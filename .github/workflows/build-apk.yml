@@ -40,11 +40,18 @@ jobs:
             yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
           fi
 
-      - name: Decode debug keystore & prepare .env
+      - name: Prepare debug keystore & .env
         run: |
-          if [ -f debug.keystore.base64 ] && [ ! -f debug.keystore ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
+          if [ -s debug.keystore.base64 ] && [ ! -s debug.keystore ]; then
+            tr -d '\r\n ' < debug.keystore.base64 | base64 -d > debug.keystore || rm -f debug.keystore
           fi
+          if [ ! -s debug.keystore ]; then
+            keytool -genkeypair -noprompt -keystore debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          ls -lh debug.keystore
           if [ ! -f .env ] && [ -f .env.example ]; then
             cp .env.example .env
           fi
@@ -58,6 +65,8 @@ jobs:
         run: python3 ena-mind/tests/run_tests.py
 
       - name: Run Android unit tests and build Debug APK
+        env:
+          JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
         run: gradle :app:testDebugUnitTest :app:assembleDebug --no-daemon
 
       - name: Upload ENA APK artifact
