@@ -1,0 +1,8 @@
+[
+  {"symbol": "BTCUSDT", "type": "above", "price": 80000, "note": "цель лонга"},
+  {"symbol": "BTCUSDT", "type": "stop", "price": 73000, "side": "long", "note": "стоп лонга (снизу)"},
+  {"symbol": "BTCUSDT", "type": "stop", "price": 78000, "side": "short", "note": "стоп шорта (сверху)"},
+  {"symbol": "BTCUSDT", "type": "pct_move", "pct": 3, "direction": "down", "note": "коррекция 3% за 24ч"},
+  {"symbol": "BTCUSDT", "type": "funding_above", "pct": 0.05, "rearm": true, "note": "перегрев лонгов"},
+  {"symbol": "BTCUSDT", "type": "funding_below", "pct": -0.03, "rearm": true, "note": "перегрев шортов"}
+]

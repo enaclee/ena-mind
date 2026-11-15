@@ -1,0 +1,563 @@
+package com.enamind.ai.ui
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.CandlestickChart
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Remove
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+
+/**
+ * KlineChart v8.2 (Native Compose Canvas): свечной график OHLCV + объём + живая свеча.
+ */
+@Composable
+fun KlineChart(
+    bars: List<List<Double>>,          // [[ts_ms,o,h,l,c,v],...] старые->новые
+    lastBar: List<Double>?,            // живая (незакрытая) свеча из WS kline
+    theme: String = "black",
+    symbol: String = "",
+    intervalLabel: String = "",
+    sourceLabel: String = "",
+    modifier: Modifier = Modifier
+) {
+    val validBars = remember(bars) { validateBars(bars) }
+    val displayBars = remember(validBars, lastBar) {
+        validBars?.let { mergeLiveBar(it, lastBar) }
+    }
+
+    val seriesKey = remember(bars) {
+        "${bars.firstOrNull()?.firstOrNull()?.toLong() ?: 0L}:${bars.size}"
+    }
+    var panOffsetBars by remember { mutableFloatStateOf(0f) }
+    var visibleCount by remember { mutableIntStateOf(55) }
+    var inspectedIdx by remember { mutableStateOf<Int?>(null) }
+
+    val firstTs = bars.firstOrNull()?.firstOrNull()?.toLong() ?: 0L
+    LaunchedEffect(firstTs) {
+        if (firstTs > 0L) {
+            panOffsetBars = 0f
+            inspectedIdx = null
+        }
+    }
+    LaunchedEffect(bars.isEmpty()) {
+        if (bars.isEmpty()) {
+            panOffsetBars = 0f
+            inspectedIdx = null
+        }
+    }
+
+    val renderState = when {
+        bars.isEmpty() -> "NO_DATA"
+        displayBars == null -> "SOURCE_ERROR"
+        else -> "OK"
+    }
+
+    val isDark = theme != "white"
+    val bgTop = if (isDark) Color(0xFF0A0A0A) else Color(0xFFFFFFFF)
+    val bgBottom = if (isDark) Color(0xFF000000) else Color(0xFFF7F7F7)
+    val gridColor = if (isDark) Color(0x1EFFFFFF) else Color(0x14111111)
+    val borderColor = if (isDark) Color(0x3D525252) else Color(0x28111111)
+    val labelColor = if (isDark) Color(0xFFA3A3A3) else Color(0xFF525252)
+    val bullColor = Color(0xFF00E5A0)
+    val bearColor = Color(0xFFFF4D5E)
+    val bullVolColor = Color(0x5500E5A0)
+    val bearVolColor = Color(0x55FF4D5E)
+
+    val textMeasurer = rememberTextMeasurer()
+    val axisTextStyle = TextStyle(
+        color = labelColor,
+        fontSize = 9.sp,
+        fontFamily = FontFamily.Monospace
+    )
+
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            // Заголовок карточки графика: символ/ТФ/источник + кнопки масштаба (>=48dp touch targets)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (symbol.isNotBlank()) {
+                    Text(
+                        "$symbol · $intervalLabel",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(
+                            if (lastBar != null) bullColor.copy(alpha = 0.14f)
+                            else MaterialTheme.colorScheme.surfaceVariant
+                        )
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .background(
+                                if (lastBar != null) bullColor
+                                else if (renderState == "OK") MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                                CircleShape
+                            )
+                    )
+                    Spacer(Modifier.width(5.dp))
+                    Text(
+                        when {
+                            lastBar != null -> "LIVE${if (sourceLabel.isNotBlank()) " · $sourceLabel" else ""}"
+                            renderState == "OK" -> "OK (${displayBars?.size ?: 0})"
+                            else -> "загрузка"
+                        },
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (lastBar != null) bullColor else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(Modifier.weight(1f))
+                IconButton(
+                    onClick = { visibleCount = (visibleCount - 15).coerceAtLeast(18) },
+                    modifier = Modifier.testTag("chart_zoom_in")
+                ) {
+                    Icon(
+                        Icons.Outlined.Add,
+                        contentDescription = "Приблизить график",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(
+                    onClick = { visibleCount = (visibleCount + 15).coerceAtMost(120) },
+                    modifier = Modifier.testTag("chart_zoom_out")
+                ) {
+                    Icon(
+                        Icons.Outlined.Remove,
+                        contentDescription = "Отдалить график",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(
+                    onClick = {
+                        panOffsetBars = 0f
+                        visibleCount = 55
+                        inspectedIdx = null
+                    },
+                    modifier = Modifier.testTag("chart_zoom_reset")
+                ) {
+                    Icon(
+                        Icons.Outlined.Refresh,
+                        contentDescription = "Сбросить масштаб графика",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(220.dp)
+                    .background(Brush.verticalGradient(listOf(bgTop, bgBottom)))
+            ) {
+                if (displayBars != null && displayBars.isNotEmpty()) {
+                    val total = displayBars.size
+                    val count = visibleCount.coerceIn(16, max(16, min(total, 120)))
+                    val maxOffset = (total - count).coerceAtLeast(0).toFloat()
+                    val clampedOffset = panOffsetBars.coerceIn(0f, maxOffset)
+                    val endIdx = (total - clampedOffset.roundToInt()).coerceIn(1, total)
+                    val startIdx = (endIdx - count).coerceAtLeast(0)
+                    val visible = displayBars.subList(startIdx, endIdx)
+
+                    val selectedBar = inspectedIdx?.let { idx ->
+                        displayBars.getOrNull(idx)
+                    } ?: displayBars.last()
+
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .testTag("kline_chart_canvas")
+                            .pointerInput(seriesKey, total, count) {
+                                detectHorizontalDragGestures { change, dragAmount ->
+                                    change.consume()
+                                    val plotW = (size.width - 56.dp.toPx()).coerceAtLeast(1f)
+                                    val barPx = plotW / count.coerceAtLeast(1)
+                                    panOffsetBars = (panOffsetBars + dragAmount / barPx).coerceIn(0f, maxOffset)
+                                }
+                            }
+                            .pointerInput(seriesKey, startIdx, visible.size) {
+                                detectTapGestures(
+                                    onDoubleTap = {
+                                        panOffsetBars = 0f
+                                        inspectedIdx = null
+                                    },
+                                    onTap = { offset ->
+                                        val plotW = (size.width - 56.dp.toPx()).coerceAtLeast(1f)
+                                        if (offset.x <= plotW && visible.isNotEmpty()) {
+                                            val rel = ((offset.x / plotW) * visible.size).toInt()
+                                                .coerceIn(0, visible.size - 1)
+                                            val target = startIdx + rel
+                                            inspectedIdx = if (inspectedIdx == target) null else target
+                                        } else {
+                                            inspectedIdx = null
+                                        }
+                                    }
+                                )
+                            }
+                    ) {
+                        val rightAxisW = 56.dp.toPx()
+                        val bottomAxisH = 18.dp.toPx()
+                        val topPad = 18.dp.toPx()
+                        val plotW = (size.width - rightAxisW).coerceAtLeast(1f)
+                        val plotH = (size.height - bottomAxisH - topPad).coerceAtLeast(1f)
+                        val candleTop = topPad
+                        val candleBottom = topPad + plotH * 0.74f
+                        val candleH = (candleBottom - candleTop).coerceAtLeast(1f)
+                        val volTop = candleBottom + plotH * 0.05f
+                        val volBottom = topPad + plotH
+                        val volHMax = (volBottom - volTop).coerceAtLeast(1f)
+
+                        var rawMin = Double.POSITIVE_INFINITY
+                        var rawMax = Double.NEGATIVE_INFINITY
+                        var maxVol = 0.0
+                        for (bar in visible) {
+                            if (bar[3] < rawMin) rawMin = bar[3]
+                            if (bar[2] > rawMax) rawMax = bar[2]
+                            if (bar[5] > maxVol) maxVol = bar[5]
+                        }
+                        val span = (rawMax - rawMin).let {
+                            if (it <= 0.0) max(rawMax * 0.005, 1e-4) else it
+                        }
+                        val pad = span * 0.08
+                        val minP = rawMin - pad
+                        val maxP = rawMax + pad
+                        val pRange = (maxP - minP).coerceAtLeast(1e-9)
+                        val safeMaxVol = maxVol.coerceAtLeast(1e-9)
+
+                        fun priceToY(p: Double): Float {
+                            val frac = ((p - minP) / pRange).toFloat().coerceIn(0f, 1f)
+                            return candleBottom - frac * candleH
+                        }
+
+                        // Разделители осей
+                        drawLine(
+                            color = borderColor,
+                            start = Offset(plotW, 0f),
+                            end = Offset(plotW, topPad + plotH),
+                            strokeWidth = 1.dp.toPx()
+                        )
+                        drawLine(
+                            color = borderColor,
+                            start = Offset(0f, topPad + plotH),
+                            end = Offset(size.width, topPad + plotH),
+                            strokeWidth = 1.dp.toPx()
+                        )
+
+                        // Горизонтальная сетка цен (4 уровня)
+                        val gridSteps = 3
+                        for (g in 0..gridSteps) {
+                            val frac = g.toFloat() / gridSteps
+                            val price = minP + frac * pRange
+                            val y = candleBottom - frac * candleH
+                            drawLine(
+                                color = gridColor,
+                                start = Offset(0f, y),
+                                end = Offset(plotW, y),
+                                strokeWidth = 1f
+                            )
+                            val label = formatAxisPrice(price)
+                            val measured = textMeasurer.measure(label, style = axisTextStyle)
+                            drawText(
+                                textLayoutResult = measured,
+                                topLeft = Offset(
+                                    x = plotW + 4.dp.toPx(),
+                                    y = (y - measured.size.height / 2f).coerceIn(0f, candleBottom - measured.size.height)
+                                )
+                            )
+                        }
+
+                        val slotW = plotW / visible.size.coerceAtLeast(1)
+                        val bodyW = (slotW * 0.64f).coerceIn(2f, 12.dp.toPx())
+                        val wickW = (slotW * 0.14f).coerceIn(1f, 1.8.dp.toPx())
+                        val minBodyH = 1.5.dp.toPx()
+
+                        val timeStep = max(1, visible.size / 4)
+                        for (i in visible.indices) {
+                            val bar = visible[i]
+                            val cx = (i + 0.5f) * slotW
+
+                            if (i > 0 && i % timeStep == 0 && i < visible.size - 2) {
+                                drawLine(
+                                    color = gridColor,
+                                    start = Offset(cx, candleTop),
+                                    end = Offset(cx, topPad + plotH),
+                                    strokeWidth = 1f
+                                )
+                                val tLabel = formatBarTime(bar[0].toLong())
+                                val tm = textMeasurer.measure(tLabel, style = axisTextStyle)
+                                drawText(
+                                    textLayoutResult = tm,
+                                    topLeft = Offset(
+                                        x = (cx - tm.size.width / 2f).coerceIn(2f, plotW - tm.size.width),
+                                        y = topPad + plotH + 2.dp.toPx()
+                                    )
+                                )
+                            }
+
+                            val o = bar[1]; val h = bar[2]; val l = bar[3]; val c = bar[4]; val v = bar[5]
+                            val isBull = c >= o
+                            val color = if (isBull) bullColor else bearColor
+
+                            val yH = priceToY(h)
+                            val yL = priceToY(l)
+                            val yO = priceToY(o)
+                            val yC = priceToY(c)
+
+                            drawLine(
+                                color = color,
+                                start = Offset(cx, yH),
+                                end = Offset(cx, yL),
+                                strokeWidth = wickW
+                            )
+
+                            val rectTop = min(yO, yC)
+                            val rectH = max(kotlin.math.abs(yC - yO), minBodyH)
+                            drawRect(
+                                color = color,
+                                topLeft = Offset(cx - bodyW / 2f, rectTop),
+                                size = Size(bodyW, rectH)
+                            )
+
+                            val vh = ((v / safeMaxVol).toFloat().coerceIn(0f, 1f)) * volHMax
+                            if (vh > 0.5f) {
+                                drawRect(
+                                    color = if (isBull) bullVolColor else bearVolColor,
+                                    topLeft = Offset(cx - bodyW / 2f, volBottom - vh),
+                                    size = Size(bodyW, vh)
+                                )
+                            }
+                        }
+
+                        // Текущая цена + плашка справа
+                        val lastClose = visible.last()[4]
+                        val lastBull = visible.last()[4] >= visible.last()[1]
+                        val lastColor = if (lastBull) bullColor else bearColor
+                        val lastY = priceToY(lastClose)
+                        drawLine(
+                            color = lastColor.copy(alpha = 0.75f),
+                            start = Offset(0f, lastY),
+                            end = Offset(plotW, lastY),
+                            strokeWidth = 1.dp.toPx(),
+                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f), 0f)
+                        )
+                        val lastLabel = formatAxisPrice(lastClose)
+                        val pillTextColor = if (lastBull) Color(0xFF041C14) else Color.White
+                        val lastMeasured = textMeasurer.measure(
+                            lastLabel,
+                            style = axisTextStyle.copy(color = pillTextColor, fontWeight = FontWeight.Bold)
+                        )
+                        val pillTop = (lastY - lastMeasured.size.height / 2f - 2.dp.toPx())
+                            .coerceIn(0f, candleBottom - lastMeasured.size.height - 4.dp.toPx())
+                        drawRect(
+                            color = lastColor,
+                            topLeft = Offset(plotW + 1.dp.toPx(), pillTop),
+                            size = Size(rightAxisW - 2.dp.toPx(), lastMeasured.size.height + 4.dp.toPx())
+                        )
+                        drawText(
+                            textLayoutResult = lastMeasured,
+                            topLeft = Offset(plotW + 4.dp.toPx(), pillTop + 2.dp.toPx())
+                        )
+
+                        // Перекрестие при выборе свечи тапом
+                        val activeIdx = inspectedIdx
+                        if (activeIdx != null && activeIdx in startIdx until endIdx) {
+                            val relIdx = activeIdx - startIdx
+                            val cx = (relIdx + 0.5f) * slotW
+                            val cy = priceToY(displayBars[activeIdx][4])
+                            drawLine(
+                                color = labelColor.copy(alpha = 0.7f),
+                                start = Offset(cx, candleTop),
+                                end = Offset(cx, topPad + plotH),
+                                strokeWidth = 1.dp.toPx(),
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(4f, 4f), 0f)
+                            )
+                            drawLine(
+                                color = labelColor.copy(alpha = 0.7f),
+                                start = Offset(0f, cy),
+                                end = Offset(plotW, cy),
+                                strokeWidth = 1.dp.toPx(),
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(4f, 4f), 0f)
+                            )
+                        }
+                    }
+
+                    // Строка OHLC в левом верхнем углу
+                    val o = selectedBar[1]; val h = selectedBar[2]; val l = selectedBar[3]; val c = selectedBar[4]
+                    val ohlcColor = if (c >= o) bullColor else bearColor
+                    Text(
+                        "O ${formatAxisPrice(o)}  H ${formatAxisPrice(h)}  L ${formatAxisPrice(l)}  C ${formatAxisPrice(c)}",
+                        fontSize = 9.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Medium,
+                        color = ohlcColor,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(horizontal = 10.dp, vertical = 3.dp)
+                    )
+                } else {
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (renderState == "NO_DATA") {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(22.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        } else {
+                            Icon(
+                                Icons.Outlined.CandlestickChart,
+                                contentDescription = null,
+                                modifier = Modifier.size(28.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Text(
+                            when (renderState) {
+                                "NO_DATA" -> "Загрузка свечей (Bybit / Binance / OKX)…"
+                                "SOURCE_ERROR" -> "Ошибка формата OHLCV: данные не прошли валидацию"
+                                else -> "График: $renderState"
+                            },
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Слияние живой (незакрытой) свечи WS с валидным историческим рядом.
+ */
+fun mergeLiveBar(validBars: List<List<Double>>, lastBar: List<Double>?): List<List<Double>> {
+    if (validBars.isEmpty() || lastBar == null || lastBar.size < 6) return validBars
+    if (lastBar.take(6).any { !it.isFinite() }) return validBars
+    val ts = lastBar[0]
+    val o = lastBar[1]; val h = lastBar[2]; val l = lastBar[3]; val c = lastBar[4]; val v = lastBar[5]
+    if (ts <= 1_483_228_800_000.0 || o <= 0 || c <= 0 || h < o || h < c || l > o || l > c || h < l || v < 0) {
+        return validBars
+    }
+    val lastClosedTs = validBars.last()[0]
+    return when {
+        ts == lastClosedTs -> validBars.dropLast(1) + listOf(lastBar)
+        ts > lastClosedTs -> validBars + listOf(lastBar)
+        else -> validBars
+    }
+}
+
+/**
+ * Валидация OHLCV (§2): ts возрастает и уникален, OHLC согласованы и > 0,
+ * объём >= 0, ts после 2017. Возвращает очищенный список или null.
+ */
+fun validateBars(rows: List<List<Double>>): List<List<Double>>? {
+    if (rows.size < 2) return null
+    val out = ArrayList<List<Double>>(rows.size)
+    var prevTs = -1.0
+    for (r in rows) {
+        if (r.size < 6) return null
+        if (r.take(6).any { !it.isFinite() }) return null
+        val ts = r[0]
+        if (ts <= 1_483_228_800_000.0) return null   // до 2017-01-01 — мусор
+        if (ts <= prevTs) return null                  // не возрастает/дубль
+        val o = r[1]; val h = r[2]; val l = r[3]; val c = r[4]; val v = r[5]
+        if (o <= 0 || c <= 0) return null
+        if (h < o || h < c || l > o || l > c) return null
+        if (h < l) return null
+        if (v < 0) return null
+        out.add(r)
+        prevTs = ts
+    }
+    return out
+}
+
+private fun formatAxisPrice(p: Double): String = when {
+    p >= 10_000 -> "%.0f".format(Locale.US, p)
+    p >= 1_000 -> "%.1f".format(Locale.US, p)
+    p >= 10 -> "%.2f".format(Locale.US, p)
+    else -> "%.4f".format(Locale.US, p)
+}
+
+private fun formatBarTime(tsMs: Long): String =
+    SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(tsMs))

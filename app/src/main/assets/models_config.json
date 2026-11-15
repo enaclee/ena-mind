@@ -1,0 +1,41 @@
+{
+  "_comment": "Список ИИ-провайдеров (OpenAI-совместимый /chat/completions). Пользователь может добавлять своих: положите отредактированный файл в память приложения (кнопка «Свои провайдеры» в настройках) — без пересборки APK. Ключи хранятся только на устройстве.",
+  "providers": [
+    {
+      "id": "zai",
+      "name": "Z.ai (GLM) — основной",
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "model_id": "glm-5.3",
+      "dashboard_url": "https://z.ai/manage-apikey/apikey-list",
+      "supports_tools": true,
+      "note": "Function calling: полный доступ к инструментам ENA-MIND."
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter (Meta Llama 3 8B, free)",
+      "base_url": "https://openrouter.ai/api/v1",
+      "model_id": "meta-llama/llama-3-8b-instruct:free",
+      "dashboard_url": "https://openrouter.ai/keys",
+      "supports_tools": false,
+      "note": "Бесплатный лимит; без function calling — анализ подставляется контекстом."
+    },
+    {
+      "id": "groq",
+      "name": "Groq (Llama 3 8B)",
+      "base_url": "https://api.groq.com/openai/v1",
+      "model_id": "llama3-8b-8192",
+      "dashboard_url": "https://console.groq.com/keys",
+      "supports_tools": true,
+      "note": "Высокая скорость, щедрый бесплатный лимит."
+    },
+    {
+      "id": "gemini",
+      "name": "Google AI Studio (Gemini 1.5 Flash)",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "model_id": "gemini-1.5-flash",
+      "dashboard_url": "https://aistudio.google.com/app/apikey",
+      "supports_tools": true,
+      "note": "OpenAI-совместимый эндпоинт Google; бесплатная квота AI Studio."
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{"ts": "2026-11-13T22:45:28.052747+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-13T22:45:29.275204+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-13T22:45:29.295134+00:00", "m": {"url": "https://api.coingecko.com/api/v3/global", "a": 1, "e": "HTTP Error 429: Too Many Requests"}}
+{"ts": "2026-11-13T22:45:35.097683+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-13T23:04:00.040538+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-13T23:04:01.260689+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-13T23:04:06.895785+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-14T00:04:51.972349+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:04:53.964807+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:04:58.138434+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-14T00:16:16.467656+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:16:18.488435+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:16:24.266090+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-14T00:16:51.647455+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:16:53.707219+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:17:00.102683+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-14T00:29:23.132885+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:29:25.113610+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:29:29.226215+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-14T00:38:24.514340+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:38:26.499901+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:38:30.428356+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-14T00:40:00.454444+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:40:02.453927+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:40:08.019786+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-14T00:44:36.251972+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:44:38.267437+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T00:44:44.470772+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-14T11:29:17.247786+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T11:29:19.306047+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T11:29:26.423527+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-14T12:24:38.465708+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T12:24:40.563215+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T12:24:52.957816+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-14T13:20:03.924780+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 1, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T13:20:05.940339+00:00", "m": {"url": "https://data-api.binance.vision/api/v3/aggTrades?symbol=TESTUSDT&limit=10", "a": 2, "e": "HTTP Error 400: Bad Request"}}
+{"ts": "2026-11-14T13:20:14.348797+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-15T02:01:47.627171+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-15T02:02:10.417029+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}
+{"ts": "2026-11-15T02:28:23.636888+00:00", "m": {"url": "https://api.mainnet-beta.solana.com", "a": 1, "e": "Expecting value: line 1 column 1 (char 0)"}}

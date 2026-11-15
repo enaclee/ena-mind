@@ -1,0 +1,6 @@
+{
+  "name": "ENA",
+  "description": "ENA — personal crypto market intelligence terminal with real-time predictive trend engine, 6H/24H horizons, self-diagnostic agents, and isolated Google AI Studio chat.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
