@@ -421,4 +421,44 @@ class EnaMindParserRobolectricTest {
             settings.aiStudioApiKey = ""
         }
     }
+
+    @Test
+    fun outlook_text_formats_range_80_pct_safely_without_conversion_crash() {
+        val payload = org.json.JSONObject().apply {
+            put("ok", true)
+            put("horizon_hours", 24)
+            put("side", "LONG")
+            put("p_up", 0.54)
+            put("p_flat", 0.24)
+            put("p_down", 0.22)
+            put("threshold_pct", 0.85)
+            put("expected_move_pct", 1.15)
+            put("range_low_pct", -1.40)
+            put("range_high_pct", 2.90)
+            put("sigma_24h_pct", 2.15)
+            put("range_low_price", 63500.0)
+            put("range_high_price", 66800.0)
+            put(
+                "drivers",
+                org.json.JSONArray().apply {
+                    put("Кросс-биржевое опережение Coinbase +18 bps")
+                    put(org.json.JSONObject().put("title", "Приток стейблкоинов").put("n_copies", 2))
+                }
+            )
+            put("invalidation", org.json.JSONArray().put("Пробой вниз 63200"))
+            put("calibration", "Brier 0.21")
+        }
+        val rendered = com.enamind.ai.ui.outlookText(payload, 24)
+        assertTrue(rendered.contains("Диапазон 80%:"))
+        assertTrue(rendered.contains("24 часа"))
+        assertTrue(rendered.contains("Кросс-биржевое опережение"))
+        assertTrue(rendered.contains("Brier 0.21"))
+
+        val nanPayload = org.json.JSONObject(
+            """{"ok":true,"horizon_hours":6,"p_up":"NaN","p_flat":0.5,"p_down":0.5,"threshold_pct":"NaN","expected_move_pct":"NaN","range_low_pct":"NaN","range_high_pct":"NaN"}"""
+        )
+        val safeNaN = com.enamind.ai.ui.outlookText(nanPayload, 6)
+        assertFalse(safeNaN.contains("NaN"))
+        assertTrue(safeNaN.contains("6 часов"))
+    }
 }

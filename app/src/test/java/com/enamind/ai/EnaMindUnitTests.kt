@@ -12,10 +12,7 @@ import com.enamind.ai.intelligence.RealTimeLeadEngine
 import com.enamind.ai.intelligence.RealtimePulseVault
 import com.enamind.ai.ui.ChatIntentRouter
 import com.enamind.ai.ui.mergeLiveBar
-import com.enamind.ai.ui.outlookText
 import com.enamind.ai.ui.validateBars
-import org.json.JSONArray
-import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -173,54 +170,6 @@ class EnaMindUnitTests {
         assertEquals(10, Settings.SYMBOLS.size)
         assertTrue("BNBUSDT" in Settings.SYMBOLS)
         assertTrue("LINKUSDT" in Settings.SYMBOLS)
-    }
-
-    @Test
-    fun `outlookText formats range 80 pct safely without UnknownFormatConversionException`() {
-        val payload = JSONObject().apply {
-            put("ok", true)
-            put("horizon_hours", 24)
-            put("side", "LONG")
-            put("p_up", 0.54)
-            put("p_flat", 0.24)
-            put("p_down", 0.22)
-            put("threshold_pct", 0.85)
-            put("expected_move_pct", 1.15)
-            put("range_low_pct", -1.40)
-            put("range_high_pct", 2.90)
-            put("sigma_24h_pct", 2.15)
-            put("range_low_price", 63500.0)
-            put("range_high_price", 66800.0)
-            put(
-                "drivers",
-                JSONArray().apply {
-                    put("Кросс-биржевое опережение Coinbase +18 bps")
-                    put(JSONObject().put("title", "Приток стейблкоинов").put("n_copies", 2))
-                }
-            )
-            put("invalidation", JSONArray().put("Пробой вниз 63200"))
-            put("calibration", "Brier 0.21")
-        }
-        val rendered = outlookText(payload, 24)
-        assertTrue(rendered.contains("Диапазон 80%:"))
-        assertTrue(rendered.contains("24 часа"))
-        assertTrue(rendered.contains("Кросс-биржевое опережение"))
-        assertTrue(rendered.contains("Brier 0.21"))
-
-        val nanPayload = JSONObject().apply {
-            put("ok", true)
-            put("horizon_hours", 6)
-            put("p_up", Double.NaN)
-            put("p_flat", 0.5)
-            put("p_down", 0.5)
-            put("threshold_pct", Double.NaN)
-            put("expected_move_pct", Double.NaN)
-            put("range_low_pct", Double.NaN)
-            put("range_high_pct", Double.NaN)
-        }
-        val safeNaN = outlookText(nanPayload, 6)
-        assertFalse(safeNaN.contains("NaN"))
-        assertTrue(safeNaN.contains("6 часов"))
     }
 
     @Test

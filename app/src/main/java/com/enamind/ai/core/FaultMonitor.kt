@@ -98,9 +98,11 @@ object FaultMonitor {
 
     fun init(ctx: Context) {
         synchronized(lock) {
-            if (appDir != null) return
             val dir = File(ctx.filesDir, "enamind").apply { mkdirs() }
+            if (appDir?.absolutePath == dir.absolutePath) return
             appDir = dir
+            lastDedupMs.clear()
+            componentHealthy.clear()
             loadLocked()
             publishLocked(System.currentTimeMillis())
         }

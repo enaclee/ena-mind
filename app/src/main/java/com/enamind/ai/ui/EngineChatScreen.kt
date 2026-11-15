@@ -597,7 +597,7 @@ object ChatIntentRouter {
             Regex("""\bavax(usdt)?\b|авакс""").containsMatchIn(low) -> "AVAXUSDT"
             Regex("""\bdoge(usdt)?\b|дог""").containsMatchIn(low) -> "DOGEUSDT"
             Regex("""\bop(usdt)?\b|оптимизм""").containsMatchIn(low) -> "OPUSDT"
-            Regex("""\blink(usdt)?\b|чейнлинк""").containsMatchIn(low) -> "LINKUSDT"
+            Regex("""\blink(usdt)?\b|чейнлинк|chainlink""").containsMatchIn(low) -> "LINKUSDT"
             else -> null
         }
     }
