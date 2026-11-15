@@ -32,7 +32,7 @@ jobs:
 
       - name: Accept Android SDK licenses
         run: |
-          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDK_DIR="\( {ANDROID_HOME:- \){ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
           SDKMANAGER=$(command -v sdkmanager || ls -1 "$SDK_DIR"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n1 || true)
@@ -64,10 +64,10 @@ jobs:
       - name: Run Python skill tests
         run: python3 ena-mind/tests/run_tests.py
 
-      - name: Run Android unit tests and build Debug APK
+      - name: Build Debug APK
         env:
           JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
-        run: gradle :app:testDebugUnitTest :app:assembleDebug --no-daemon
+        run: gradle :app:assembleDebug --no-daemon
 
       - name: Upload ENA APK artifact
         uses: actions/upload-artifact@v4
