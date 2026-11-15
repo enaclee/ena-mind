@@ -136,7 +136,7 @@ abstract class AppDatabase : RoomDatabase() {
     companion object {
         fun build(ctx: Context): AppDatabase =
             Room.databaseBuilder(ctx, AppDatabase::class.java, "enamind.db")
-                .fallbackToDestructiveMigration()
+                .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
     }
 }

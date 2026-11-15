@@ -35,6 +35,7 @@ object CrashGuard {
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun writeReport(ctx: Context, thread: Thread, t: Throwable) {
         val dir = File(ctx.filesDir, "enamind").apply { mkdirs() }
         val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())

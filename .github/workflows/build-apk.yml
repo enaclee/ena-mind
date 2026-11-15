@@ -17,16 +17,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
       - name: Set up Python 3.11 for Chaquopy
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -68,9 +68,10 @@ jobs:
           fi
 
       - name: Set up Gradle 9.3.1
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '9.3.1'
+          cache-provider: 'basic'
 
       - name: Run Python skill tests
         run: python3 ena-mind/tests/run_tests.py
@@ -80,8 +81,16 @@ jobs:
           JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
         run: gradle :app:testDebugUnitTest :app:assembleDebug --no-daemon
 
+      - name: Upload ENA test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ENA-test-reports
+          path: app/build/reports/tests/**
+          if-no-files-found: ignore
+
       - name: Upload ENA APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ENA-debug-apk
           path: app/build/outputs/apk/debug/*.apk
@@ -89,6 +98,6 @@ jobs:
 
       - name: Attach APK to GitHub Release (on tag push)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: app/build/outputs/apk/debug/*.apk

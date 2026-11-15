@@ -672,8 +672,8 @@ private fun runCommand(
     )
     val mentionedSym = userDisplayOverride?.let { ChatIntentRouter.detectSymbolMention(it) }
     val switchSymbol = mentionedSym != null && mentionedSym != state.market.value.symbol
-    if (switchSymbol && mentionedSym != null) {
-        state.changeSymbol(mentionedSym)
+    if (switchSymbol) {
+        state.changeSymbol(requireNotNull(mentionedSym))
     }
 
     val placeholderId = state.nextChatMsgId()
