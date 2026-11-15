@@ -653,10 +653,13 @@ def selftest():
     assert to_binance("BTCUSDC")=="BTCUSDT"
     assert to_okx("BTCUSDT")=="BTC-USDT-SWAP"
     assert to_okx("SOL-USDT-SWAP")=="SOL-USDT-SWAP"
-    # rate limiter: два вызова подряд на один хост дают интервал
-    t0=time.monotonic()
-    fetch("https://api.llama.fi/v2/chains"); fetch("https://api.llama.fi/v2/chains")
-    assert time.monotonic()-t0>=0.4,"rate limiter не выдержал интервал"
+    # rate limiter: два вызова подряд на один хост дают интервал (мокаем сеть в selftest)
+    import unittest.mock as _mock
+    with _mock.patch("mm_data.fetch_json",return_value=(None,{"url":"mock","fetched_at":None,"source":"mock","attempts":1,"error":"offline"})):
+        _LAST_REQ.clear();_BAN.clear()
+        t0=time.monotonic()
+        fetch("https://api.llama.fi/v2/chains"); fetch("https://api.llama.fi/v2/chains")
+        assert time.monotonic()-t0>=0.4,"rate limiter не выдержал интервал"
     # кэш mm_data отдаёт STALE-метку (fetch без сети -> cache/None) — контракт сохранён
     # v7.2: парсер книги опционов Deribit (офлайн, фикстура)
     import datetime
@@ -677,9 +680,13 @@ def selftest():
     assert deribit_options("SUIUSDT")["status"]=="INSUFFICIENT"
     # пустая книга — INSUFFICIENT
     assert not _parse_deribit_book([],now_d)["ok"]
-    # v8.0: кэш китов и макро (без сети — честный UNAVAILABLE, кэш не портится)
-    assert binance_whales("TESTUSDT",limit=10)["status"] in ("UNAVAILABLE","INSUFFICIENT")
-    assert coingecko_global()["status"] in ("UNAVAILABLE","INSUFFICIENT","AVAILABLE","STALE")
+    # v9.0: кэш китов и макро офлайн (с моком fetch — ноль сетевых запросов)
+    with _mock.patch("mm_data.fetch_json",return_value=(None,{"url":"mock","fetched_at":None,"source":"mock","attempts":0,"error":"offline"})):
+        _WHALE_CACHE["ts"]=0.0;_WHALE_CACHE["by_sym"].clear()
+        _MACRO_CACHE["ts"]=0.0;_MACRO_CACHE["data"]=None
+        _BAN.clear()
+        assert binance_whales("TESTUSDT",limit=10)["status"] in ("UNAVAILABLE","INSUFFICIENT")
+        assert coingecko_global()["status"] in ("UNAVAILABLE","INSUFFICIENT")
     print("mm_sources: OK")
 if __name__=="__main__":
     import argparse

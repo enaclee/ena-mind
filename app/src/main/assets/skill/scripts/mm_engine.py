@@ -1,38 +1,27 @@
 #!/usr/bin/env python3
-"""mm_engine — NEURAL FORECAST ENGINE ENA-MIND v8.0 «ЛЕС И ПАУТИНА».
+"""mm_engine — NEURAL FORECAST ENGINE ENA v9.0 «ЛЕС И ПАУТИНА».
 
 Конвейер (реальные вычисления, каждый шаг честно статусприруется):
   DATA INGESTION -> DATA VALIDATION -> FEATURE ENGINEERING -> REGIME DETECTION
   -> 18 ANALYTICAL AGENTS (лес) -> WEB (паутина связей) -> NEURAL COUNCIL
-  -> STATISTICAL AI -> PREDICTION ENGINE -> FORECAST (15 мин) -> FORECAST MEMORY
+  -> STATISTICAL AI -> PREDICTION ENGINE -> FORECAST (6 часов) + OUTLOOK 24H -> FORECAST MEMORY
   -> FEEDBACK LOOP
 
-Прогноз на 15 минут (главная функция 7.0+):
-- пересчёт по каждому feed() (приложение шлёт новые данные каждые ~5с);
-- СЕССИЯ прогноза = 15-минутное окно: начальный прогноз сохраняется в память
-  и не перезаписывается; последующие пересчёты — ВЕРСИИ той же сессии
-  (обновление ≠ новый независимый прогноз);
-- P(UP)+P(FLAT)+P(DOWN)=100% строго; при недостатке подтверждений — NO_SIGNAL.
-
-Режим работы — SHADOW (только анализ, никакой торговли; ЧАСТЬ 11).
-
-Двухканальная подача данных (ЧАСТЬ 9 — производительность):
-- set_klines(symbol, tf, rows) — тяжёлые свечные ряды (редко, раз в ~60с);
-- feed(symbol, fast) — лёгкий срез живого рынка (каждые ~5с: цена/потоки/книга/
-  деривативы/кросс-биржа/сентимент). При allow_fetch=True недостающие части
-  движок добирает сам (CLI/desktop-режим), с rate-limit и кэшем mm_sources.
-- v8.0: медленный контекст (DefiLlama/mempool) и редкие части (киты Binance,
-  макро CoinGecko, опционы Deribit) подаются merge-подачей и не теряются.
+Прогноз на 6 часов и сценарий 24 часа:
+- пересчёт по каждому feed() (приложение шлёт актуальные данные с бирж);
+- СЕССИЯ прогноза = 6-часовое окно: начальный прогноз сохраняется в память
+  и не перезаписывается; последующие пересчёты — ВЕРСИИ той же сессии;
+- по явному запросу (6ч / 24ч) выполняется свежий пересчёт от текущих данных без кэша.
 """
 import json,math,os,time
 import mm_config,mm_agents,mm_memory,mm_stats
 
-HORIZON_MIN=15
-SESSION_MS=HORIZON_MIN*60*000  # placeholder, заменено ниже
+HORIZON_MIN=360
+HORIZON_HOURS=6
 SESSION_MS=HORIZON_MIN*60*1000
-MAX_VERSIONS=600            # версий на сессию (5с * 15мин = 180, с запасом)
+MAX_VERSIONS=600            # версий на сессию
 LOG_MAX=200
-ENGINE_VERSION="8.0"
+ENGINE_VERSION="9.0"
 
 class NeuralEngine:
     def __init__(self,cfg=None):
@@ -366,9 +355,9 @@ class NeuralEngine:
               (stat or {}).get("evidence",["отключён"])[0][:120])
         stage("PREDICTION ENGINE",pred["status"],
               pred["evidence"][0] if pred.get("evidence") else "")
-        # 7 FORECAST + сессии (версионирование)
+        # 7 FORECAST + сессии (версионирование 6ч)
         fc,cinfo=self._forecast_session(symbol,pred,fb,quality,regime,council,agents,store)
-        stage("FORECAST 15M","OK","P(UP)=%.0f%% P(FLAT)=%.0f%% P(DOWN)=%.0f%% — сессия %s, версия %d%s"%(
+        stage("FORECAST 6H","OK","P(UP)=%.0f%% P(FLAT)=%.0f%% P(DOWN)=%.0f%% — сессия %s, версия %d%s"%(
             pred["features"].get("p_up",0)*100,pred["features"].get("p_flat",0)*100,
             pred["features"].get("p_down",0)*100,cinfo["id"],cinfo["version"],
             " (начальная)" if cinfo["is_initial"] else " (обновление)"))
@@ -380,23 +369,25 @@ class NeuralEngine:
                 self.weights=new_w;self._save_weights()
                 self._log("feedback","веса агентов обновлены: %s"%json.dumps(new_w,ensure_ascii=False))
         stage("FEEDBACK LOOP","OK","весов агентов: %d"%len(self.weights))
-        # v8.1 (ТЗ §16): 24H OUTLOOK — отдельный горизонт, не подменяет 15м.
-        # Запускаем не чаще раза в 5 минут (дорогой новостной контекст кэшируется NewsRepo).
+        # v9.0: оба горизонта (6H и 24H) пересчитываются СВЕЖО от актуальных данных и памяти
         try:
+            import mm_outlook24
             news=fb.get("news") or []
-            news_sig=(len(news),(news[0].get("title") if news and isinstance(news[0],dict) else ""))
-            if (time.time()-getattr(self,"_last_24h",0)>300
-                    or getattr(self,"_out24_symbol",None)!=symbol
-                    or getattr(self,"_out24_news_sig",None)!=news_sig):
-                import mm_outlook24
-                st=mm_memory.stats().get("checked") or {}
-                self._out24_local=mm_outlook24.outlook_24h(fb.get("klines") or {},trend,
-                                                           news,mem_stats_compat(st))
-                self._last_24h=time.time()
-                self._out24_symbol=symbol
-                self._out24_news_sig=news_sig
+            st=mm_memory.stats().get("checked") or {}
+            mst=mem_stats_compat(st)
+            deriv=fb.get("deriv") or {}
+            self._out6_local=mm_outlook24.outlook_6h(fb.get("klines") or {},trend,news,mst,deriv=deriv)
+            self._out24_local=mm_outlook24.outlook_24h(fb.get("klines") or {},trend,news,mst,deriv=deriv)
         except Exception as e:
-            self._out24_local={"status":"INSUFFICIENT","error":str(e)[:80]}
+            self._out6_local={"status":"INSUFFICIENT","horizon_h":6,"error":str(e)[:80]}
+            self._out24_local={"status":"INSUFFICIENT","horizon_h":24,"error":str(e)[:80]}
+        stage("6H OUTLOOK",
+              self._out6_local.get("status","INSUFFICIENT"),
+              "P(UP)=%.0f%% P(FLAT)=%.0f%% P(DOWN)=%.0f%% (%s)"%(
+                  100*(self._out6_local.get("p_up") or 0),
+                  100*(self._out6_local.get("p_flat") or 0),
+                  100*(self._out6_local.get("p_down") or 0),
+                  self._out6_local.get("calibration",{}).get("label","")))
         stage("24H OUTLOOK",
               self._out24_local.get("status","INSUFFICIENT"),
               "P(UP)=%.0f%% P(FLAT)=%.0f%% P(DOWN)=%.0f%% (%s)"%(
@@ -418,13 +409,29 @@ class NeuralEngine:
                 "mode":"SHADOW","engine":ENGINE_VERSION,"stages":stages,
                 "data":quality,"regime":regime,"agents":agents,"council":council,
                 "prediction":pred,"forecast":fc,"session":cinfo,
-                "trend":trend,"onchain":ocie,"outlook24h":self._out24_local,
-                "discovery":disc,
+                "trend":trend,"onchain":ocie,"outlook6h":self._out6_local,
+                "outlook24h":self._out24_local,"discovery":disc,
                 "elapsed_ms":int((time.time()-t0)*1000)}
         self._log(symbol,"compute: grade=%s, %s, P(up)=%.0f%%, %dмс"%(
             quality["grade"],council["status"],
             100*(pred["features"].get("p_up") or 0),result["elapsed_ms"]))
         return result
+
+    def compute_outlook(self,symbol="BTCUSDT",horizon_h=6):
+        """Свежий пересчёт прогноза на 6ч или 24ч по текущим свечам/новостям/деривативам."""
+        import mm_trend,mm_outlook24
+        fb=self._fb(symbol,allow_fetch=False)
+        kl=fb.get("klines") or {}
+        news=fb.get("news") or []
+        deriv=fb.get("deriv") or {}
+        trend=mm_trend.trend_layer(kl) if kl else {"status":"INSUFFICIENT","reason":"нет свечей"}
+        st=mm_memory.stats().get("checked") or {}
+        mst=mem_stats_compat(st)
+        h=6 if int(horizon_h)<=6 else 24
+        res=mm_outlook24.outlook_6h(kl,trend,news,mst,deriv=deriv) if h==6 else mm_outlook24.outlook_24h(kl,trend,news,mst,deriv=deriv)
+        res["symbol"]=symbol
+        res["price"]=fb.get("price")
+        return res
 
     def _forecast_session(self,symbol,pred,fb,quality,regime,council,agents,store):
         """Сессии 15-минутных прогнозов: начальная версия пишется в память,
@@ -446,11 +453,12 @@ class NeuralEngine:
         is_initial=sess["initial"] is None
         memory_op="no-op"
         if is_initial and store and pred.get("status")=="OK" and fb.get("price"):
-            # волатильностная полоса для аналитики по волатильности
-            vb="hi" if (p.get("sigma_15m_pct") or 0)>=0.5 else ("lo" if (p.get("sigma_15m_pct") or 1)<=0.15 else "mid")
+            # волатильностная полоса для аналитики по волатильности (горизонт 6ч)
+            vb="hi" if (p.get("sigma_6h_pct") or 0)>=2.4 else ("lo" if (p.get("sigma_6h_pct") or 3)<=0.5 else "mid")
             mm_memory.store({
                 "id":sess["id"],"asset":symbol,"ts":now_ms,
                 "entry_price":fb.get("price"),"horizon_min":HORIZON_MIN,
+                "horizon_h":HORIZON_HOURS,
                 "p":{"p_up":p.get("p_up"),"p_flat":p.get("p_flat"),"p_down":p.get("p_down"),
                      "side":pred.get("side")},
                 "side":pred.get("side"),"model_version":(self.model or {}).get("version","heuristic_v1"),
@@ -477,12 +485,13 @@ class NeuralEngine:
                "initial":sess["initial"]}
         fc=dict(ver);fc["session_id"]=sess["id"];fc["version"]=len(sess["versions"])
         fc["is_initial"]=is_initial
+        fc["horizon_h"]=HORIZON_HOURS
         fc["arguments"]=(pred.get("evidence") or [])[:6]
         fc["contradictions"]=(pred.get("contradictions") or [])[:6]
         fc["invalidate"]=(pred.get("invalidate") or [])[:4]
         fc["alt_scenario"]=(pred.get("features") or {}).get("alt_scenario")
         fc["range_low"]=p.get("range_low");fc["range_high"]=p.get("range_high")
-        fc["sigma_15m_pct"]=p.get("sigma_15m_pct")
+        fc["sigma_6h_pct"]=p.get("sigma_6h_pct")
         fc["expected_move_pct"]=p.get("expected_move_pct")
         fc["signal_strength"]=p.get("signal_strength");fc["uncertainty"]=p.get("uncertainty")
         fc["council_status"]=council["status"]
@@ -582,7 +591,12 @@ def selftest():
         assert res2["session"]["n_updates"]>=1
         assert res2["session"]["initial"] is not None
         assert res2["forecast"]["version"]>1
-        # смена 15-мин окна -> новая сессия (сдвигаем время принудительно)
+        # свежий пересчёт прогноза 6ч и 24ч на каждую заявку
+        out6=eng.compute_outlook("TESTUSDT",6)
+        assert out6["horizon_h"]==6 and out6["computed_fresh"] is True,out6
+        out24=eng.compute_outlook("TESTUSDT",24)
+        assert out24["horizon_h"]==24 and out24["computed_fresh"] is True,out24
+        # смена 6ч окна -> новая сессия (сдвигаем время принудительно)
         s=eng.sessions["TESTUSDT"];s["bucket"]-=1
         res3=eng.compute("TESTUSDT")
         assert res3["session"]["is_initial"],"новое окно обязано дать новую сессию"

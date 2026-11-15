@@ -1,25 +1,22 @@
-"""24H OUTLOOK ENGINE v8.1 (ТЗ §16, v2 Дополнение).
+"""OUTLOOK ENGINE 6H & 24H v9.0 (ENA).
 
-Отдельный прогноз на 24 часа: P(UP)/P(FLAT)/P(DOWN) с фиксированным
-порогом, сценарии (base/bull/bear), драйверы, события и условия отмены.
+Независимые горизонты прогноза на 6 часов и 24 часа: P(UP)/P(FLAT)/P(DOWN)
+с фиксированными порогами, сценариями (base/bull/bear), драйверами,
+новостным давлением, деривативным давлением и условиями отмены.
 
-Пороги фиксируются ДО тестирования (§16.3): UP/DOWN = max(0.75%, 1.5σ24h)
-— учитывает комиссии taker round-trip 0.11% + шум; одинаковые при оценке
-на истории. Никакого «точного предсказания цены» — калиброванные
-вероятности и честная маркировка EXPERIMENTAL / NOT CALIBRATED, пока
-выборка проверенных прогнозов < 30.
-
-Новостной pipeline (§16.1): факты отделены от интерпретации, дубликаты
-синдицированных копий не считаются подтверждениями, слухи маркируются.
+Пороги фиксируются ДО тестирования:
+- 6ч:  UP/DOWN = max(0.35%, 1.5σ6h)
+- 24ч: UP/DOWN = max(0.75%, 1.5σ24h)
 """
 import math,time
 
-ENGINE_VERSION="outlook24_v1"
-CALC_VERSION="outlook24_calc_v1"
+ENGINE_VERSION="outlook_v9"
+CALC_VERSION="outlook_calc_v2"
 
-# Фиксированный порог (§16.3): не меняется задним числом
+# Фиксированные пороги (§16.3): не меняются задним числом
 FEE_RT_PCT=0.11       # taker round-trip Bybit
-UPDOWN_MIN_PCT=0.75   # минимум: ниже — движение неотличимо от шума
+UPDOWN_MIN_PCT=0.75   # 24ч минимум: ниже — движение неотличимо от шума
+UPDOWN_MIN_6H_PCT=0.35  # 6ч минимум: ниже — шум внутридневного диапазона
 
 # Типы событий классификатора (§16.2)
 EVENT_TYPES=("regulation","etf","listing","delisting","exploit","outage",
@@ -27,11 +24,17 @@ EVENT_TYPES=("regulation","etf","listing","delisting","exploit","outage",
              "partnership","upgrade","insolvency","security","rumor")
 
 def threshold_pct(sigma_24h_pct=None):
-    """Порог UP/DOWN/FLAT: max(UPDOWN_MIN, fees) и не меньше 1.5σ, если σ известна.
-    Определяется ДО оценки; одинаков на истории и в бою."""
+    """Порог UP/DOWN/FLAT 24ч: max(UPDOWN_MIN_PCT, fees) и >= 1.5σ."""
     base=max(UPDOWN_MIN_PCT,FEE_RT_PCT)
     if sigma_24h_pct and sigma_24h_pct>0:
         return round(max(base,1.5*sigma_24h_pct),4)
+    return round(base,4)
+
+def threshold_pct_6h(sigma_6h_pct=None):
+    """Порог UP/DOWN/FLAT 6ч: max(UPDOWN_MIN_6H_PCT, fees) и >= 1.5σ6h."""
+    base=max(UPDOWN_MIN_6H_PCT,FEE_RT_PCT)
+    if sigma_6h_pct and sigma_6h_pct>0:
+        return round(max(base,1.5*sigma_6h_pct),4)
     return round(base,4)
 
 
@@ -109,22 +112,16 @@ def news_pressure(events):
     return round(score,3),drivers
 
 
-# ---------------- 24H движок ----------------
+# ---------------- единый свежий расчёт 6H / 24H ----------------
 
-def outlook_24h(klines=None,trend=None,news_items=None,memory_stats=None,
-                deriv=None,now=None):
-    """24H OUTLOOK: тренд + моментум + волатильность + новости + калибровка.
-
-    Возвращает P(UP)/P(FLAT)/P(DOWN) (сумма строго 1.0), диапазон движения
-    (80% интервал), base/bull/bear сценарии, драйверы, события 24ч,
-    условия отмены. Не подменяет 15м прогноз (§19: отдельные горизонты)."""
+def _build_outlook(horizon_h=24,klines=None,trend=None,news_items=None,
+                   memory_stats=None,deriv=None,now=None):
+    """Свежий расчёт прогноза на заданный горизонт (6ч или 24ч) без устаревшего кэша."""
+    h=6 if int(horizon_h)<=6 else 24
     now=now or int(time.time())
     t0=time.time()
     trend_missing=trend is None or trend.get("status")!="OK"
-    # ---- 1) тренд-контекст (переиспользуем mm_trend, не дублируем) ----
     if trend_missing and klines is None:
-        # klines=None означает «данных нет» (Kotlin передаёт {} при пустом кэше);
-        # честно строим INSUFFICIENT без попыток фетчить
         trend={"status":"INSUFFICIENT","reason":"нет свечей для тренд-слоя"}
     elif trend_missing and klines:
         try:
@@ -134,21 +131,42 @@ def outlook_24h(klines=None,trend=None,news_items=None,memory_stats=None,
             trend={"status":"INSUFFICIENT","reason":"тренд-слой недоступен"}
     else:
         trend=trend or {}
-    # ---- 2) волатильность 24ч из 60m-свечей ----
+
     sigma=None
-    rows=(klines or {}).get("60") or []
-    if len(rows)>=48:
-        closes=[r[4] for r in rows[-48:]]
-        rets=[math.log(closes[i+1]/closes[i]) for i in range(len(closes)-1)]
-        if rets:
-            mean=sum(rets)/len(rets)
-            var=sum((r-mean)**2 for r in rets)/len(rets)
-            sigma=math.sqrt(var)*100.0*math.sqrt(24)  # σ на 24ч, %
-    thr=threshold_pct(sigma)
-    # ---- 3) новостное давление ----
+    if h==6:
+        rows15=(klines or {}).get("15") or []
+        rows60=(klines or {}).get("60") or []
+        if len(rows15)>=28:
+            closes=[r[4] for r in rows15[-96:]]
+            rets=[math.log(closes[i+1]/closes[i]) for i in range(len(closes)-1) if closes[i]>0 and closes[i+1]>0]
+            if rets:
+                mean=sum(rets)/len(rets)
+                var=sum((r-mean)**2 for r in rets)/len(rets)
+                sigma=math.sqrt(var)*100.0*math.sqrt(24.0)  # 24 бара по 15м = 6 часов
+        elif len(rows60)>=12:
+            closes=[r[4] for r in rows60[-48:]]
+            rets=[math.log(closes[i+1]/closes[i]) for i in range(len(closes)-1) if closes[i]>0 and closes[i+1]>0]
+            if rets:
+                mean=sum(rets)/len(rets)
+                var=sum((r-mean)**2 for r in rets)/len(rets)
+                sigma=math.sqrt(var)*100.0*math.sqrt(6.0)
+        thr=threshold_pct_6h(sigma)
+        s=sigma if (sigma and sigma>0) else 1.4
+    else:
+        rows=(klines or {}).get("60") or []
+        if len(rows)>=48:
+            closes=[r[4] for r in rows[-48:]]
+            rets=[math.log(closes[i+1]/closes[i]) for i in range(len(closes)-1) if closes[i]>0 and closes[i+1]>0]
+            if rets:
+                mean=sum(rets)/len(rets)
+                var=sum((r-mean)**2 for r in rets)/len(rets)
+                sigma=math.sqrt(var)*100.0*math.sqrt(24.0)
+        thr=threshold_pct(sigma)
+        s=sigma if (sigma and sigma>0) else 3.0
+
     events=classify_news(news_items,now)
     np,drivers=news_pressure(events)
-    # ---- 4) bias из тренда ----
+
     bias_score=0.0
     bias=trend.get("bias","NEUTRAL / RANGE")
     if "STRONG BULLISH" in bias: bias_score=1.0
@@ -157,18 +175,23 @@ def outlook_24h(klines=None,trend=None,news_items=None,memory_stats=None,
     elif "STRONG BEARISH" in bias: bias_score=-1.0
     elif "BEARISH" in bias: bias_score=-0.6
     elif "WEAK BEARISH" in bias: bias_score=-0.3
-    # persistence модулирует (тренд может выдыхаться)
     p_cont=(trend.get("persistence") or {}).get("p_continue",0.4)
-    # ---- 5) результирующий сдвиг (mu в единицах порога) ----
-    # новости и тренд — независимые контуры (§16.3)
-    edge=0.65*bias_score*p_cont/max(p_cont,0.34)+0.35*math.tanh(np/2.0)
+
+    # мягкий вклад деривативов (funding/LSR перегрев)
+    deriv_bias=0.0
+    if isinstance(deriv,dict) and deriv.get("ok"):
+        fp=deriv.get("funding_pct")
+        if fp is not None:
+            if fp>=0.04: deriv_bias-=0.2
+            elif fp<=-0.02: deriv_bias+=0.2
+        lsr_p=deriv.get("lsr_pct_rank")
+        if lsr_p is not None:
+            if lsr_p>=90: deriv_bias-=0.15
+            elif lsr_p<=10: deriv_bias+=0.15
+
+    edge=0.62*bias_score*p_cont/max(p_cont,0.34)+0.28*math.tanh(np/2.0)+0.10*max(-1.0,min(1.0,deriv_bias*2.5))
     mu=round(edge*thr,4) if thr else 0.0
-    # ---- 6) вероятности через нормальное приближение ----
-    if sigma and sigma>0:
-        s=sigma
-    else:
-        s=3.0  # консервативная σ 24ч при отсутствии истории (честно помечаем)
-        # без истории σ — прогноз слабее
+
     def phi(x): return 0.5*(1.0+math.erf(x/math.sqrt(2.0)))
     z_up=(thr-mu)/s
     z_dn=(-thr-mu)/s
@@ -181,27 +204,27 @@ def outlook_24h(klines=None,trend=None,news_items=None,memory_stats=None,
         if p_flat>=p_up and p_flat>=p_down: p_flat=round(p_flat+resid,4)
         elif p_up>=p_down: p_up=round(p_up+resid,4)
         else: p_down=round(p_down+resid,4)
-    # ---- 7) калибровка (§16.2 24H_CALIBRATION_AGENT) ----
+
     n_checked=(memory_stats or {}).get("n",0)
     calibrated=n_checked>=30
-    # статус: тренд недоступен И новостей нет И σ неизвестна -> честный
-    # INSUFFICIENT (нет даже минимальной основы); иначе DEGRADED/OK
     if trend.get("status")=="INSUFFICIENT" and not events and sigma is None:
         status="INSUFFICIENT"
     elif trend.get("status")=="OK":
         status="OK"
     else:
         status="DEGRADED"
-    # ---- 8) сценарии ----
+
     base={"move_pct":mu,"prob":round(max(p_up,p_flat,p_down),3),
           "label":"UP" if p_up>=max(p_flat,p_down) else ("DOWN" if p_down>=p_flat else "FLAT")}
     bull={"move_pct":round(mu+1.2816*s,3),"prob":round(p_up,3),"label":"BULL"}
     bear={"move_pct":round(mu-1.2816*s,3),"prob":round(p_down,3),"label":"BEAR"}
-    return {
+    half_h=3 if h==6 else 12
+    out={
         "engine":ENGINE_VERSION,"calc_version":CALC_VERSION,
         "status":status,"ts":int(time.time()*1000),
-        "horizon_h":24,
-        "threshold_pct":thr,"sigma_24h_pct":round(s,4) if s else None,
+        "horizon_h":h,"computed_fresh":True,
+        "threshold_pct":thr,
+        "sigma_pct":round(s,4) if s else None,
         "p_up":p_up,"p_flat":p_flat,"p_down":p_down,
         "expected_move_pct":mu,
         "range_low_pct":round(mu-1.2816*s,3),"range_high_pct":round(mu+1.2816*s,3),
@@ -213,10 +236,25 @@ def outlook_24h(klines=None,trend=None,news_items=None,memory_stats=None,
                        "label":"CALIBRATED" if calibrated else "EXPERIMENTAL / NOT CALIBRATED"},
         "invalidate":["P(сторона) падает ниже 35% при обновлении",
                       "новое событие типа exploit/regulation перевешивает тренд",
-                      "порог %.2f%% пробит раньше 12ч с ускорением"%(thr)],
-        "next_update":"при следующем анализе или существенном событии",
+                      "порог %.2f%% пробит раньше %dч с ускорением"%(thr,half_h)],
+        "next_update":"свежий пересчёт при каждом запросе и обновлении данных",
         "elapsed_ms":int((time.time()-t0)*1000),
     }
+    if h==6:
+        out["sigma_6h_pct"]=out["sigma_pct"]
+    else:
+        out["sigma_24h_pct"]=out["sigma_pct"]
+    return out
+
+def outlook_6h(klines=None,trend=None,news_items=None,memory_stats=None,
+               deriv=None,now=None):
+    """Актуальный 6H OUTLOOK: свежий расчёт на 6 часов с текущими данными и калибровкой."""
+    return _build_outlook(6,klines,trend,news_items,memory_stats,deriv,now)
+
+def outlook_24h(klines=None,trend=None,news_items=None,memory_stats=None,
+                deriv=None,now=None):
+    """24H OUTLOOK: тренд + моментум + волатильность + новости + калибровка."""
+    return _build_outlook(24,klines,trend,news_items,memory_stats,deriv,now)
 
 
 def brier_score(records):
@@ -293,6 +331,11 @@ def selftest():
     # 8) без тренда и без новостей — честный INSUFFICIENT
     r3=outlook_24h(None,None,[])
     assert r3["status"]=="INSUFFICIENT"
-    # 9) 24h не подменяется 15м: горизонт в ответе всегда 24
+    # 9) горизонт 24ч и новый 6ч работают независимо и пересчитываются свежо
     assert r["horizon_h"]==24
+    r6=outlook_6h({"60":_mk(300,0.002,seed=1),"15":_mk(120,0.0012,seed=2)},trend,news)
+    assert r6["horizon_h"]==6 and r6["computed_fresh"] is True
+    assert abs(r6["p_up"]+r6["p_flat"]+r6["p_down"]-1.0)<1e-6
+    assert r6["p_up"]>r6["p_down"],r6
+    assert threshold_pct_6h(None)==0.35
     print("mm_outlook24: OK")

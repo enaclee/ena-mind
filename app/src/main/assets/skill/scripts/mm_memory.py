@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""mm_memory — память прогнозов и самообучение ENA-MIND v7.0 (ЧАСТЬ 7 промпта).
+"""mm_memory — память прогнозов и самообучение ENA v9.0 (ЧАСТЬ 7 промпта).
 
-Каждый прогноз 15 минут записывается с полным контекстом:
+Каждый прогноз (по умолчанию 6 часов = 360 мин) записывается с полным контекстом:
   asset, ts, entry_price, horizon_min, initial probabilities (P up/flat/down),
   model_version, agent_results, market_regime, data_quality,
   а после истечения горизонта — actual_price, actual_return, result, error.
 
 Автопроверка: verify() находит записи с истёкшим горизонтом и закрывает их по
-фактической цене (свечи Bybit). Никакая запись не проверяется дважды.
+фактической цене (свечи Bybit) с нейтральным порогом FLAT_BAND_PCT. Никакая запись не проверяется дважды.
 
 Аналитика: forecast history, accuracy по активам/режимам/времени суток/волатильности,
 agent accuracy (голос агента против факта), model performance (Brier/калибровка),
@@ -24,10 +24,11 @@ model drift (скользящая точность против долгосро
 import json,math,os,time
 import mm_config
 
-HORIZON_MIN=15
+HORIZON_MIN=360
+FLAT_BAND_PCT=0.15
 AGENT_MIN_N=20
 WEIGHT_MIN,WEIGHT_MAX=0.5,1.5
-MEMORY_VERSION="7.0"
+MEMORY_VERSION="9.0"
 
 def _path():
     return os.path.join(mm_config.data_dir(),"forecast_memory_v7.jsonl")
@@ -78,38 +79,57 @@ def pending():
 
 def verify(fetch_klines=None):
     """Автопроверка истёкших прогнозов. fetch_klines(symbol, limit) -> rows
-    (позволяет мокать в тестах). Возвращает (n_checked, n_errors)."""
+    (позволяет мокать в тестах). Выбирает ТФ ('15' или '60') и достаточный limit
+    под horizon_min, использует порог FLAT_BAND_PCT. Возвращает (n_checked, n_errors)."""
     import mm_sources
     rows_cache={}
-    def _kl(symbol,limit=50):
-        if fetch_klines is not None: return fetch_klines(symbol,limit)
-        if symbol not in rows_cache:
-            r=mm_sources.bybit_klines(symbol,"1",limit)
-            rows_cache[symbol]=r.get("rows") or []
-        return rows_cache[symbol]
+    def _kl(symbol,horizon_min):
+        if fetch_klines is not None:
+            lim=300 if horizon_min>=180 else 250
+            return fetch_klines(symbol,lim)
+        tf="15" if horizon_min>=180 else "1"
+        lim=300 if horizon_min>=180 else 250
+        key=(symbol,tf)
+        if key not in rows_cache:
+            r=mm_sources.bybit_klines(symbol,tf,lim)
+            rows=r.get("rows") or []
+            if not rows and tf!="60":
+                r2=mm_sources.bybit_klines(symbol,"60",200)
+                rows=r2.get("rows") or []
+            rows_cache[key]=rows
+        return rows_cache[key]
     pend=pending()
     if not pend: return 0,0
     recs=_load_all()
     n_ok=n_err=0
     for p in pend:
         try:
-            rows=_kl(p["asset"],50)
+            hmin=float(p.get("horizon_min") or HORIZON_MIN)
+            rows=_kl(p["asset"],hmin)
             entry_ts=p["ts"]/1000.0
             entry_price=p.get("entry_price")
             if not rows or not entry_price:
                 _close(p,recs,None,None,"нет данных для проверки")
                 n_err+=1;continue
             # ближайшая свеча к моменту истечения горизонта
-            target_ts=entry_ts+float(p.get("horizon_min") or HORIZON_MIN)*60.0
+            target_ts=entry_ts+hmin*60.0
             fut=[r for r in rows if r[0]/1000.0>=target_ts]
             if not fut:
-                # горизонт только что истёк и 1m-свечей ещё нет — оставляем на следующий вызов
+                # горизонт ещё не закрыт свечой — оставляем до следующего вызова
                 continue
             actual=fut[0][4]
             ret=100.0*(actual-entry_price)/entry_price if entry_price else None
             prob=p.get("p") or {}
             side=prob.get("side") or p.get("side") or "FLAT"
-            actual_side="UP" if ret>0 else ("DOWN" if ret<0 else "FLAT")
+            band=float(p.get("flat_band_pct") or (FLAT_BAND_PCT if hmin>=60 else 0.08))
+            if ret is None:
+                actual_side="FLAT"
+            elif ret>band:
+                actual_side="UP"
+            elif ret<-band:
+                actual_side="DOWN"
+            else:
+                actual_side="FLAT"
             hit=1 if side==actual_side else 0
             _close(p,recs,actual,ret,"OK",hit=hit,actual_side=actual_side)
             n_ok+=1
@@ -271,26 +291,36 @@ def selftest():
     d=tempfile.mkdtemp()
     os.environ["MM5_DATA_DIR"]=d
     try:
-        # store + verify с мок-свечами (без сети)
+        # store + verify на 6-часовом горизонте (без сети)
         for i,p_up in enumerate((0.62,0.58,0.71,0.55,0.65)):
-            store({"id":"F%d"%i,"asset":"BTCUSDT","ts":(time.time()-(30+i)*60)*1000,
-                   "entry_price":100.0,"horizon_min":15,
+            store({"id":"F%d"%i,"asset":"BTCUSDT","ts":(time.time()-(420+i*15)*60)*1000,
+                   "entry_price":100.0,"horizon_min":360,
                    "p":{"p_up":p_up,"p_flat":0.2,"p_down":1-p_up-0.2,
                         "side":"UP" if p_up>0.5 else "DOWN"},
                    "side":"UP","model_version":"test","regime":"trend_up",
                    "data_quality":"A","volatility_band":"mid",
                    "agents":[{"agent":"PRICE_ANALYST","side":"LONG","confidence":0.6},
                              {"agent":"ORDER_FLOW_ANALYST","side":"SHORT","confidence":0.55}]})
-        # цена растёт -> UP-прогнозы должны попадать (окно покрывает все горизонты записей)
-        kl={"BTCUSDT":[[ (time.time()-k*60)*1000,100,101,99,100+ (90-k)*0.5,1.0] for k in range(90,0,-1)]}
-        def mock_fetch(symbol,limit=50): return kl[symbol]
+        # тест deadband для FLAT: движение +0.05% (< 0.15%) засчитывается как FLAT
+        store({"id":"FLAT0","asset":"FLATUSD","ts":(time.time()-400*60)*1000,
+               "entry_price":100.0,"horizon_min":360,
+               "p":{"p_up":0.2,"p_flat":0.6,"p_down":0.2,"side":"FLAT"},
+               "side":"FLAT","model_version":"test","regime":"range"})
+        # 15m-свечи покрывают последние 10 часов (40 баров)
+        kl={
+            "BTCUSDT":[[ (time.time()-k*900)*1000,100,101,99,100+(40-k)*0.4,1.0] for k in range(40,0,-1)],
+            "FLATUSD":[[ (time.time()-k*900)*1000,100,100.1,99.9,100.05,1.0] for k in range(40,0,-1)],
+        }
+        def mock_fetch(symbol,limit=300): return kl[symbol]
         n,err=verify(fetch_klines=mock_fetch)
-        assert n>=4 and err==0,(n,err)
+        assert n>=5 and err==0,(n,err)
+        flat_rec=[r for r in _load_all() if r.get("id")=="FLAT0"][0]
+        assert flat_rec["actual_side"]=="FLAT" and flat_rec["hit"]==1,flat_rec
         # повторная проверка ничего не закрывает
         n2,_=verify(fetch_klines=mock_fetch)
         assert n2==0
         s=stats()
-        assert s["total"]==5 and s["checked"]["n"]>=4,s
+        assert s["total"]>=6 and s["checked"]["n"]>=5,s
         assert "by_asset" in s and "by_hour" in s and "by_volatility" in s
         assert s["by_asset"].get("BTCUSDT",{}).get("n",0)>=4
         # точность агентов: PRICE LONG был прав (рынок рос), FLOW SHORT ошибался
@@ -302,8 +332,8 @@ def selftest():
         assert w0=={} or all(v==1.0 for v in w0.values()),w0
         # докидываем записи до порога AGENT_MIN_N (по умолчанию 20)
         for i in range(25):
-            store({"id":"G%d"%i,"asset":"BTCUSDT","ts":(time.time()-(60+i)*60)*1000,
-                   "entry_price":100.0,"horizon_min":15,
+            store({"id":"G%d"%i,"asset":"BTCUSDT","ts":(time.time()-(380+i)*60)*1000,
+                   "entry_price":100.0,"horizon_min":360,
                    "p":{"p_up":0.6,"p_flat":0.2,"p_down":0.2,"side":"UP"},
                    "side":"UP","model_version":"test","regime":"range",
                    "agents":[{"agent":"PRICE_ANALYST","side":"LONG","confidence":0.6}]})

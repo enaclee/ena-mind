@@ -452,34 +452,64 @@ def agent_derivatives(fb):
 def agent_cross_exchange(fb):
     cross=fb.get("cross") or {}
     parts=cross.get("parts") or {}
+    mv=fb.get("multi_venue") or {}
     prices={}
     if parts.get("bybit",{}).get("ok"): prices["bybit"]=parts["bybit"]["last"]
     if parts.get("binance_price",{}).get("ok"): prices["binance"]=parts["binance_price"]["last"]
     if parts.get("okx_price",{}).get("ok"): prices["okx"]=parts["okx_price"]["last"]
+    try:
+        cb_p=float(mv.get("coinbase_price") or 0.0)
+        if cb_p>0: prices["coinbase"]=cb_p
+    except Exception:
+        pass
+    try:
+        kr_p=float(mv.get("kraken_price") or 0.0)
+        if kr_p>0: prices["kraken"]=kr_p
+    except Exception:
+        pass
     if len(prices)<2:
         return _agent("CROSS_EXCHANGE_ANALYST","INSUFFICIENT",
                       evidence=["живых цен меньше двух бирж (нужен подтверждённый сигнал)"],
                       features={"n_exchanges":len(prices)})
-    feat={"prices":prices,"diffs":cross.get("diffs") or {}}
+    diffs=dict(cross.get("diffs") or {})
+    bybit_p=prices.get("bybit")
+    if bybit_p and bybit_p>0:
+        for vn in ("coinbase","kraken"):
+            vp=prices.get(vn)
+            if vp and vp>0 and ("%s_bybit_bps"%vn) not in diffs:
+                diffs["%s_bybit_bps"%vn]=round((vp-bybit_p)/bybit_p*10000.0,2)
+    feat={"prices":prices,"diffs":diffs,"n_exchanges":len(prices)}
     ev=[]
     max_bps=0.0
-    for k,v in (cross.get("diffs") or {}).items():
+    for k,v in diffs.items():
         ev.append("спред %s: %+.2f bps"%(k.replace("_bps","").replace("_"," "),v))
         max_bps=max(max_bps,abs(v))
     feat["max_spread_bps"]=round(max_bps,2)
-    # потоки трёх бирж: подтверждение агрессии
+    # потоки нескольких бирж: подтверждение агрессии
     deltas=[]
     for nm in ("binance_flow","okx_flow"):
         d=parts.get(nm) or {}
         if d.get("ok"): deltas.append(d.get("delta_pct"))
     tape=fb.get("tape") or {}
     if tape.get("ok"): deltas.append(tape.get("delta_pct"))
+    vel_sec=float(mv.get("binance_trade_vel_sec") or 0.0)
+    aggr_buy=float(mv.get("binance_aggr_buy_pct") or 0.0)
+    whale_usd=float(mv.get("binance_whale_spike_usd") or 0.0)
+    if vel_sec>0:
+        feat["binance_trade_vel_sec"]=round(vel_sec,2)
+        feat["binance_aggr_buy_pct"]=round(aggr_buy,1)
+        if aggr_buy>0:
+            deltas.append((aggr_buy-50.0)*2.0)
+        ev.append("скорость ленты Binance: %.1f сд/с · покупки %.1f%%"%(vel_sec,aggr_buy))
+    if whale_usd>=50000:
+        feat["binance_whale_spike_usd"]=round(whale_usd,0)
+        ev.append("крупный принт Binance: $%.0f"%whale_usd)
     same=0
     if len(deltas)>=2:
         pos=sum(1 for x in deltas if x>1.0);neg=sum(1 for x in deltas if x<-1.0)
         feat["flow_agree_exchanges"]=max(pos,neg);feat["flow_total_exchanges"]=len(deltas)
-        if pos>=2 and pos>neg: same=1;ev.append("агрессивные покупки подтверждаются на %d/%d биржах"%(pos,len(deltas)))
-        elif neg>=2 and neg>pos: same=-1;ev.append("агрессивные продажи подтверждаются на %d/%d биржах"%(neg,len(deltas)))
+        if pos>=2 and pos>neg: same=1;ev.append("агрессивные покупки подтверждаются на %d/%d потоках"%(pos,len(deltas)))
+        elif neg>=2 and neg>pos: same=-1;ev.append("агрессивные продажи подтверждаются на %d/%d потоках"%(neg,len(deltas)))
         else: ev.append("потоки бирж расходятся — подтверждения нет")
     # funding расхождение
     f_by=parts.get("bybit",{}).get("funding_pct");f_ok=parts.get("okx_funding",{}).get("funding_pct")
@@ -487,11 +517,13 @@ def agent_cross_exchange(fb):
         feat["funding_divergence_pp"]=round(abs(f_by-f_ok),4)
         ev.append("funding bybit %+.4f%% vs okx %+.4f%%"%(f_by,f_ok))
     score=0.55*same if same else 0.0
+    if vel_sec>=15.0 and abs(aggr_buy-50.0)>=12.0:
+        score+=0.25 if aggr_buy>50.0 else -0.25
     if max_bps>15:  # сильный межбиржевой дисбаланс — доверие ниже
         feat["note"]="межбиржевой спред %.1f bps — арбитражный шум"%max_bps
         score*=0.5
     side="LONG" if score>0.2 else ("SHORT" if score<-0.2 else "NEUTRAL")
-    conf=_clamp(0.3+0.4*abs(score),0.3,0.7)
+    conf=_clamp(0.3+0.4*abs(score),0.3,0.75)
     if side=="NEUTRAL": conf=_clamp(0.2+0.25*abs(score),0.2,0.45)
     return _agent("CROSS_EXCHANGE_ANALYST","OK",side,conf,feat,ev,
                   invalidate=["подтверждающий поток исчезает на одной из бирж",
@@ -609,15 +641,15 @@ def agent_volatility(fb):
         if ratio>=1.6: ev.append("расширение волатильности (x%.2f) — импульс"%ratio)
         elif ratio<=0.6: ev.append("сжатие волатильности (x%.2f) — готовится пробой"%ratio)
         else: ev.append("волатильность ровная (x%.2f)"%ratio)
-    # 15-минутный горизонт прогноза: σ ожидаемого движения
-    rv15=None
-    if rv is not None: rv15=rv*math.sqrt(15.0)
+    # 6-часовой горизонт прогноза: σ ожидаемого движения
+    rv6h=None
+    if rv is not None: rv6h=rv*math.sqrt(360.0)
     if ev_ is not None:
-        alt15=ev_*math.sqrt(15.0)
-        rv15=max(rv15 or 0,alt15*0.5+ (rv15 or 0)*0.5) if rv15 else alt15
-    if rv15 is None and atr_pct is not None:
-        rv15=atr_pct*math.sqrt(15.0)
-    feat["sigma_15m_pct"]=round(rv15,4) if rv15 is not None else None
+        alt6h=ev_*math.sqrt(360.0)
+        rv6h=max(rv6h or 0,alt6h*0.5+(rv6h or 0)*0.5) if rv6h else alt6h
+    if rv6h is None and atr_pct is not None:
+        rv6h=atr_pct*math.sqrt(360.0)
+    feat["sigma_6h_pct"]=round(rv6h,4) if rv6h is not None else None
     # классификация режима (ЧАСТЬ 4: TREND UP/DOWN, RANGE, HIGH/LOW VOL, BREAKOUT, UNCERTAIN)
     closes15=[r[4] for r in (kl.get("15") or [])]
     trend=None
@@ -626,10 +658,10 @@ def agent_volatility(fb):
         if e10 and e25: trend="UP" if e10>e25 else "DOWN"
     regime="UNCERTAIN"
     if ratio is not None and ratio>=1.8: regime="BREAKOUT"
-    elif trend=="UP" and (rv15 or 0)<0.35: regime="TREND UP"
-    elif trend=="DOWN" and (rv15 or 0)<0.35: regime="TREND DOWN"
-    elif (rv15 or 0)>=0.5: regime="HIGH VOLATILITY"
-    elif (rv15 or 0)<=0.12: regime="LOW VOLATILITY"
+    elif trend=="UP" and (rv6h or 0)<1.8: regime="TREND UP"
+    elif trend=="DOWN" and (rv6h or 0)<1.8: regime="TREND DOWN"
+    elif (rv6h or 0)>=2.4: regime="HIGH VOLATILITY"
+    elif (rv6h or 0)<=0.5: regime="LOW VOLATILITY"
     elif trend: regime="RANGE"
     feat["regime"]=regime
     ev.append("режим: %s"%regime)
@@ -701,7 +733,7 @@ def agent_statistical(fb):
         return _agent("STATISTICAL_AI","INSUFFICIENT",evidence=["признаки вне области модели"])
     feat={"p_up_model":round(p_up,4),"model_version":model.get("version"),
           "model_n":model.get("train_n"),"features":{k:round(v,5) for k,v in feats.items()}}
-    ev=["модель %s: P(up 15м)=%.3f (обучение n=%d, walk-forward)"%(
+    ev=["модель %s: P(up 6ч)=%.3f (обучение n=%d, walk-forward)"%(
         model.get("version"),p_up,model.get("train_n"))]
     # аномалии объёма (z-score)
     vols=[r[5] for r in rows1[-90:]]
@@ -1189,13 +1221,13 @@ def agent_prediction(agents,fb,weights=None):
     if longs and shorts:
         contradictions.append("противоречие: %s за LONG против %s за SHORT"%(
             ",".join(a["agent"] for a in longs),",".join(a["agent"] for a in shorts)))
-    vol=None;sigma15=None
+    vol=None;sigma6h=None
     for a in agents:
         if a["agent"]=="VOLATILITY_ANALYST" and a["status"]=="OK":
-            sigma15=a["features"].get("sigma_15m_pct");vol=a
-    if sigma15 is None or sigma15<=0:
+            sigma6h=a["features"].get("sigma_6h_pct");vol=a
+    if sigma6h is None or sigma6h<=0:
         return _agent("PREDICTION_AGENT","INSUFFICIENT",
-                      evidence=evidence+["σ 15м неизвестна — вероятности не строятся"],
+                      evidence=evidence+["σ 6ч неизвестна — вероятности не строятся"],
                       contradictions=contradictions)
     # модельный приор (если STATISTICAL_AI жив)
     prior_logit=0.0
@@ -1204,16 +1236,16 @@ def agent_prediction(agents,fb,weights=None):
             p=_clamp(a["features"]["p_up_model"],0.02,0.98)
             prior_logit=math.log(p/(1-p))
             evidence.append("приор модели: logit=%.2f"%round(prior_logit,2))
-    # ожидаемое движение: mu = edge_norm * sigma * k
-    k=0.35
-    mu=norm*sigma15*k
+    # ожидаемое движение на горизонте 6ч: mu = edge_norm * sigma6h * k
+    k=0.38
+    mu=norm*sigma6h*k
     logit=3.0*norm+0.6*prior_logit
-    # порог FLAT: шум (половина сигмы) и издержки (taker round-trip 0.11% + проскальзывание)
-    fees_rt=0.11
-    thr=max(0.5*sigma15,fees_rt)
+    # порог FLAT: шум и издержки (taker round-trip 0.11% + минимум 0.35% для 6ч)
+    fees_rt=0.35
+    thr=max(0.45*sigma6h,fees_rt)
     # вероятности через нормальное распределение движения
     def _phi(x): return 0.5*(1.0+math.erf(x/math.sqrt(2.0)))
-    z_up=(thr-mu)/sigma15;z_dn=(-thr-mu)/sigma15
+    z_up=(thr-mu)/sigma6h;z_dn=(-thr-mu)/sigma6h
     p_down=_phi(z_dn)
     p_up=1.0-_phi(z_up)
     p_flat=max(0.0,1.0-p_up-p_down)
@@ -1229,12 +1261,13 @@ def agent_prediction(agents,fb,weights=None):
     ent=-sum(p*math.log(p+1e-12) for p in (p_up,p_flat,p_down))/math.log(3.0)
     uncertainty=ent
     feat={"p_up":round(p_up,4),"p_flat":round(p_flat,4),"p_down":round(p_down,4),
-          "expected_move_pct":round(mu,4),"sigma_15m_pct":round(sigma15,4),
+          "horizon_h":6,
+          "expected_move_pct":round(mu,4),"sigma_6h_pct":round(sigma6h,4),
           "flat_threshold_pct":round(thr,4),"signal_strength":round(strength,4),
           "uncertainty":round(uncertainty,4),"logit":round(logit,3),
           "n_voting_agents":len(uniq),"n_total_agents":len([a for a in agents if a["status"]=="OK"])}
     # ожидаемый диапазон (80% интервал)
-    feat["range_low_pct"]=round(mu-1.2816*sigma15,4);feat["range_high_pct"]=round(mu+1.2816*sigma15,4)
+    feat["range_low_pct"]=round(mu-1.2816*sigma6h,4);feat["range_high_pct"]=round(mu+1.2816*sigma6h,4)
     price=fb.get("price")
     if price:
         feat["range_low"]=round(price*(1+feat["range_low_pct"]/100.0),6)
@@ -1268,8 +1301,8 @@ def agent_prediction(agents,fb,weights=None):
     argmax=p_up if side=="UP" else (p_down if side=="DOWN" else p_flat)
     evidence.insert(0,"P(UP)=%.1f%% P(FLAT)=%.1f%% P(DOWN)=%.1f%% (сумма 100%%)"%(
         p_up*100,p_flat*100,p_down*100))
-    evidence.insert(1,"ожидаемое движение %+.3f%% ± %.3f%% за 15м (порог FLAT %.3f%%)"%(
-        mu,sigma15,thr))
+    evidence.insert(1,"ожидаемое движение %+.3f%% ± %.3f%% за 6ч (порог FLAT %.3f%%)"%(
+        mu,sigma6h,thr))
     alt="альтернативный сценарий: %s (%.1f%%) при %s"%(
         {"UP":"DOWN","DOWN":"UP","FLAT":"UP" if p_down>p_up else "DOWN"}[side],
         (p_down if side!="DOWN" else p_up)*100 if side!="FLAT" else max(p_up,p_down)*100,
@@ -1378,7 +1411,7 @@ def selftest():
     assert agent_btc_correlation({"alt_klines":{},"klines":{"1":[]}},"SOLUSDT")["status"]=="INSUFFICIENT"
     # 07 VOLATILITY: на трендовом ряду — режим и сигма
     a=agent_volatility({"klines":kl,"price":up[-1][4]})
-    assert a["status"]=="OK" and a["features"].get("sigma_15m_pct",0)>0,a
+    assert a["status"]=="OK" and a["features"].get("sigma_6h_pct",0)>0,a
     assert a["features"].get("regime")
     assert agent_volatility({"klines":{"1":flat[:40]}})["status"]=="INSUFFICIENT"
     # 08 SENTIMENT: никогда не определяет сторону

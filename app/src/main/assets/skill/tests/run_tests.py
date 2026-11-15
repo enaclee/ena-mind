@@ -341,8 +341,8 @@ def integration_v7_no_lookahead():
     f2=mm_stats.features_at(rows2,400)
     assert f1==f2,"LOOKAHEAD: признаки зависят от будущих свечей"
 def integration_v7_engine_sessions():
-    """ЧАСТИ 6-7: сессии 15-мин прогнозов — начальная версия хранится, обновления
-    не перезаписывают её; вероятности строго суммируются в 100%; grade D честен."""
+    """ЧАСТИ 6-7: сессии 6-час прогнозов — начальная версия хранится, обновления
+    не перезаписывают её; вероятности строго суммируются в 100%; свежие 6ч/24ч пересчёты."""
     import mm_engine,tempfile,time,random
     old=os.environ.get("MM5_DATA_DIR")
     td=tempfile.mkdtemp();os.environ["MM5_DATA_DIR"]=td
@@ -377,10 +377,17 @@ def integration_v7_engine_sessions():
         r2=eng.compute("V7USDT")
         assert not r2["session"]["is_initial"] and r2["forecast"]["version"]==2
         assert r2["session"]["initial"]==r1["session"]["initial"]
-        # смена окна -> новая сессия (новый независимый прогноз)
+        # смена 6ч окна -> новая сессия (новый независимый прогноз)
         eng.sessions["V7USDT"]["bucket"]-=1
         r3=eng.compute("V7USDT")
         assert r3["session"]["is_initial"] and r3["forecast"]["version"]==1
+        assert r3["forecast"]["horizon_h"]==6
+        # свежий пересчёт 6ч и 24ч от текущих данных
+        o6=eng.compute_outlook("V7USDT",6)
+        o24=eng.compute_outlook("V7USDT",24)
+        assert o6["horizon_h"]==6 and o6["computed_fresh"] is True
+        assert o24["horizon_h"]==24 and o24["computed_fresh"] is True
+        assert abs(o6["p_up"]+o6["p_flat"]+o6["p_down"]-1.0)<1e-6
         # grade D: устаревшие свечи -> отказ без выдуманных чисел
         stale=[r[:] for r in up];stale[-1][0]=int((time.time()-900)*1000)
         eng.set_klines("STALE7","1",stale)
@@ -461,13 +468,16 @@ def integration_v81_trend_card():
     assert r["entry_quality"] in ("GOOD","MEDIUM","LOW")
     assert r["risk"] in ("NORMAL","ELEVATED","COMPRESSED")
 def integration_v81_outlook_thresholds():
-    """v8.1 (ТЗ §16.3): порог 24H фиксирован ДО оценки; UP/FLAT/DOWN в сумме 1;
+    """v9.0: пороги 6H/24H фиксированы ДО оценки; UP/FLAT/DOWN в сумме 1;
     слух не создаёт давления; маркировка NOT CALIBRATED до 30 проверок."""
     import mm_outlook24
     assert mm_outlook24.threshold_pct(None)==0.75
+    assert mm_outlook24.threshold_pct_6h(None)==0.35
     r=mm_outlook24.outlook_24h(None,{"status":"INSUFFICIENT"},[])
     assert r["status"]=="INSUFFICIENT"
     assert "NOT CALIBRATED" in r["calibration"]["label"]
+    r6=mm_outlook24.outlook_6h(None,{"status":"INSUFFICIENT"},[])
+    assert r6["horizon_h"]==6 and r6["status"]=="INSUFFICIENT"
 def integration_v81_graph_degradation():
     """v8.1 (ТЗ §26.4/26.5): необязательный узел недоступен -> degraded, путь
     продолжается; критический упал -> зависимые skipped, отчёт честный."""
