@@ -423,42 +423,30 @@ class EnaMindParserRobolectricTest {
     }
 
     @Test
-    fun outlook_text_formats_range_80_pct_safely_without_conversion_crash() {
-        val payload = org.json.JSONObject().apply {
-            put("ok", true)
-            put("horizon_hours", 24)
-            put("side", "LONG")
-            put("p_up", 0.54)
-            put("p_flat", 0.24)
-            put("p_down", 0.22)
-            put("threshold_pct", 0.85)
-            put("expected_move_pct", 1.15)
-            put("range_low_pct", -1.40)
-            put("range_high_pct", 2.90)
-            put("sigma_24h_pct", 2.15)
-            put("range_low_price", 63500.0)
-            put("range_high_price", 66800.0)
-            put(
-                "drivers",
-                org.json.JSONArray().apply {
-                    put("Кросс-биржевое опережение Coinbase +18 bps")
-                    put(org.json.JSONObject().put("title", "Приток стейблкоинов").put("n_copies", 2))
-                }
-            )
-            put("invalidation", org.json.JSONArray().put("Пробой вниз 63200"))
-            put("calibration", "Brier 0.21")
-        }
-        val rendered = com.enamind.ai.ui.outlookText(payload, 24)
-        assertTrue(rendered.contains("Диапазон 80%:"))
-        assertTrue(rendered.contains("24 часа"))
-        assertTrue(rendered.contains("Кросс-биржевое опережение"))
-        assertTrue(rendered.contains("Brier 0.21"))
-
-        val nanPayload = org.json.JSONObject(
-            """{"ok":true,"horizon_hours":6,"p_up":"NaN","p_flat":0.5,"p_down":0.5,"threshold_pct":"NaN","expected_move_pct":"NaN","range_low_pct":"NaN","range_high_pct":"NaN"}"""
+    fun outlook_summary_formats_json_with_range_and_drivers_cleanly() {
+        val summary = com.enamind.ai.intelligence.OutlookSummary(
+            horizonHours = 24,
+            side = "UP",
+            pUp = 0.54,
+            pFlat = 0.24,
+            pDown = 0.22,
+            expectedMovePct = 1.15,
+            sigmaPct = 2.15,
+            rangeLowPct = -1.40,
+            rangeHighPct = 2.90,
+            thresholdPct = 0.85,
+            calibrationLabel = "Brier 0.21",
+            drivers = listOf("Кросс-биржевое опережение Coinbase +18 bps"),
+            invalidationRules = listOf("Пробой вниз 63200")
         )
-        val safeNaN = com.enamind.ai.ui.outlookText(nanPayload, 6)
-        assertFalse(safeNaN.contains("NaN"))
-        assertTrue(safeNaN.contains("6 часов"))
+        val rendered = summary.toJson("BTCUSDT", 65000.0)
+        assertTrue(rendered.optBoolean("ok"))
+        assertEquals(24, rendered.optInt("horizon_hours"))
+        assertEquals(0.54, rendered.optDouble("p_up"), 1e-6)
+        assertEquals("Brier 0.21", rendered.optString("calibration"))
+        assertTrue(rendered.optDouble("range_low_price") < 65000.0)
+        assertTrue(rendered.optDouble("range_high_price") > 65000.0)
+        assertTrue(rendered.getJSONArray("drivers").getString(0).contains("Кросс-биржевое"))
+        assertEquals("Пробой вниз 63200", rendered.getJSONArray("invalidation").getString(0))
     }
 }

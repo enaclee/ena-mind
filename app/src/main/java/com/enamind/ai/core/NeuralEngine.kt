@@ -3,6 +3,7 @@ package com.enamind.ai.core
 import android.content.Context
 import android.util.Log
 import com.enamind.ai.bybit.BinanceWs
+import com.enamind.ai.bybit.BookState
 import com.enamind.ai.bybit.BybitWs
 import com.enamind.ai.bybit.MultiVenueDataBridge
 import com.enamind.ai.bybit.OkxWs
@@ -34,7 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * NEURAL FORECAST ENGINE v9.0 — Единый оркестратор (Python + 9 Kotlin-ботов + Multi-Venue + RealTime Lead + Chain Radar + Sentinel).
+ * NEURAL FORECAST ENGINE — Единый оркестратор (Python + Kotlin-боты + Order Flow + Multi-Venue + Chain Radar + Sentinel).
  */
 class NeuralEngine(
     private val ctx: Context,
@@ -43,7 +44,6 @@ class NeuralEngine(
     companion object {
         val WATCHLIST = Settings.SYMBOLS
         private const val TAG = "NeuralEngine"
-        const val ENGINE_VERSION = "9.0"
     }
 
     private val scope: CoroutineScope get() = state.appScope
@@ -81,7 +81,7 @@ class NeuralEngine(
     private val _intelligence = MutableStateFlow<UnifiedIntelligenceReport?>(null)
     val intelligence: StateFlow<UnifiedIntelligenceReport?> = _intelligence
 
-    /** Живой упреждающий предиктор 5–15м (нижняя волновая панель реального времени). */
+    /** Живой срез микроструктуры реального времени. */
     private val _realTimePulse = MutableStateFlow(
         RealTimeLeadEngine.RealTimeTrendPulse(symbol = state.market.value.symbol)
     )
@@ -179,7 +179,7 @@ class NeuralEngine(
         }
     }
 
-    /** v7.1: включить/выключить фоновый режим на лету. */
+    /** Включить/выключить фоновый режим на лету. */
     fun setBackgroundMode(on: Boolean) {
         if (on) EngineService.start(ctx) else EngineService.stop(ctx)
     }
@@ -238,6 +238,42 @@ class NeuralEngine(
             override fun onDepth(bids: List<Pair<Double, Double>>, asks: List<Pair<Double, Double>>) {
                 binanceDepth = bids to asks
                 state.onFallbackDepth(sym, bids, asks)
+                if (!state.hasFreshBybitBook()) {
+                    state.orderFlow.streamHub.recordBookSnapshot(
+                        symbol = sym,
+                        bids = bids,
+                        asks = asks,
+                        synced = true,
+                        tsMs = clockSync.exchangeNowMs(),
+                        venue = "Binance"
+                    )
+                }
+            }
+
+            override fun onTrade(price: Double, qty: Double, isAggressiveBuy: Boolean, exchangeTsMs: Long, lagMs: Long) {
+                if (!state.hasFreshBybitTrades()) {
+                    state.orderFlow.streamHub.recordTrade(
+                        symbol = sym,
+                        price = price,
+                        qty = qty,
+                        isAggressiveBuy = isAggressiveBuy,
+                        exchangeTsMs = exchangeTsMs,
+                        lagMs = lagMs,
+                        venue = "Binance"
+                    )
+                }
+            }
+
+            override fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {
+                if (!state.hasFreshBybitBook()) {
+                    state.orderFlow.streamHub.recordDomDeltas(sym, deltas, synced, lagMs, "Binance")
+                }
+            }
+
+            override fun onBookDesync(reason: String) {
+                if (!state.hasFreshBybitBook()) {
+                    state.orderFlow.streamHub.recordDesync(sym, reason, "Binance")
+                }
             }
 
             override fun onKline(bar: BybitWs.Kline) {
@@ -254,7 +290,7 @@ class NeuralEngine(
                 binanceNote = note
                 state.onFallbackStatus()
             }
-        }, klineInterval = iv).also { it.connect() }
+        }, klineInterval = iv, clockOffsetMsProvider = { clockSync.status().offsetMs }).also { it.connect() }
     }
 
     private fun connectOkxOnly() {
@@ -458,6 +494,7 @@ class NeuralEngine(
             val learnedWeights = memoryVault.currentWeights()
             val learningSnap = memoryVault.snapshot()
 
+            val ofPayload = state.orderFlow.report.value.takeIf { it.symbol == targetSym }?.councilPayload
             val report = withContext(Dispatchers.Default) {
                 TrendReasoningEngine.analyze(
                     symbol = targetSym,
@@ -472,7 +509,8 @@ class NeuralEngine(
                     clockStatus = clockSt,
                     venueSnap = venueSnap,
                     binancePrice = binancePrice,
-                    okxPrice = okxPrice
+                    okxPrice = okxPrice,
+                    orderFlow = ofPayload
                 )
             }
             val entryPx = report.price
@@ -627,6 +665,7 @@ class NeuralEngine(
             JSONObject().put("ok", true).put(key, py)
         } ?: lastPythonOkResult
 
+        val ofPayload = state.orderFlow.report.value.takeIf { it.symbol == targetSym }?.councilPayload
         val report = withContext(Dispatchers.Default) {
             TrendReasoningEngine.analyze(
                 symbol = targetSym,
@@ -641,7 +680,8 @@ class NeuralEngine(
                 clockStatus = clockSt,
                 venueSnap = venueSnap,
                 binancePrice = binancePrice,
-                okxPrice = okxPrice
+                okxPrice = okxPrice,
+                orderFlow = ofPayload
             )
         }
         if (targetSym == symbol) {
@@ -826,6 +866,23 @@ class NeuralEngine(
                     )
                 }
                 _realTimePulse.value = pulse
+
+                // Обновление модуля ENA — ORDER FLOW & ABSORPTION INTELLIGENCE в реальном времени
+                val chartBars = klinesCache["$sym:$chartInterval"] ?: state.klines.value.ifEmpty { bars1m }
+                val livePx = m.price
+                    ?: binancePrice.takeIf { it > 0.0 }
+                    ?: okxPrice.takeIf { it > 0.0 }
+                val tickSize = state.contractCatalog.findTickSize(sym)
+                withContext(Dispatchers.Default) {
+                    state.orderFlow.evaluate(
+                        symbol = sym,
+                        interval = chartInterval,
+                        tickSize = tickSize,
+                        livePrice = livePx,
+                        bars = chartBars,
+                        nowMs = clockSync.exchangeNowMs()
+                    )
+                }
 
                 // Фиксируем бакет в RealtimePulseVault и сверяем истёкшие прогнозы по живому графику
                 val px = pulse.price

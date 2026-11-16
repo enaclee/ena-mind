@@ -22,7 +22,8 @@ data class BotSignal(
     val bias: BiasDirection,
     val confidence: Double,
     val summary: String,
-    val metrics: Map<String, String> = emptyMap()
+    val metrics: Map<String, String> = emptyMap(),
+    val hasData: Boolean = true
 )
 
 data class CausalStep(
@@ -225,13 +226,13 @@ data class UnifiedIntelligenceReport(
             .put("p_down", trendLogic.pDown)
             .put("expected_move_pct", trendLogic.expectedMovePct)
             .put("horizon_hours", 6)
-            .put("sigma_6h_pct", outlook6h?.sigmaPct ?: kotlin.math.abs(trendLogic.expectedMovePct).coerceAtLeast(0.45))
+            .put("sigma_6h_pct", outlook6h?.sigmaPct ?: JSONObject.NULL)
 
         val invArr = JSONArray().apply {
             trendLogic.invalidationRules.forEach { put(it) }
         }
         val prediction = JSONObject()
-            .put("status", "OK")
+            .put("status", if (outlook6h != null) "OK" else "INSUFFICIENT")
             .put("side", side)
             .put("confidence", conf)
             .put("features", predFeatures)
@@ -321,8 +322,8 @@ data class UnifiedIntelligenceReport(
         return JSONObject().apply {
             put("ok", true)
             put("symbol", symbol)
-            put("mode", "SHADOW")
-            put("engine", "kotlin+python-v9")
+            put("mode", "ANALYTICS")
+            put("engine", "ena-core")
             put("source", sourceLabel)
             put("data", dataQuality)
             put("quant_diagnostics", quantObj)

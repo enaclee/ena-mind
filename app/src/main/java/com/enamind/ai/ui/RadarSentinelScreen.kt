@@ -23,10 +23,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.Radar
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -34,12 +36,16 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -52,30 +58,39 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.enamind.ai.calendar.MajorCalendarRepo
 import com.enamind.ai.core.AppState
 import com.enamind.ai.intelligence.BiasDirection
 import com.enamind.ai.intelligence.ChainRadarSnapshot
+import com.enamind.ai.intelligence.OutlookSummary
 import com.enamind.ai.intelligence.SentinelEvent
 import com.enamind.ai.intelligence.SentinelSeverity
 import com.enamind.ai.intelligence.TrendLogicSummary
 import com.enamind.ai.intelligence.TrendReasoningEngine
 import com.enamind.ai.intelligence.UnifiedIntelligenceReport
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 /**
- * РАДАР v8.3 — читаемый аналитический блок:
+ * РАДАР — аналитический блок:
  *   1. CHAIN RADAR — разведка блокчейна (что происходит с деньгами до графика);
  *   2. CRYPTO SENTINEL — система обнаружения аномалий и событий риска;
- *   3. РАЗУМ И БОТЫ — причинно-следственная логика тренда и согласие контуров.
+ *   3. РАЗУМ И БОТЫ — причинно-следственная логика тренда, свежие прогнозы 6ч/24ч и согласие контуров;
+ *   4. КАЛЕНДАРЬ — предстоящие крупные макро- и крипто-события в карточках (до 10 событий, без повторов, цикл 15 дней).
  */
 @Composable
 fun RadarSentinelScreen(state: AppState) {
     val market by state.market.collectAsState()
     val intel by state.engine.intelligence.collectAsState()
     val refreshing by state.engine.radarRefreshing.collectAsState()
-    var filterTab by rememberSaveable { mutableIntStateOf(0) } // 0 Всё | 1 Radar | 2 Sentinel | 3 Разум
+    val calendarState by state.majorCalendar.state.collectAsState()
+    var filterTab by rememberSaveable { mutableIntStateOf(0) } // 0 Всё | 1 Radar | 2 Sentinel | 3 Разум | 4 Календарь
 
     Column(modifier = Modifier.fillMaxSize()) {
         // Верхняя панель экрана
@@ -107,7 +122,7 @@ fun RadarSentinelScreen(state: AppState) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                if (refreshing) {
+                if (refreshing || calendarState.syncing) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(20.dp).padding(end = 4.dp),
                         strokeWidth = 2.dp,
@@ -139,7 +154,7 @@ fun RadarSentinelScreen(state: AppState) {
                 .padding(horizontal = 16.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            listOf("Всё", "Chain Radar", "Crypto Sentinel", "Разум и боты").forEachIndexed { idx, label ->
+            listOf("Всё", "Chain Radar", "Crypto Sentinel", "Разум и боты", "Календарь").forEachIndexed { idx, label ->
                 FilterChip(
                     selected = filterTab == idx,
                     onClick = { filterTab = idx },
@@ -151,7 +166,7 @@ fun RadarSentinelScreen(state: AppState) {
         }
 
         val current = intel
-        if (current == null) {
+        if (current == null && filterTab != 4) {
             Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
@@ -168,19 +183,24 @@ fun RadarSentinelScreen(state: AppState) {
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                if (filterTab == 0 || filterTab == 1) {
+                if (current != null && (filterTab == 0 || filterTab == 1)) {
                     item(key = "chain_radar_block") {
                         ChainRadarCard(current.chainRadar)
                     }
                 }
-                if (filterTab == 0 || filterTab == 2) {
+                if (current != null && (filterTab == 0 || filterTab == 2)) {
                     item(key = "crypto_sentinel_block") {
                         CryptoSentinelCard(current.sentinelEvents, market)
                     }
                 }
-                if (filterTab == 0 || filterTab == 3) {
+                if (current != null && (filterTab == 0 || filterTab == 3)) {
                     item(key = "logic_reasoner_block") {
-                        ReasoningBrainCard(current, current.trendLogic)
+                        ReasoningBrainCard(state, current, current.trendLogic)
+                    }
+                }
+                if (filterTab == 0 || filterTab == 4) {
+                    item(key = "major_calendar_block") {
+                        MajorCalendarCardBlock(state, calendarState)
                     }
                 }
             }
@@ -573,7 +593,14 @@ private fun CryptoSentinelCard(events: List<SentinelEvent>, market: AppState.Mar
 }
 
 @Composable
-private fun ReasoningBrainCard(report: UnifiedIntelligenceReport, logic: TrendLogicSummary) {
+private fun ReasoningBrainCard(
+    state: AppState,
+    report: UnifiedIntelligenceReport,
+    logic: TrendLogicSummary
+) {
+    val uiScope = rememberCoroutineScope()
+    var freshHorizon by remember { mutableStateOf<Int?>(null) }
+    var freshOutlookResult by remember { mutableStateOf<JSONObject?>(null) }
     val biasColor = when (logic.biasLabel) {
         "BULLISH" -> Color.EnaGreen
         "BEARISH" -> Color.EnaRed
@@ -583,7 +610,7 @@ private fun ReasoningBrainCard(report: UnifiedIntelligenceReport, logic: TrendLo
     RadarSectionCard(
         indexLabel = "3",
         title = "РАЗУМ И БОТЫ-АГЕНТЫ",
-        subtitle = "Причинно-следственный синтез и вычисление фазы тренда",
+        subtitle = "Причинно-следственный синтез, прогнозы 6ч/24ч и сценарии",
         icon = Icons.Outlined.Psychology,
         badgeText = "${logic.biasLabel} · ${logic.strength}/100",
         badgeColor = biasColor
@@ -624,6 +651,75 @@ private fun ReasoningBrainCard(report: UnifiedIntelligenceReport, logic: TrendLo
                     if (logic.pUp > 0) Box(Modifier.weight(logic.pUp.toFloat().coerceAtLeast(0.01f)).fillMaxHeight().background(Color.EnaGreen))
                     if (logic.pFlat > 0) Box(Modifier.weight(logic.pFlat.toFloat().coerceAtLeast(0.01f)).fillMaxHeight().background(MaterialTheme.colorScheme.outline))
                     if (logic.pDown > 0) Box(Modifier.weight(logic.pDown.toFloat().coerceAtLeast(0.01f)).fillMaxHeight().background(Color.EnaRed))
+                }
+            }
+        }
+
+        // Перенесённый блок прогнозов 6ч / 24ч и сценариев из удалённого Чата
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.background,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+        ) {
+            Column(modifier = Modifier.padding(11.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Прогнозы 6ч / 24ч и сценарии",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            freshHorizon = 6
+                            uiScope.launch {
+                                val res = withContext(Dispatchers.IO) { state.requestFreshOutlook(6) }
+                                freshOutlookResult = res
+                                freshHorizon = null
+                            }
+                        },
+                        enabled = freshHorizon == null,
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("radar_outlook_6h_button"),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text(if (freshHorizon == 6) "Расчёт 6ч…" else "Свежий 6ч", fontSize = 11.sp)
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            freshHorizon = 24
+                            uiScope.launch {
+                                val res = withContext(Dispatchers.IO) { state.requestFreshOutlook(24) }
+                                freshOutlookResult = res
+                                freshHorizon = null
+                            }
+                        },
+                        enabled = freshHorizon == null,
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("radar_outlook_24h_button"),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text(if (freshHorizon == 24) "Расчёт 24ч…" else "Свежий 24ч", fontSize = 11.sp)
+                    }
+                }
+                OutlookDetailBlock("Горизонт 6 часов", report.outlook6h)
+                OutlookDetailBlock("Горизонт 24 часа", report.outlook24h)
+                freshOutlookResult?.let { fo ->
+                    val status = fo.optString("status")
+                    val h = fo.optInt("horizon_hours", 6)
+                    if (status == "OK") {
+                        Text(
+                            "Свежий расчёт ${h}ч: UP ${(fo.optDouble("p_up") * 100).toInt()}% · FLAT ${(fo.optDouble("p_flat") * 100).toInt()}% · DOWN ${(fo.optDouble("p_down") * 100).toInt()}% (${fo.optString("note")})",
+                            fontSize = 10.5.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    } else {
+                        Text(
+                            fo.optString("error").ifBlank { "Недостаточно свежих свечей для расчёта ${h}ч" },
+                            fontSize = 10.5.sp,
+                            color = Color.EnaYellow
+                        )
+                    }
                 }
             }
         }
@@ -876,3 +972,293 @@ internal fun formatLogicProbabilityLine(logic: TrendLogicSummary): String {
 
 private fun fmtTime(ms: Long): String =
     if (ms <= 0L) "—" else SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(ms))
+
+private fun fmtDateShort(ms: Long): String =
+    if (ms <= 0L) "—" else SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(ms))
+
+private fun fmtUtcEventDate(ms: Long): String {
+    if (ms <= 0L) return "—"
+    val sdf = SimpleDateFormat("dd MMM HH:mm 'UTC'", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
+    }
+    return sdf.format(Date(ms))
+}
+
+private fun formatCountdownRu(eventTsMs: Long): String {
+    val diff = eventTsMs - System.currentTimeMillis()
+    if (diff <= -3600_000L) return "завершено"
+    if (diff <= 0L) return "идёт сейчас"
+    val mins = diff / 60_000L
+    val hours = mins / 60L
+    val days = hours / 24L
+    return when {
+        days > 0L -> "через ${days}д ${hours % 24L}ч"
+        hours > 0L -> "через ${hours}ч ${mins % 60L}м"
+        else -> "через ${mins.coerceAtLeast(1)}м"
+    }
+}
+
+@Composable
+private fun OutlookDetailBlock(title: String, o: OutlookSummary?) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+    ) {
+        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            if (o == null) {
+                Text(
+                    "$title: недостаточно свежих свечей для расчёта",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        title,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        "UP ${(o.pUp * 100).toInt()}% · FLAT ${(o.pFlat * 100).toInt()}% · DOWN ${(o.pDown * 100).toInt()}%",
+                        fontSize = 10.5.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.SemiBold,
+                        color = when {
+                            o.pUp > o.pDown + 0.08 -> Color.EnaGreen
+                            o.pDown > o.pUp + 0.08 -> Color.EnaRed
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    )
+                }
+                Text(
+                    "Ожид. ход: ${"%+.2f%%".format(Locale.US, o.expectedMovePct)} · σ ${"%.2f%%".format(Locale.US, o.sigmaPct)} · 80% диапазон: ${"%+.2f%%".format(Locale.US, o.rangeLowPct)}…${"%+.2f%%".format(Locale.US, o.rangeHighPct)}",
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                o.drivers.take(3).forEach { drv ->
+                    Text(
+                        "• $drv",
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+                o.invalidationRules.firstOrNull()?.let { inv ->
+                    Text(
+                        "Отмена сценария: $inv",
+                        fontSize = 9.5.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MajorCalendarCardBlock(
+    state: AppState,
+    calendarState: MajorCalendarRepo.CalendarUiState
+) {
+    RadarSectionCard(
+        indexLabel = "4",
+        title = "КАЛЕНДАРЬ КРУПНЫХ СОБЫТИЙ",
+        subtitle = "Предстоящие макро- и крипто-события · до 10 в карточке · цикл 15 дней",
+        icon = Icons.Outlined.CalendarMonth,
+        badgeText = "${calendarState.totalUpcoming} СОБЫТ.",
+        badgeColor = MaterialTheme.colorScheme.primary
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    "Источники: ${calendarState.sourceSummary}",
+                    fontSize = 10.5.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    "Обновлено: ${fmtDateShort(calendarState.lastSyncMs)} · след. цикл: ${fmtDateShort(calendarState.nextAutoSyncMs)}",
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            OutlinedButton(
+                onClick = { state.refreshMajorCalendar(force = true) },
+                enabled = !calendarState.syncing,
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("calendar_refresh_button"),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Text(if (calendarState.syncing) "Загрузка…" else "Обновить", fontSize = 11.sp)
+            }
+        }
+
+        calendarState.error?.let { err ->
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp),
+                color = Color.EnaYellow.copy(alpha = 0.12f),
+                border = BorderStroke(0.8.dp, Color.EnaYellow.copy(alpha = 0.4f))
+            ) {
+                Text(
+                    err,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(10.dp)
+                )
+            }
+        }
+
+        if (calendarState.cards.isEmpty()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant
+            ) {
+                Text(
+                    if (calendarState.syncing) {
+                        "Загружаю предстоящие крупные события из открытых источников…"
+                    } else {
+                        "Предстоящих событий пока нет или открытые источники недоступны. Нажмите «Обновить» при наличии интернета."
+                    },
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(12.dp)
+                )
+            }
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                calendarState.cards.forEach { card ->
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("calendar_card_${card.index}"),
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.background,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(11.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    card.title,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    "${card.events.size} из 10",
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            card.events.forEachIndexed { idx, ev ->
+                                if (idx > 0) {
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+                                }
+                                CalendarEventRow(ev)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CalendarEventRow(ev: MajorCalendarRepo.CalendarEvent) {
+    val catColor = if (ev.category == MajorCalendarRepo.EventCategory.MACRO) {
+        Color.EnaYellow
+    } else {
+        MaterialTheme.colorScheme.primary
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Surface(
+                shape = RoundedCornerShape(6.dp),
+                color = catColor.copy(alpha = 0.14f)
+            ) {
+                Text(
+                    ev.category.labelRu,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = catColor,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                )
+            }
+            if (ev.assetOrCurrency.isNotBlank()) {
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant
+                ) {
+                    Text(
+                        ev.assetOrCurrency,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.weight(1f))
+            Text(
+                formatCountdownRu(ev.eventTsMs),
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.SemiBold,
+                color = Color.EnaGreen
+            )
+        }
+        Text(
+            ev.title,
+            fontSize = 12.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(
+                fmtUtcEventDate(ev.eventTsMs),
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                ev.source,
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        val extraParts = buildList {
+            ev.forecast?.let { add("прогноз: $it") }
+            ev.previous?.let { add("пред.: $it") }
+        }
+        if (extraParts.isNotEmpty()) {
+            Text(
+                extraParts.joinToString(" · "),
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}

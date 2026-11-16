@@ -16,11 +16,11 @@ class EnaApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        // v7.1: страховочная сетка — любой краш пишется в файл и виден в Диагностике
+        // Страховочная сетка — любой краш пишется в файл и виден в Диагностике
         com.enamind.ai.core.CrashGuard.install(this)
-        // v9.0: самодиагностика и реестр сбоев ENA
+        // Самодиагностика и реестр сбоев ENA
         com.enamind.ai.core.FaultMonitor.init(this)
-        // v8.4: чистим оборванные .tmp файлы и протухший кэш до старта БД/Python
+        // Чистим оборванные .tmp файлы и протухший кэш до старта БД/Python
         com.enamind.ai.core.StorageGuard.sanitizeOnStartup(this)
         val db = AppDatabase.build(this)
         state = AppState(this, db)

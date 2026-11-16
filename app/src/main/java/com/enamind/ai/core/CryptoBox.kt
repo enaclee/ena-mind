@@ -15,8 +15,7 @@ import javax.crypto.spec.GCMParameterSpec
  * base64(iv || ciphertext). Ключи API никогда не лежат в открытом виде ни в
  * SharedPreferences, ни в JSON, ни в логах.
  *
- * v8.0: перенесён из пакета ai/ — внешние AI-провайдеры удалены из приложения,
- * шифрование осталось для ключей Bybit (трейд-панель) и NewsAPI.
+ * Используется для шифрования ключей AI-провайдеров, Bybit и NewsAPI.
  */
 object CryptoBox {
 

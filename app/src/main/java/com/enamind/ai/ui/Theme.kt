@@ -51,26 +51,26 @@ private val Red = Color(0xFFEF4444)
 private val Yellow = Color(0xFFF59E0B)
 private val IceBlue = Color(0xFF60A5FA)
 
-// Палитра в духе Google AI Studio Dark — глубокий графит, мягкие тональные карточки и деликатные контуры
+// Глубокая тёмная палитра (OLED Dark): по-настоящему тёмный фон, контрастные карточки и деликатные контуры
 private val DarkScheme = darkColorScheme(
     primary = AiStudioBlueDark,
     onPrimary = Color(0xFF062E6F),
-    primaryContainer = Color(0xFF1B2B45),
+    primaryContainer = Color(0xFF142238),
     onPrimaryContainer = Color(0xFFD2E3FC),
     secondary = Color(0xFFC4C7C5),
-    onSecondary = Color(0xFF1F1F1F),
-    secondaryContainer = Color(0xFF1E222B),
+    onSecondary = Color(0xFF16181E),
+    secondaryContainer = Color(0xFF141822),
     onSecondaryContainer = Color(0xFFE8EAED),
     tertiary = Yellow,
     onTertiary = Color(0xFF000000),
-    background = Color(0xFF0E1015),
-    onBackground = Color(0xFFE8EAED),
-    surface = Color(0xFF151821),
-    onSurface = Color(0xFFE8EAED),
-    surfaceVariant = Color(0xFF1E232F),
-    onSurfaceVariant = Color(0xFF9AA0A6),
-    outline = Color(0xFF3C4043),
-    outlineVariant = Color(0xFF272C37),
+    background = Color(0xFF050608),
+    onBackground = Color(0xFFECEEF2),
+    surface = Color(0xFF0C0E14),
+    onSurface = Color(0xFFECEEF2),
+    surfaceVariant = Color(0xFF131620),
+    onSurfaceVariant = Color(0xFF949BA8),
+    outline = Color(0xFF2B3142),
+    outlineVariant = Color(0xFF1E2230),
     error = Color(0xFFF28B82),
     onError = Color(0xFF601410)
 )

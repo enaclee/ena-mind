@@ -239,7 +239,7 @@ object FaultMonitor {
                 markHealthy("Data Quality Gate")
             }
             intel.bots.forEach { b ->
-                if (!b.confidence.isFinite() || b.confidence <= 0.05) {
+                if (!b.confidence.isFinite() || (b.hasData && b.confidence <= 0.05)) {
                     recordFault(
                         component = b.name,
                         kind = Kind.AGENT,

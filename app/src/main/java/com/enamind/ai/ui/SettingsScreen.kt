@@ -76,27 +76,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.enamind.ai.ai.AiStudioClient
 import com.enamind.ai.core.AppState
-import com.enamind.ai.core.CrashGuard
 import com.enamind.ai.core.FaultMonitor
-import com.enamind.ai.core.PythonBridge
 import com.enamind.ai.core.Settings
-import com.enamind.ai.db.AnalysisEntity
-import com.enamind.ai.db.ForecastEntity
-import com.enamind.ai.export.ZipManager
+import com.enamind.ai.orderflow.OrderFlowEventVault
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
- * Настройки ENA v9.0 (вкладка нижней навигации): Тема / API (+ Google AI Studio) / Скилл /
- * История / Память (6ч + реал-тайм) / Сбои (Watchdog).
- * Режим чисто аналитический (SHADOW), без приватных ключей бирж.
+ * Настройки ENA: Тема / API (Google AI Studio + OpenAI-совместимые ключи) / Память (экспорт JSON + CSV) / Сбои.
  */
 @Composable
 fun SettingsScreen(
@@ -105,9 +96,9 @@ fun SettingsScreen(
     onClose: () -> Unit,
     initialTab: Int = 0
 ) {
-    var tab by remember { mutableIntStateOf(initialTab.coerceIn(0, 5)) }
+    var tab by remember { mutableIntStateOf(initialTab.coerceIn(0, 3)) }
     LaunchedEffect(initialTab) {
-        tab = initialTab.coerceIn(0, 5)
+        tab = initialTab.coerceIn(0, 3)
     }
 
     val summary by FaultMonitor.summary.collectAsState()
@@ -126,7 +117,7 @@ fun SettingsScreen(
                     color = MaterialTheme.colorScheme.onBackground
                 )
                 Text(
-                    "ENA · режим SHADOW",
+                    "ENA · аналитический терминал",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -152,8 +143,6 @@ fun SettingsScreen(
             val tabNames = listOf(
                 "Тема",
                 "API",
-                "Скилл",
-                "История",
                 "Память",
                 if (summary.activeFaults > 0) "Сбои (${summary.activeFaults})" else "Сбои"
             )
@@ -168,7 +157,7 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.labelLarge,
                             fontSize = 12.sp,
                             fontWeight = if (tab == i) FontWeight.SemiBold else FontWeight.Medium,
-                            color = if (i == 5 && summary.activeFaults > 0 && tab != i) Color.EnaYellow
+                            color = if (i == 3 && summary.activeFaults > 0 && tab != i) Color.EnaYellow
                             else Color.Unspecified,
                             maxLines = 1
                         )
@@ -180,9 +169,7 @@ fun SettingsScreen(
         when (tab) {
             0 -> ThemeTab(state, onThemeChange)
             1 -> ApiTab(state)
-            2 -> SkillsTab(state)
-            3 -> HistoryTab(state)
-            4 -> MemoryTab(state)
+            2 -> MemoryTab(state)
             else -> FaultsTab(state)
         }
     }
@@ -245,9 +232,12 @@ private fun ThemeTab(state: AppState, onThemeChange: (Settings.Theme) -> Unit) {
                         state.settings.theme = theme
                         onThemeChange(theme)
                     },
-                    modifier = Modifier.heightIn(min = 48.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .testTag("theme_dark_button"),
                     colors = settingsChipColors(),
-                    label = { Text("Ночная (AI Dark)", style = MaterialTheme.typography.labelLarge) }
+                    label = { Text("Ночная", style = MaterialTheme.typography.labelLarge) }
                 )
                 FilterChip(
                     selected = theme == Settings.Theme.WHITE,
@@ -256,16 +246,14 @@ private fun ThemeTab(state: AppState, onThemeChange: (Settings.Theme) -> Unit) {
                         state.settings.theme = theme
                         onThemeChange(theme)
                     },
-                    modifier = Modifier.heightIn(min = 48.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .testTag("theme_light_button"),
                     colors = settingsChipColors(),
                     label = { Text("Светлая", style = MaterialTheme.typography.labelLarge) }
                 )
             }
-            Text(
-                "Ночная тема в стиле Google AI Studio снижает нагрузку на глаза и экономит заряд на OLED-экранах.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
 
         SettingsCard {
@@ -283,7 +271,7 @@ private fun ThemeTab(state: AppState, onThemeChange: (Settings.Theme) -> Unit) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "Накапливать память в фоне",
+                    "Накапливать аналитику в фоне",
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
                     modifier = Modifier.weight(1f)
@@ -310,26 +298,31 @@ private fun ThemeTab(state: AppState, onThemeChange: (Settings.Theme) -> Unit) {
                     }
                 )
             }
-            Text(
-                "Вкл: foreground-сервис, запись 6-часовых прогнозов и ленты реального времени продолжаются в свёрнутом приложении — память и калибровка растут быстрее.\n" +
-                    "MIUI / HyperOS: при необходимости отключите оптимизацию батареи для ENA в системных настройках.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
     }
 }
 
 // ---------------------------------------------------------
-// API (+ изолированное подключение Google AI Studio)
+// API (+ универсальное подключение AI Studio & OpenAI-совместимых API)
 // ---------------------------------------------------------
 @Composable
 private fun ApiTab(state: AppState) {
     val uiScope = rememberCoroutineScope()
 
+    var provider by remember { mutableStateOf(state.settings.aiProvider) }
+
     var aiKey by remember { mutableStateOf(state.settings.aiStudioApiKey) }
     var aiKeyVisible by remember { mutableStateOf(false) }
     var aiModel by remember { mutableStateOf(state.settings.aiStudioModel) }
+    var fetchedModels by remember { mutableStateOf<List<AiStudioClient.AvailableModel>>(emptyList()) }
+    var modelsLoading by remember { mutableStateOf(false) }
+    var modelsError by remember { mutableStateOf<String?>(null) }
+
+    var openAiBaseUrl by remember { mutableStateOf(state.settings.aiOpenAiBaseUrl) }
+    var openAiKey by remember { mutableStateOf(state.settings.aiOpenAiApiKey) }
+    var openAiKeyVisible by remember { mutableStateOf(false) }
+    var openAiModel by remember { mutableStateOf(state.settings.aiOpenAiModel) }
+
     var aiTesting by remember { mutableStateOf(false) }
     var aiTestResult by remember { mutableStateOf<AiStudioClient.AiReply?>(null) }
 
@@ -345,7 +338,7 @@ private fun ApiTab(state: AppState) {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // 1. Google AI Studio (изолированный свободный ИИ-чат)
+        // 1. Универсальный AI-клиент (изолирован от расчётов ENA)
         SettingsCard {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -357,128 +350,243 @@ private fun ApiTab(state: AppState) {
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(18.dp)
                 )
-                SectionTitle("Google AI Studio (свободный ИИ-чат)")
+                SectionTitle("Универсальный ИИ-чат (изолирован)")
             }
             Text(
-                "Полностью изолированное подключение для вкладки «ИИ ЧАТ». Собеседник НЕ имеет доступа к квантовому движку, ботам и прогнозам ENA, поэтому не может повлиять на расчёты.",
+                "Собеседник во вкладке «ИИ ЧАТ» не имеет доступа к квантовому движку и Order Flow. Выберите Google AI Studio или любой OpenAI-совместимый API.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            OutlinedTextField(
-                value = aiKey,
-                onValueChange = {
-                    aiKey = it
-                    state.settings.aiStudioApiKey = it.trim()
-                },
-                label = { Text("API-ключ Google AI Studio") },
-                placeholder = { Text("AIza…", fontFamily = JetBrainsMonoFontFamily) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("ai_studio_key_input"),
-                visualTransformation = if (aiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                trailingIcon = {
-                    IconButton(
-                        onClick = { aiKeyVisible = !aiKeyVisible },
-                        modifier = Modifier.minimumInteractiveComponentSize()
-                    ) {
-                        Icon(
-                            imageVector = if (aiKeyVisible) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
-                            contentDescription = if (aiKeyVisible) "Скрыть ключ" else "Показать ключ"
-                        )
-                    }
-                },
-                singleLine = true,
-                shape = RoundedCornerShape(12.dp),
-                colors = settingsFieldColors()
-            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = provider == Settings.PROVIDER_GEMINI,
+                    onClick = {
+                        provider = Settings.PROVIDER_GEMINI
+                        state.settings.aiProvider = Settings.PROVIDER_GEMINI
+                    },
+                    modifier = Modifier.heightIn(min = 48.dp).testTag("ai_provider_gemini"),
+                    colors = settingsChipColors(),
+                    label = { Text("Google AI Studio", fontSize = 11.5.sp) }
+                )
+                FilterChip(
+                    selected = provider == Settings.PROVIDER_OPENAI_COMPAT,
+                    onClick = {
+                        provider = Settings.PROVIDER_OPENAI_COMPAT
+                        state.settings.aiProvider = Settings.PROVIDER_OPENAI_COMPAT
+                    },
+                    modifier = Modifier.heightIn(min = 48.dp).testTag("ai_provider_openai"),
+                    colors = settingsChipColors(),
+                    label = { Text("OpenAI-совместимый", fontSize = 11.5.sp) }
+                )
+            }
 
-            Text(
-                "Бесплатные быстрые модели с большим дневным лимитом:",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                AiStudioClient.FREE_MODELS.forEach { preset ->
-                    FilterChip(
-                        selected = aiModel == preset.id,
-                        onClick = {
-                            aiModel = preset.id
-                            state.settings.aiStudioModel = preset.id
-                        },
-                        modifier = Modifier
-                            .heightIn(min = 48.dp)
-                            .testTag("ai_model_chip_${preset.id}"),
-                        colors = settingsChipColors(),
-                        label = {
-                            Text(
-                                preset.title,
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = if (aiModel == preset.id) FontWeight.Bold else FontWeight.Medium
+            if (provider == Settings.PROVIDER_GEMINI) {
+                OutlinedTextField(
+                    value = aiKey,
+                    onValueChange = {
+                        aiKey = it
+                        state.settings.aiStudioApiKey = it.trim()
+                    },
+                    label = { Text("API-ключ Google AI Studio") },
+                    placeholder = { Text("AIza…", fontFamily = JetBrainsMonoFontFamily) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("ai_studio_key_input"),
+                    visualTransformation = if (aiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(
+                            onClick = { aiKeyVisible = !aiKeyVisible },
+                            modifier = Modifier.minimumInteractiveComponentSize()
+                        ) {
+                            Icon(
+                                imageVector = if (aiKeyVisible) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                                contentDescription = if (aiKeyVisible) "Скрыть ключ" else "Показать ключ"
                             )
                         }
-                    )
-                }
-            }
-
-            val activePreset = AiStudioClient.FREE_MODELS.firstOrNull { it.id == aiModel }
-            if (activePreset != null) {
-                Surface(
+                    },
+                    singleLine = true,
                     shape = RoundedCornerShape(12.dp),
-                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
-                    border = BorderStroke(0.75.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.28f))
+                    colors = settingsFieldColors()
+                )
+
+                Text(
+                    "Актуальные модели Gemini 3.5 (устаревшие модели отключены):",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalArrangement = Arrangement.spacedBy(2.dp)
-                    ) {
-                        Text(
-                            activePreset.badge,
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        Text(
-                            activePreset.description,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                    AiStudioClient.FREE_MODELS.forEach { preset ->
+                        FilterChip(
+                            selected = aiModel == preset.id,
+                            onClick = {
+                                aiModel = preset.id
+                                state.settings.aiStudioModel = preset.id
+                            },
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .testTag("ai_model_chip_${preset.id}"),
+                            colors = settingsChipColors(),
+                            label = {
+                                Text(
+                                    preset.title,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = if (aiModel == preset.id) FontWeight.Bold else FontWeight.Medium
+                                )
+                            }
                         )
                     }
                 }
-            }
 
-            OutlinedTextField(
-                value = aiModel,
-                onValueChange = {
-                    aiModel = it
-                    if (it.isNotBlank()) state.settings.aiStudioModel = it.trim()
-                },
-                label = { Text("ID модели AI Studio (можно ввести свою)") },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("ai_studio_model_input"),
-                singleLine = true,
-                shape = RoundedCornerShape(12.dp),
-                colors = settingsFieldColors()
-            )
+                OutlinedButton(
+                    onClick = {
+                        modelsLoading = true
+                        modelsError = null
+                        val keySnapshot = aiKey.trim()
+                        uiScope.launch {
+                            val (list, err) = withContext(Dispatchers.IO) {
+                                AiStudioClient.fetchGeminiModels(keySnapshot)
+                            }
+                            fetchedModels = list
+                            modelsError = err
+                            modelsLoading = false
+                        }
+                    },
+                    enabled = !modelsLoading,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .testTag("ai_fetch_models_button"),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(if (modelsLoading) "Загрузка списка моделей…" else "Загрузить доступные модели по API-ключу")
+                }
+
+                modelsError?.let { err ->
+                    Text(err, fontSize = 11.sp, color = Color.EnaYellow)
+                }
+
+                if (fetchedModels.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        fetchedModels.forEach { m ->
+                            FilterChip(
+                                selected = aiModel == m.id,
+                                onClick = {
+                                    aiModel = m.id
+                                    state.settings.aiStudioModel = m.id
+                                },
+                                modifier = Modifier.heightIn(min = 48.dp),
+                                colors = settingsChipColors(),
+                                label = { Text(m.id, fontSize = 11.sp) }
+                            )
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    value = aiModel,
+                    onValueChange = {
+                        aiModel = it
+                        if (it.isNotBlank()) state.settings.aiStudioModel = it.trim()
+                    },
+                    label = { Text("ID модели AI Studio") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("ai_studio_model_input"),
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = settingsFieldColors()
+                )
+            } else {
+                OutlinedTextField(
+                    value = openAiBaseUrl,
+                    onValueChange = {
+                        openAiBaseUrl = it
+                        state.settings.aiOpenAiBaseUrl = it.trim()
+                    },
+                    label = { Text("Base URL (OpenAI / OpenRouter / Groq / DeepSeek)") },
+                    placeholder = { Text("https://api.openai.com/v1", fontFamily = JetBrainsMonoFontFamily) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("ai_openai_baseurl_input"),
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = settingsFieldColors()
+                )
+                OutlinedTextField(
+                    value = openAiKey,
+                    onValueChange = {
+                        openAiKey = it
+                        state.settings.aiOpenAiApiKey = it.trim()
+                    },
+                    label = { Text("API-ключ (Bearer)") },
+                    placeholder = { Text("sk-…", fontFamily = JetBrainsMonoFontFamily) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("ai_openai_key_input"),
+                    visualTransformation = if (openAiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(
+                            onClick = { openAiKeyVisible = !openAiKeyVisible },
+                            modifier = Modifier.minimumInteractiveComponentSize()
+                        ) {
+                            Icon(
+                                imageVector = if (openAiKeyVisible) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                                contentDescription = if (openAiKeyVisible) "Скрыть ключ" else "Показать ключ"
+                            )
+                        }
+                    },
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = settingsFieldColors()
+                )
+                OutlinedTextField(
+                    value = openAiModel,
+                    onValueChange = {
+                        openAiModel = it
+                        if (it.isNotBlank()) state.settings.aiOpenAiModel = it.trim()
+                    },
+                    label = { Text("ID модели (например, gpt-4o-mini, deepseek-chat)") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("ai_openai_model_input"),
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = settingsFieldColors()
+                )
+            }
 
             Button(
                 onClick = {
                     aiTesting = true
                     aiTestResult = null
+                    val provSnapshot = provider
                     val keySnapshot = aiKey.trim()
                     val modelSnapshot = aiModel.trim()
+                    val oaiUrl = openAiBaseUrl.trim()
+                    val oaiKey = openAiKey.trim()
+                    val oaiModel = openAiModel.trim()
                     uiScope.launch {
                         val reply = withContext(Dispatchers.IO) {
-                            AiStudioClient.testConnection(keySnapshot, modelSnapshot)
+                            AiStudioClient.testConnection(
+                                apiKey = keySnapshot,
+                                modelId = modelSnapshot,
+                                provider = provSnapshot,
+                                openAiBaseUrl = oaiUrl,
+                                openAiKey = oaiKey,
+                                openAiModel = oaiModel
+                            )
                         }
                         aiTestResult = reply
                         aiTesting = false
@@ -504,7 +612,7 @@ private fun ApiTab(state: AppState) {
                     Spacer(Modifier.width(8.dp))
                 }
                 Text(
-                    if (aiTesting) "ПРОВЕРКА AI STUDIO…" else "Проверить ИИ-подключение",
+                    if (aiTesting) "ПРОВЕРКА AI…" else "Проверить ИИ-подключение",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -714,83 +822,47 @@ private fun ApiTab(state: AppState) {
 }
 
 // ---------------------------------------------------------
-// SKILLS
+// ПАМЯТЬ (только экспорт истории Order Flow & Absorption в JSON и CSV)
 // ---------------------------------------------------------
 @Composable
-private fun SkillsTab(state: AppState) {
+private fun MemoryTab(state: AppState) {
     val ctx = LocalContext.current
     val uiScope = rememberCoroutineScope()
-    var files by remember { mutableStateOf<JSONObject?>(null) }
-    var selftest by remember { mutableStateOf<String?>(null) }
-    var zipInfo by remember { mutableStateOf<String?>(null) }
-    var exporting by remember { mutableStateOf(false) }
-    var pendingZip by remember { mutableStateOf<File?>(null) }
-    var trustInfo by remember { mutableStateOf<JSONObject?>(null) }
-    var crashLog by remember { mutableStateOf<String?>(null) }
+    var pendingBundle by remember { mutableStateOf<OrderFlowEventVault.ExportBundle?>(null) }
+    var exportStatus by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(Unit) {
-        files = withContext(Dispatchers.IO) { ZipManager.listSkillFiles(ctx) }
-    }
-
-    fun doImport(confirmed: Boolean) {
-        val tmp = pendingZip
-        if (tmp == null) {
-            trustInfo = null
-            return
-        }
-        uiScope.launch {
-            val (res, updatedFiles) = withContext(Dispatchers.IO) {
-                ZipManager.import(ctx, tmp, confirmed) to ZipManager.listSkillFiles(ctx)
-            }
-            zipInfo = if (res.optBoolean("ok")) {
-                "Импорт завершён: данные ${res.optJSONArray("restored")}, " +
-                    "скриптов скилла ${res.optInt("skill_scripts")}, " +
-                    "подпись: ${res.optString("signature", "—")}"
-            } else {
-                "ошибка импорта: ${res.optString("error")}"
-            }
-            files = updatedFiles
-            trustInfo = null
-        }
-    }
-
-    val pickZip = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-        if (uri != null) {
+    val saveCsvLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri: Uri? ->
+        val bundle = pendingBundle
+        if (uri != null && bundle != null) {
             uiScope.launch {
-                val tmp = File(ctx.cacheDir, "import.zip")
-                val trust = withContext(Dispatchers.IO) {
-                    ctx.contentResolver.openInputStream(uri)?.use { ins -> tmp.outputStream().use { ins.copyTo(it) } }
-                    ZipManager.inspectTrust(tmp)
-                }
-                if (!trust.optBoolean("ok")) {
-                    zipInfo = "ОТКАЗ: ${trust.optString("error")}"
-                    return@launch
-                }
-                pendingZip = tmp
-                if (trust.optString("status") == "trusted") doImport(true)
-                else trustInfo = trust
-            }
-        }
-    }
-
-    val saveZip = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri: Uri? ->
-        if (uri != null) {
-            uiScope.launch {
-                val info = withContext(Dispatchers.IO) {
-                    val res = ZipManager.export(ctx, com.example.BuildConfig.VERSION_NAME)
-                    if (res.optBoolean("ok")) {
-                        val src = File(res.optString("path"))
-                        ctx.contentResolver.openOutputStream(uri)?.use { os -> src.inputStream().use { it.copyTo(os) } }
-                        "Экспортировано: ${src.length()} байт (прогнозы 6ч/24ч, память реал-тайм, веса ботов, журнал сбоев; без ключей)"
-                    } else {
-                        "ошибка экспорта: ${res.optString("error")}"
+                withContext(Dispatchers.IO) {
+                    ctx.contentResolver.openOutputStream(uri)?.use { os ->
+                        os.write(bundle.csvText.toByteArray(Charsets.UTF_8))
                     }
                 }
-                zipInfo = info
-                exporting = false
+                exportStatus = "CSV сохранён (${bundle.eventCount} событий поглощения/атак)"
             }
-        } else {
-            exporting = false
+        }
+    }
+
+    val saveJsonLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri: Uri? ->
+        val bundle = pendingBundle
+        if (uri != null && bundle != null) {
+            uiScope.launch {
+                withContext(Dispatchers.IO) {
+                    ctx.contentResolver.openOutputStream(uri)?.use { os ->
+                        os.write(bundle.jsonText.toByteArray(Charsets.UTF_8))
+                    }
+                }
+                exportStatus = "JSON сохранён (${bundle.eventCount} событий) · выберите файл для CSV…"
+                saveCsvLauncher.launch("ena_order_flow_history.csv")
+            }
+        } else if (bundle != null) {
+            saveCsvLauncher.launch("ena_order_flow_history.csv")
         }
     }
 
@@ -802,73 +874,25 @@ private fun SkillsTab(state: AppState) {
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         SettingsCard {
-            SectionTitle("ENA Skill (Python-ядро v9.0)")
-            files?.let { f ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        "Версия: v${f.optString("version")}",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Text(
-                        "Модулей: ${f.optJSONArray("files")?.length() ?: 0}",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                OutlinedButton(
-                    onClick = {
-                        uiScope.launch {
-                            val r = withContext(Dispatchers.IO) { PythonBridge.runSelftests() }
-                            selftest = if (r.optBoolean("ok")) {
-                                "ALL PASS: ${r.optInt("pass")}/${r.optInt("pass") + r.optInt("fail")}"
-                            } else {
-                                "FAIL: ${r.optInt("fail")} модулей\n${r.optJSONObject("results")}"
-                            }
-                        }
-                    },
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) { Text("Самотест", fontSize = 11.sp) }
-
-                OutlinedButton(
-                    onClick = {
-                        uiScope.launch {
-                            selftest = withContext(Dispatchers.IO) { ZipManager.listSkillFiles(ctx).toString(2) }
-                        }
-                    },
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) { Text("Манифест", fontSize = 11.sp) }
-
-                OutlinedButton(
-                    onClick = { pickZip.launch(arrayOf("application/zip")) },
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) { Text("Импорт ZIP", fontSize = 11.sp) }
-            }
+            SectionTitle("Экспорт истории Order Flow")
             Text(
-                "В архив попадают: история 6ч/24ч прогнозов (data + learning_vault), память реального времени (realtime_pulse_vault), веса 11 ботов, журнал сбоев (fault_history) и код стратегий (без API-ключей).",
+                "Выгрузка реальных зафиксированных событий поглощения, атак уровней, реакций цены через 1с / 5с / 15с / 30с и эмпирической статистики разворотов и пробоев в форматах JSON и CSV.\n\n" +
+                    "Позволяет проверить точность гипотез на реальном рынке, провести независимый бэктест и понять, какие признаки работают лучше на выбранных парах (без API-ключей и персональных данных).",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+
             Button(
                 onClick = {
-                    exporting = true
-                    saveZip.launch("ENA_export.zip")
+                    val bundle = state.exportOrderFlowHistoryBundle()
+                    pendingBundle = bundle
+                    exportStatus = "Подготовлено событий: ${bundle.eventCount}"
+                    saveJsonLauncher.launch("ena_order_flow_history.json")
                 },
-                enabled = !exporting,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("memory_download_history_button"),
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.primary,
@@ -876,489 +900,21 @@ private fun SkillsTab(state: AppState) {
                 )
             ) {
                 Text(
-                    if (exporting) "Экспорт…" else "Экспортировать ENA ZIP",
+                    "Скачать историю",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.SemiBold
                 )
             }
-            zipInfo?.let {
+
+            exportStatus?.let { st ->
                 Text(
-                    it,
-                    fontSize = 11.sp,
+                    st,
+                    style = MaterialTheme.typography.bodySmall,
                     fontFamily = JetBrainsMonoFontFamily,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            selftest?.let {
-                Text(
-                    "Тесты: $it",
-                    fontSize = 11.sp,
-                    fontFamily = JetBrainsMonoFontFamily,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.primary
                 )
             }
         }
-
-        SettingsCard {
-            SectionTitle("Файлы скилла")
-            files?.optJSONArray("files")?.let { arr ->
-                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    for (i in 0 until arr.length()) {
-                        val f = arr.getJSONObject(i)
-                        val isUpdate = f.optString("origin") == "update"
-                        Text(
-                            "${f.optString("path")} — ${f.optLong("size")} б ${if (isUpdate) "[обновление]" else ""}",
-                            fontSize = 10.sp,
-                            fontFamily = JetBrainsMonoFontFamily,
-                            color = if (isUpdate) Color.EnaGreen else MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-        }
-
-        SettingsCard {
-            SectionTitle("Диагностика (CrashGuard и Кэш)")
-            var cacheNote by remember { mutableStateOf("Кэш: ${com.enamind.ai.core.StorageGuard.cacheSizeBytes(ctx) / 1024} КБ (чистится автоматически при запуске)") }
-            Text(
-                "При критическом сбое стек ошибки сохраняется локально. Очистка кэша удаляет только временные файлы и не трогает папки самообучения.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                cacheNote,
-                fontSize = 11.sp,
-                fontFamily = JetBrainsMonoFontFamily,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = { crashLog = CrashGuard.lastReport(ctx) ?: "падений не зафиксировано" },
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) { Text("Отчёт сбоев", fontSize = 11.sp) }
-                OutlinedButton(
-                    onClick = {
-                        val rep = com.enamind.ai.core.StorageGuard.clearTemporaryCache(ctx)
-                        cacheNote = "Очищено ${rep.deletedCacheFiles} файлов (${rep.freedBytes / 1024} КБ); опыт сохранён"
-                    },
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) { Text("Очистить кэш", fontSize = 11.sp) }
-                OutlinedButton(
-                    onClick = { CrashGuard.clear(ctx); crashLog = "падений не зафиксировано" },
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) { Text("Сброс лога", fontSize = 11.sp) }
-            }
-            crashLog?.let {
-                Text(
-                    it.take(2500),
-                    fontSize = 9.sp,
-                    fontFamily = JetBrainsMonoFontFamily,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-    }
-
-    trustInfo?.let { t ->
-        val unknown = t.optString("status") == "unknown"
-        AlertDialog(
-            onDismissRequest = { trustInfo = null },
-            title = {
-                Text(
-                    if (unknown) "Неизвестная подпись" else "Архив без подписи",
-                    style = MaterialTheme.typography.titleMedium
-                )
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (unknown) {
-                        Text(
-                            "ZIP подписан ключом ДРУГОГО устройства (ECDSA P-256).\n" +
-                                "Отпечаток:\n${t.optString("fingerprint")}",
-                            fontSize = 11.sp,
-                            fontFamily = JetBrainsMonoFontFamily
-                        )
-                        Text(
-                            "Скриптов Python: ${t.optInt("scripts")} · файлов данных: ${t.optInt("data_files")}",
-                            fontSize = 11.sp
-                        )
-                        Text(
-                            "Импорт выполнит этот Python-код внутри приложения. Продолжайте, только если доверяете архиву.",
-                            fontSize = 11.sp,
-                            color = Color.EnaYellow
-                        )
-                    } else {
-                        Text(
-                            "В архиве НЕТ подписи.\n" +
-                                "Скриптов Python: ${t.optInt("scripts")} · файлов данных: ${t.optInt("data_files")}",
-                            fontSize = 11.sp
-                        )
-                        Text(
-                            "Целостность не подтверждена. Продолжайте, только если уверены в источнике.",
-                            fontSize = 11.sp,
-                            color = Color.EnaRed
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { doImport(true) }) { Text("Импортировать") }
-            },
-            dismissButton = {
-                TextButton(onClick = { trustInfo = null; pendingZip = null }) { Text("Отмена") }
-            }
-        )
-    }
-}
-
-// ---------------------------------------------------------
-// ИСТОРИЯ
-// ---------------------------------------------------------
-@Composable
-private fun HistoryTab(state: AppState) {
-    val uiScope = rememberCoroutineScope()
-    var analyses by remember { mutableStateOf<List<AnalysisEntity>>(emptyList()) }
-    var forecasts by remember { mutableStateOf<List<ForecastEntity>>(emptyList()) }
-    var mode by remember { mutableIntStateOf(0) }
-
-    LaunchedEffect(Unit) {
-        val (aList, fList) = withContext(Dispatchers.IO) {
-            state.db.analysisDao().last(50) to state.db.forecastDao().last(100)
-        }
-        analyses = aList
-        forecasts = fList
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            FilterChip(
-                selected = mode == 0,
-                onClick = { mode = 0 },
-                modifier = Modifier.heightIn(min = 48.dp),
-                colors = settingsChipColors(),
-                label = { Text("Анализы (${analyses.size})") }
-            )
-            FilterChip(
-                selected = mode == 1,
-                onClick = { mode = 1 },
-                modifier = Modifier.heightIn(min = 48.dp),
-                colors = settingsChipColors(),
-                label = { Text("Прогнозы (${forecasts.size})") }
-            )
-            Spacer(Modifier.weight(1f))
-            TextButton(
-                onClick = {
-                    uiScope.launch {
-                        state.verifyOldForecasts()
-                        delay(1500)
-                        forecasts = withContext(Dispatchers.IO) { state.db.forecastDao().last(100) }
-                    }
-                },
-                modifier = Modifier.heightIn(min = 48.dp)
-            ) {
-                Text("Проверить", style = MaterialTheme.typography.labelLarge)
-            }
-        }
-        Text(
-            "Прогнозы (6ч / 24ч) сохраняются автоматически и проверяются по факту после истечения горизонта (✓ совпало / ✗ мимо).",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (mode == 0) {
-                items(analyses, key = { it.id }) { a ->
-                    SettingsCard {
-                        Text(
-                            "${a.symbol} ${a.interval} · ${a.regime ?: "?"} · ${timeShort(a.ts)}",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontFamily = JetBrainsMonoFontFamily
-                        )
-                        Text(
-                            a.headline,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 2
-                        )
-                    }
-                }
-            } else {
-                items(forecasts, key = { it.fid }) { f ->
-                    SettingsCard {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                when (f.hit) {
-                                    1 -> "✓"
-                                    0 -> "✗"
-                                    else -> "…"
-                                },
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = when (f.hit) {
-                                    1 -> Color.EnaGreen
-                                    0 -> Color.EnaRed
-                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
-                                },
-                                modifier = Modifier.width(24.dp)
-                            )
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    "${f.symbol} ${f.side.uppercase()} ${Math.round(f.confidence * 100)}% · ${f.regime ?: "?"} · ${f.ts}",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    fontFamily = JetBrainsMonoFontFamily
-                                )
-                                val moveVal = f.movePct?.takeIf { it.isFinite() }
-                                val hRounded = if (f.horizonH.isFinite()) Math.round(f.horizonH) else 24L
-                                val extra = if (f.hit != null && moveVal != null) {
-                                    "факт: ${String.format(Locale.US, "%+.2f", moveVal)}% за ${hRounded}ч"
-                                } else {
-                                    "проверка через ${hRounded}ч · gate ${f.gateStatus ?: "-"}"
-                                }
-                                Text(
-                                    extra,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontFamily = JetBrainsMonoFontFamily,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------
-// ENA MEMORY (6ч + Реал-тайм пульс + Python опыт)
-// ---------------------------------------------------------
-@Composable
-private fun MemoryTab(state: AppState) {
-    val uiScope = rememberCoroutineScope()
-    var stats by remember { mutableStateOf<JSONObject?>(null) }
-    var journal by remember { mutableStateOf<JSONObject?>(null) }
-    var feedback by remember { mutableStateOf<JSONObject?>(null) }
-    var busy by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-        stats = withContext(Dispatchers.IO) { PythonBridge.forecastStats() }
-    }
-
-    fun reload() {
-        uiScope.launch {
-            val (s, j, f) = withContext(Dispatchers.IO) {
-                Triple(
-                    PythonBridge.forecastStats(),
-                    PythonBridge.journalStats(),
-                    PythonBridge.feedbackReport()
-                )
-            }
-            stats = s
-            journal = j
-            feedback = f
-        }
-    }
-
-    val intel by state.engine.intelligence.collectAsState()
-    val pulse by state.engine.realTimePulse.collectAsState()
-    val vaultSnap = intel?.learning ?: remember(stats) { state.engine.memoryVault.snapshot() }
-    val pulseSnap = remember(pulse.tsMs, pulse.verifiedCount, stats) {
-        state.engine.pulseVault.snapshot()
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        SettingsCard {
-            SectionTitle("Папка самообучения (горизонт 6ч)")
-            MemoryStat("Папка", vaultSnap.folderLabel)
-            MemoryStat("Записано 6ч-наблюдений", "${vaultSnap.totalRecorded}")
-            MemoryStat("Проверено по факту", "${vaultSnap.verifiedCount}")
-            vaultSnap.hitRatePct?.takeIf { it.isFinite() }?.let {
-                MemoryStat("Точность ботов (6ч)", "${Math.round(it)}%")
-            }
-            Text(
-                "Папка создаётся автоматически в защищённом хранилище приложения и не удаляется при системной очистке кэша.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-
-        SettingsCard {
-            SectionTitle("Упреждающий пульс реального времени (5–15м)")
-            MemoryStat("Папка", pulseSnap.folderName)
-            MemoryStat("Снимков в реальном времени", "${pulseSnap.totalRecorded}")
-            MemoryStat("Проверено по графику", "${pulseSnap.verifiedCount}")
-            MemoryStat(
-                "Точность (общая)",
-                pulseSnap.accuracyPct?.takeIf { it.isFinite() }?.let {
-                    String.format(Locale.US, "%.1f%%", it)
-                } ?: "накопление данных"
-            )
-            MemoryStat(
-                "Точность (последние 40)",
-                pulseSnap.recentAccuracyPct?.takeIf { it.isFinite() }?.let {
-                    String.format(Locale.US, "%.1f%%", it)
-                } ?: "—"
-            )
-            if (pulseSnap.factorWeights.isNotEmpty()) {
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
-                Text(
-                    "Веса микро-факторов:",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                pulseSnap.factorWeights.forEach { (factor, w) ->
-                    MemoryStat(
-                        "  $factor",
-                        if (w.isFinite()) String.format(Locale.US, "×%.2f", w) else "×1.00"
-                    )
-                }
-            }
-        }
-
-        SettingsCard {
-            SectionTitle("ENA MEMORY — накопленный опыт")
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = {
-                        busy = true
-                        state.verifyOldForecasts()
-                        state.refreshRadarNow()
-                        uiScope.launch {
-                            delay(2500)
-                            stats = withContext(Dispatchers.IO) { PythonBridge.forecastStats() }
-                            busy = false
-                        }
-                    },
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) { Text("Проверить старые", fontSize = 11.sp) }
-
-                OutlinedButton(
-                    onClick = { reload() },
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) { Text("Обновить статистику", fontSize = 11.sp) }
-            }
-            if (busy) CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-        }
-
-        stats?.let { s ->
-            SettingsCard {
-                SectionTitle("Прогнозы (проверенные по факту)")
-                val checked = s.optJSONObject("checked")
-                if (checked == null || checked.optInt("n", 0) == 0) {
-                    Text(
-                        "Проверенных прогнозов пока нет — они появятся после истечения горизонтов.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                } else {
-                    MemoryStat("Всего проверено", "${checked.optInt("n")}")
-                    val hitRate = checked.optDouble("hit_rate", Double.NaN)
-                    if (hitRate.isFinite()) {
-                        MemoryStat("Hit-rate", "${Math.round(hitRate * 100)}%")
-                    }
-                    checked.optDouble("mean_confidence", Double.NaN).takeIf { it.isFinite() }?.let {
-                        MemoryStat("Средняя уверенность", "${Math.round(it * 100)}%")
-                    }
-                    checked.optDouble("overconfidence", Double.NaN).takeIf { it.isFinite() }?.let {
-                        MemoryStat("Завышение уверенности", "${Math.round(it * 100)} пп")
-                    }
-                    MemoryStat("Ожидают проверки", "${s.optInt("unchecked", 0)}")
-                }
-                val byRegime = s.optJSONObject("by_regime")
-                if (byRegime != null && byRegime.length() > 0) {
-                    Text("По режимам:", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                    val keys = byRegime.keys()
-                    while (keys.hasNext()) {
-                        val k = keys.next()
-                        val v = byRegime.optJSONObject(k) ?: continue
-                        val hr = v.optDouble("hit_rate", Double.NaN)
-                        val oc = v.optDouble("overconfidence", Double.NaN)
-                        Text(
-                            "  $k: n=${v.optInt("n")}, hit=${if (hr.isFinite()) "${Math.round(hr * 100)}%" else "—"}" +
-                                (if (v.has("overconfidence") && oc.isFinite()) ", завышение=${Math.round(oc * 100)}пп" else ""),
-                            fontSize = 10.sp,
-                            fontFamily = JetBrainsMonoFontFamily,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-                val notes = s.optJSONArray("notes")
-                if (notes != null && notes.length() > 0) {
-                    Text("Наблюдения:", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                    for (i in 0 until notes.length()) {
-                        Text(
-                            "• ${notes.optString(i)}",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-        }
-
-        journal?.let { j ->
-            SettingsCard {
-                SectionTitle("Журнал")
-                val edge = j.optJSONObject("EDGE_compliant_only")
-                if (edge == null || edge.optInt("n", 0) == 0) {
-                    Text(
-                        "Журнал пуст.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                } else {
-                    MemoryStat("Compliant-записей", "${edge.optInt("n")}")
-                    edge.optDouble("winrate", Double.NaN).takeIf { it.isFinite() }?.let {
-                        MemoryStat("Winrate", "${Math.round(it * 100)}%")
-                    }
-                    edge.optDouble("avgR", Double.NaN).takeIf { it.isFinite() }?.let {
-                        MemoryStat("Средний R", String.format(Locale.US, "%.2f", it))
-                    }
-                    MemoryStat("Вердикт", j.optString("verdict"))
-                }
-            }
-        }
-
-        feedback?.let { f ->
-            SettingsCard {
-                SectionTitle("Обратная связь (p_hat)")
-                Text(
-                    if (f.optString("status") == "OK") {
-                        "p_hat = ${f.optDouble("p_hat")} (n=${f.optJSONObject("calibration")?.optInt("n") ?: 0})"
-                    } else {
-                        f.optString("msg")
-                    },
-                    fontSize = 11.sp,
-                    fontFamily = JetBrainsMonoFontFamily
-                )
-            }
-        }
-
-        Text(
-            "Память влияет на калибровку уверенности при n≥10. Правила Risk Gate остаются неизменными.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 4.dp)
-        )
     }
 }
 

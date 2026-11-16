@@ -78,8 +78,10 @@ fun AiChatScreen(
 ) {
     val messages by state.aiChatMessages.collectAsState()
     val busy by state.aiChatBusy.collectAsState()
-    val hasKey = state.settings.aiStudioApiKey.isNotBlank()
-    val activeModel = state.settings.aiStudioModel
+    val isOpenAi = state.settings.aiProvider == com.enamind.ai.core.Settings.PROVIDER_OPENAI_COMPAT
+    val hasKey = if (isOpenAi) state.settings.aiOpenAiApiKey.isNotBlank() else state.settings.aiStudioApiKey.isNotBlank()
+    val activeModel = if (isOpenAi) state.settings.aiOpenAiModel else state.settings.aiStudioModel
+    val providerTitle = if (isOpenAi) "OpenAI API" else "Google AI Studio"
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val clipboard = LocalClipboardManager.current
@@ -95,7 +97,7 @@ fun AiChatScreen(
             .fillMaxSize()
             .imePadding()
     ) {
-        // Верхняя панель статуса ИИ-чата (изоляция + модель + быстрый вход в настройки)
+        // Верхняя панель статуса ИИ-чата (изоляция + провайдер + модель + быстрый вход в настройки)
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -112,14 +114,14 @@ fun AiChatScreen(
             ) {
                 Icon(
                     imageVector = Icons.Outlined.AutoAwesome,
-                    contentDescription = "ИИ Чат Google AI Studio",
+                    contentDescription = "ИИ Чат",
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(20.dp)
                 )
                 Spacer(Modifier.width(8.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "ИИ ЧАТ · Google AI Studio",
+                        text = "ИИ ЧАТ · $providerTitle",
                         style = MaterialTheme.typography.titleSmall,
                         fontSize = 14.sp,
                         color = MaterialTheme.colorScheme.onSurface
@@ -141,7 +143,7 @@ fun AiChatScreen(
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.Settings,
-                        contentDescription = "Настроить API Google AI Studio",
+                        contentDescription = "Настроить API для ИИ-чата",
                         tint = MaterialTheme.colorScheme.primary
                     )
                 }
@@ -177,7 +179,7 @@ fun AiChatScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = "Укажите бесплатный API-ключ Google AI Studio в Настройках → API.",
+                        text = "Укажите ключ Google AI Studio или OpenAI-совместимого провайдера в Настройках → API.",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.weight(1f)

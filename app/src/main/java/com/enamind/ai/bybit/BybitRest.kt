@@ -172,15 +172,50 @@ class BybitRest(private val baseUrl: String) {
             }
         }
 
+        // Fallback 3: Bitget V2 Public Candles API
+        val bgIv = toBitgetInterval(interval)
+        val bgUrl = "https://api.bitget.com/api/v2/spot/market/candles?symbol=$bnSym&granularity=$bgIv&limit=${limit.coerceIn(10, 200)}"
+        val (bgText, bgErr) = executeText(bgUrl)
+        if (bgText != null) {
+            val parsed = parseBitgetKlines(bgText)
+            if (parsed.size >= 2) {
+                return KlinesResult(parsed, "bitget").also { putCachedKlines(symbol, interval, it) }
+            }
+        }
+
+        // Fallback 4: Gate.io V4 Public Candles API
+        val gatePair = toGatePair(symbol)
+        val gtIv = toGateInterval(interval)
+        val gtUrl = "https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=$gatePair&interval=$gtIv&limit=${limit.coerceIn(10, 300)}"
+        val (gtText, gtErr) = executeText(gtUrl)
+        if (gtText != null) {
+            val parsed = parseGateSpotKlines(gtText)
+            if (parsed.size >= 2) {
+                return KlinesResult(parsed, "gate").also { putCachedKlines(symbol, interval, it) }
+            }
+        }
+
+        // Fallback 5: KuCoin Public Candles API
+        val kcPair = toKucoinPair(symbol)
+        val kcIv = toKucoinInterval(interval)
+        val kcUrl = "https://api.kucoin.com/api/v1/market/candles?type=$kcIv&symbol=$kcPair"
+        val (kcText, kcErr) = executeText(kcUrl)
+        if (kcText != null) {
+            val parsed = parseKucoinKlines(kcText)
+            if (parsed.size >= 2) {
+                return KlinesResult(parsed, "kucoin").also { putCachedKlines(symbol, interval, it) }
+            }
+        }
+
         // Последний шанс: устаревший, но непустой локальный кэш (до 15 минут)
         cachedKlines(symbol, interval, maxAgeMs = 900_000L)?.let { return it }
 
-        val fullErr = listOfNotNull(lastErr, bnErr, okxErr).joinToString(" | ").ifBlank { "нет ответа" }
+        val fullErr = listOfNotNull(lastErr, bnErr, okxErr, bgErr, gtErr, kcErr).joinToString(" | ").ifBlank { "нет ответа" }
         FaultMonitor.recordFault(
             component = "REST Свечи ($symbol)",
             kind = FaultMonitor.Kind.NETWORK,
             severity = FaultMonitor.Severity.ERROR,
-            message = "Все биржи недоступны (Bybit/Binance/OKX): $fullErr",
+            message = "Все биржи недоступны (Bybit/Binance/OKX/Bitget/Gate/KuCoin): $fullErr",
             recovery = "Повтор на следующем тике конвейера"
         )
         return KlinesResult(
@@ -291,6 +326,64 @@ class BybitRest(private val baseUrl: String) {
                     }
                 }
             } catch (_: Exception) {
+            }
+        }
+
+        // 3) Бесплатные публичные резервы тикера (Bitget / Gate.io / KuCoin) при отказе Bybit+Binance+OKX
+        if (price == null) {
+            val bgTxt = executeText("https://api.bitget.com/api/v2/spot/market/tickers?symbol=$bnSym").first
+            if (bgTxt != null) {
+                try {
+                    val d = JSONObject(bgTxt).optJSONArray("data")?.optJSONObject(0)
+                    val p = d?.optString("lastPr")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    val c = d?.optString("changeUtc24h")?.toDoubleOrNull()?.times(100.0)
+                    val v = d?.optString("baseVolume")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    if (p != null) {
+                        price = p
+                        if (chg == null && c != null && c.isFinite()) chg = c
+                        if (vol == null && v != null) vol = v
+                        sources.add("bitget")
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }
+        if (price == null) {
+            val gtPair = toGatePair(symbol)
+            val gtTxt = executeText("https://api.gateio.ws/api/v4/spot/tickers?currency_pair=$gtPair").first
+            if (gtTxt != null) {
+                try {
+                    val d = JSONArray(gtTxt).optJSONObject(0)
+                    val p = d?.optString("last")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    val c = d?.optString("change_percentage")?.toDoubleOrNull()
+                    val v = d?.optString("base_volume")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    if (p != null) {
+                        price = p
+                        if (chg == null && c != null && c.isFinite()) chg = c
+                        if (vol == null && v != null) vol = v
+                        sources.add("gate")
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }
+        if (price == null) {
+            val kcPair = toKucoinPair(symbol)
+            val kcTxt = executeText("https://api.kucoin.com/api/v1/market/stats?symbol=$kcPair").first
+            if (kcTxt != null) {
+                try {
+                    val d = JSONObject(kcTxt).optJSONObject("data")
+                    val p = d?.optString("last")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    val c = d?.optString("changeRate")?.toDoubleOrNull()?.times(100.0)
+                    val v = d?.optString("vol")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    if (p != null) {
+                        price = p
+                        if (chg == null && c != null && c.isFinite()) chg = c
+                        if (vol == null && v != null) vol = v
+                        sources.add("kucoin")
+                    }
+                } catch (_: Exception) {
+                }
             }
         }
 
@@ -499,6 +592,49 @@ class BybitRest(private val baseUrl: String) {
             else -> "1H"
         }
 
+        fun toGatePair(symbol: String): String = baseCurrency(symbol) + "_USDT"
+
+        fun toKucoinPair(symbol: String): String = baseCurrency(symbol) + "-USDT"
+
+        fun toBitgetInterval(iv: String): String = when (iv) {
+            "1" -> "1min"
+            "3" -> "3min"
+            "5" -> "5min"
+            "15" -> "15min"
+            "30" -> "30min"
+            "60" -> "1h"
+            "120" -> "2h"
+            "240" -> "4h"
+            "D", "d" -> "1day"
+            else -> "1h"
+        }
+
+        fun toGateInterval(iv: String): String = when (iv) {
+            "1" -> "1m"
+            "3" -> "5m"
+            "5" -> "5m"
+            "15" -> "15m"
+            "30" -> "30m"
+            "60" -> "1h"
+            "120" -> "2h"
+            "240" -> "4h"
+            "D", "d" -> "1d"
+            else -> "1h"
+        }
+
+        fun toKucoinInterval(iv: String): String = when (iv) {
+            "1" -> "1min"
+            "3" -> "3min"
+            "5" -> "5min"
+            "15" -> "15min"
+            "30" -> "30min"
+            "60" -> "1hour"
+            "120" -> "2hour"
+            "240" -> "4hour"
+            "D", "d" -> "1day"
+            else -> "1hour"
+        }
+
         /** Парсит ответ Bybit V5 `/v5/market/kline` (новые сверху -> старые к новым). */
         fun parseBybitKlines(rawJson: String): List<List<Double>> {
             return try {
@@ -518,7 +654,7 @@ class BybitRest(private val baseUrl: String) {
                         out.add(listOf(ts, o, h, l, c, v))
                     }
                 }
-                out
+                out.distinctBy { it[0].toLong() }.sortedBy { it[0] }
             } catch (_: Exception) {
                 emptyList()
             }
@@ -541,13 +677,13 @@ class BybitRest(private val baseUrl: String) {
                         out.add(listOf(ts, o, h, l, c, v))
                     }
                 }
-                out
+                out.distinctBy { it[0].toLong() }.sortedBy { it[0] }
             } catch (_: Exception) {
                 emptyList()
             }
         }
 
-        /** Парсит ответ OKX `/api/v5/market/candles` (новые сверху -> старые к новым). */
+        /** Парсит ответ OKX `/api/v5/market/candles`. */
         fun parseOkxKlines(rawJson: String): List<List<Double>> {
             return try {
                 val root = JSONObject(rawJson)
@@ -566,7 +702,82 @@ class BybitRest(private val baseUrl: String) {
                         out.add(listOf(ts, o, h, l, c, v))
                     }
                 }
-                out
+                out.distinctBy { it[0].toLong() }.sortedBy { it[0] }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+        /** Bitget V2 `/api/v2/spot/market/candles`: [tsMs, open, high, low, close, baseVol]. */
+        fun parseBitgetKlines(rawJson: String): List<List<Double>> {
+            return try {
+                val root = JSONObject(rawJson)
+                if (root.optString("code") != "00000") return emptyList()
+                val arr = root.optJSONArray("data") ?: return emptyList()
+                val out = ArrayList<List<Double>>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val k = arr.optJSONArray(i) ?: continue
+                    val ts = k.optString(0).toDoubleOrNull() ?: k.optDouble(0, Double.NaN)
+                    val o = k.optString(1).toDoubleOrNull() ?: k.optDouble(1, Double.NaN)
+                    val h = k.optString(2).toDoubleOrNull() ?: k.optDouble(2, Double.NaN)
+                    val l = k.optString(3).toDoubleOrNull() ?: k.optDouble(3, Double.NaN)
+                    val c = k.optString(4).toDoubleOrNull() ?: k.optDouble(4, Double.NaN)
+                    val v = k.optString(5).toDoubleOrNull() ?: k.optDouble(5, Double.NaN)
+                    if (listOf(ts, o, h, l, c, v).all { it.isFinite() } && o > 0 && c > 0) {
+                        out.add(listOf(ts, o, h, l, c, v))
+                    }
+                }
+                out.distinctBy { it[0].toLong() }.sortedBy { it[0] }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+        /** Gate.io V4 spot candlesticks: [tsSec, quoteVol, close, high, low, open, baseVol]. */
+        fun parseGateSpotKlines(rawJson: String): List<List<Double>> {
+            return try {
+                val arr = JSONArray(rawJson)
+                val out = ArrayList<List<Double>>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val k = arr.optJSONArray(i) ?: continue
+                    val tsSec = k.optString(0).toDoubleOrNull() ?: k.optDouble(0, Double.NaN)
+                    val c = k.optString(2).toDoubleOrNull() ?: k.optDouble(2, Double.NaN)
+                    val h = k.optString(3).toDoubleOrNull() ?: k.optDouble(3, Double.NaN)
+                    val l = k.optString(4).toDoubleOrNull() ?: k.optDouble(4, Double.NaN)
+                    val o = k.optString(5).toDoubleOrNull() ?: k.optDouble(5, Double.NaN)
+                    val v = k.optString(6).toDoubleOrNull() ?: k.optDouble(6, 0.0)
+                    val tsMs = tsSec * 1000.0
+                    if (listOf(tsMs, o, h, l, c, v).all { it.isFinite() } && o > 0 && c > 0) {
+                        out.add(listOf(tsMs, o, h, l, c, v))
+                    }
+                }
+                out.distinctBy { it[0].toLong() }.sortedBy { it[0] }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+        /** KuCoin `/api/v1/market/candles`: [tsSec, open, close, high, low, volume, turnover]. */
+        fun parseKucoinKlines(rawJson: String): List<List<Double>> {
+            return try {
+                val root = JSONObject(rawJson)
+                if (root.optString("code") != "200000") return emptyList()
+                val arr = root.optJSONArray("data") ?: return emptyList()
+                val out = ArrayList<List<Double>>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val k = arr.optJSONArray(i) ?: continue
+                    val tsSec = k.optString(0).toDoubleOrNull() ?: k.optDouble(0, Double.NaN)
+                    val o = k.optString(1).toDoubleOrNull() ?: k.optDouble(1, Double.NaN)
+                    val c = k.optString(2).toDoubleOrNull() ?: k.optDouble(2, Double.NaN)
+                    val h = k.optString(3).toDoubleOrNull() ?: k.optDouble(3, Double.NaN)
+                    val l = k.optString(4).toDoubleOrNull() ?: k.optDouble(4, Double.NaN)
+                    val v = k.optString(5).toDoubleOrNull() ?: k.optDouble(5, 0.0)
+                    val tsMs = tsSec * 1000.0
+                    if (listOf(tsMs, o, h, l, c, v).all { it.isFinite() } && o > 0 && c > 0) {
+                        out.add(listOf(tsMs, o, h, l, c, v))
+                    }
+                }
+                out.distinctBy { it[0].toLong() }.sortedBy { it[0] }
             } catch (_: Exception) {
                 emptyList()
             }

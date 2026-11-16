@@ -41,7 +41,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * NEURAL PATH v8.1 (ТЗ §24 v3, §39 v4): визуализация РЕАЛЬНОГО пути
+ * NEURAL PATH: визуализация РЕАЛЬНОГО пути
  * вычислений A→J из mm_graph. Источник истины — execution engine:
  * топология и статусы приходят из engine_run_graph, статичная карта —
  * без ложной активности (§24.2 no fake activity).

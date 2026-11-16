@@ -3,7 +3,7 @@ package com.enamind.ai.core
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * FeedStatus v8.1 (ТЗ §1.3): «WebSocket подключён» ≠ «данные поступают».
+ * FeedStatus: «WebSocket подключён» ≠ «данные поступают».
  *
  * Шесть честных состояний потока по каждой ТЕМЕ отдельно:
  *  - CONNECTING         — соединение устанавливается;

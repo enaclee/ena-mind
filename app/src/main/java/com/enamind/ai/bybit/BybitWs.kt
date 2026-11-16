@@ -14,32 +14,25 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 /**
- * Bybit V5 public WebSocket: tickers / publicTrade / orderbook.50 / allLiquidation /
- * kline.{interval} (v6.1: живой стриминг свечей на график).
- * Ликвидации существуют ТОЛЬКО здесь (REST-эндпоинта нет — аудит 2026-11-12),
- * поэтому статистика копится фоном и передаётся в анализ через extra_parts.
- *
- * v8.1 (ТЗ §1.3): раздельные честные статусы по ТЕМАМ через FeedStatus.Tracker —
- * LIVE только после валидного payload по конкретной теме, плюс счётчики событий,
- * возраст данных и текст ошибки. onStatus остаётся для совместимости (сводный статус).
- * v8.1 (ТЗ §14): orderbook собирается snapshot+delta через BookState c sequence
- * guard — дельты после разрыва sequence отбрасываются до нового snapshot.
+ * Bybit V5 public WebSocket: tickers / publicTrade / orderbook.50 / allLiquidation / kline.{interval}.
+ * Передаёт исходные биржевые временные метки, задержку доставки и последовательные дельты стакана.
  */
 class BybitWs(
     private val symbol: String,
     private val listener: Listener,
-    private val klineInterval: String = "60"
+    private val klineInterval: String = "60",
+    private val clockOffsetMsProvider: () -> Long = { 0L }
 ) {
     interface Listener {
         fun onTicker(t: Ticker)
         fun onTrade(tr: Trade)
         fun onBook(bids: List<BookLevel>, asks: List<BookLevel>)
         fun onLiquidation(l: Liquidation)
-        /** v6.1: свеча из топика kline.{interval}.{symbol}. confirm=true — свеча закрылась. */
         fun onKline(bar: Kline)
         fun onStatus(connected: Boolean, note: String)
-        /** v8.1: книга рассинхронизирована — нужен новый snapshot (UI/движок узнают честно). */
         fun onBookDesync(reason: String) {}
+        fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {}
+        fun onLatency(lagMs: Long) {}
     }
 
     data class Ticker(
@@ -50,7 +43,7 @@ class BybitWs(
         val nextFundingTs: Long
     )
 
-    data class Trade(val price: Double, val size: Double, val side: String, val tsMs: Long)
+    data class Trade(val price: Double, val size: Double, val side: String, val tsMs: Long, val lagMs: Long = 0L)
 
     data class BookLevel(val price: Double, val qty: Double)
 
@@ -67,7 +60,7 @@ class BybitWs(
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // WS живёт без таймаута чтения
+        .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
@@ -75,7 +68,6 @@ class BybitWs(
     private var closedByUser = false
     private var reconnectDelayMs = 1000L
 
-    /** v8.1: честные статусы по темам (§1.3) + книга snapshot/delta (§14). */
     val feedTracker = FeedStatus.Tracker(
         setOf(
             FeedStatus.Kind.TICKER, FeedStatus.Kind.TRADES, FeedStatus.Kind.BOOK,
@@ -103,7 +95,7 @@ class BybitWs(
                     put("publicTrade.$symbol")
                     put("orderbook.50.$symbol")
                     put("allLiquidation.$symbol")
-                    put("kline.$klineInterval.$symbol") // v6.1: живые свечи для графика
+                    put("kline.$klineInterval.$symbol")
                 }
                 webSocket.send(JSONObject().put("op", "subscribe").put("args", args).toString())
                 listener.onStatus(true, "подключено (ждём данные)")
@@ -154,18 +146,25 @@ class BybitWs(
         }.apply { isDaemon = true }.start()
     }
 
+    private fun computeLagMs(exchangeTsMs: Long): Long {
+        if (exchangeTsMs <= 1_600_000_000_000L) return 0L
+        val syncedNow = System.currentTimeMillis() + clockOffsetMsProvider()
+        return (syncedNow - exchangeTsMs).coerceIn(0L, 600_000L)
+    }
+
     private fun handle(text: String) {
         try {
             val msg = JSONObject(text)
             val topic = msg.optString("topic", "")
-            // ВАЖНО: data бывает объектом (tickers/orderbook) и массивом (publicTrade/
-            // kline/allLiquidation) — ранний return по optJSONObject глотал массивы
-            // (v6.0-баг: лента сделок в UI не обновлялась).
+            val msgTs = msg.optLong("ts", 0L)
+            if (msgTs > 0L) {
+                listener.onLatency(computeLagMs(msgTs))
+            }
             when {
                 topic.startsWith("tickers") -> {
                     val data = msg.optJSONObject("data") ?: return
                     val t = parseTicker(data)
-                    if (t.last > 0 && t.last.isFinite()) { // валидный payload -> LIVE (§1.3)
+                    if (t.last > 0 && t.last.isFinite()) {
                         feedTracker.onValidMessage(FeedStatus.Kind.TICKER)
                         FaultMonitor.markHealthy("Bybit WebSocket")
                     }
@@ -174,14 +173,18 @@ class BybitWs(
                 topic.startsWith("publicTrade") -> {
                     val arr = msg.optJSONArray("data") ?: return
                     if (arr.length() > 0) feedTracker.onValidMessage(FeedStatus.Kind.TRADES)
-                    for (i in 0 until arr.length()) listener.onTrade(parseTrade(arr.getJSONObject(i)))
+                    for (i in 0 until arr.length()) {
+                        val tr = parseTrade(arr.getJSONObject(i))
+                        if (tr.price > 0 && tr.size > 0 && tr.price.isFinite() && tr.size.isFinite()) {
+                            listener.onTrade(tr)
+                        }
+                    }
                 }
                 topic.startsWith("orderbook") -> {
                     val data = msg.optJSONObject("data") ?: return
-                    handleBook(msg, data)
+                    handleBook(msg, data, msgTs)
                 }
                 topic.startsWith("kline") -> {
-                    // v6.1: [{start(ms), open, high, low, close, volume, confirm, ...}]
                     val arr = msg.optJSONArray("data") ?: return
                     if (arr.length() > 0) feedTracker.onValidMessage(FeedStatus.Kind.KLINE)
                     for (i in 0 until arr.length()) {
@@ -200,8 +203,6 @@ class BybitWs(
                     }
                 }
                 topic.startsWith("allLiquidation") -> {
-                    // формат v5: T (ts ms), s (symbol), S (side Buy/Sell), v (size), p (price)
-                    // Side=Sell — ликвидирован лонг, Side=Buy — ликвидирован шорт
                     val arr = msg.optJSONArray("data") ?: return
                     if (arr.length() > 0) feedTracker.onValidMessage(FeedStatus.Kind.LIQUIDATION)
                     for (i in 0 until arr.length()) {
@@ -257,35 +258,49 @@ class BybitWs(
         )
     }
 
-    private fun parseTrade(d: JSONObject): Trade = Trade(
-        price = d.optDouble("p"),
-        size = d.optDouble("v"),
-        side = d.optString("S"),
-        tsMs = d.optLong("T")
-    )
+    private fun parseTrade(d: JSONObject): Trade {
+        val ts = d.optLong("T")
+        return Trade(
+            price = d.optDouble("p"),
+            size = d.optDouble("v"),
+            side = d.optString("S"),
+            tsMs = ts,
+            lagMs = computeLagMs(ts)
+        )
+    }
 
-    private fun handleBook(msg: JSONObject, data: JSONObject) {
-        // В Bybit V5 поле "type" ("snapshot"/"delta") находится на верхнем уровне msg!
+    private fun handleBook(msg: JSONObject, data: JSONObject, msgTs: Long) {
         val type = msg.optString("type").ifEmpty { data.optString("type") }
-        // Bybit V5: snapshot = {u, seq, b, a}; delta = {u, seq, b, a}. Книга собирается
-        // через BookState: разрыв u -> DESYNC и ожидание нового snapshot.
+        val eventTs = if (msgTs > 0L) msgTs else System.currentTimeMillis()
+        val lagMs = computeLagMs(eventTs)
         fun pairs(arr: JSONArray?): List<Pair<Double, Double>> =
             parseLevels(arr).map { it.price to it.qty }
         if (type == "snapshot") {
-            bookState.snapshot(pairs(data.optJSONArray("b")), pairs(data.optJSONArray("a")), data.optLong("u"))
-            feedTracker.onValidMessage(FeedStatus.Kind.BOOK)
-            emitBook()
-        } else if (type == "delta") {
-            val applied = bookState.delta(
+            val deltas = bookState.snapshotWithDeltas(
                 pairs(data.optJSONArray("b")),
                 pairs(data.optJSONArray("a")),
                 data.optLong("u"),
-                data.optLong("seq")
+                eventTs
+            )
+            feedTracker.onValidMessage(FeedStatus.Kind.BOOK)
+            listener.onBookDeltas(deltas, true, lagMs)
+            emitBook()
+        } else if (type == "delta") {
+            val (applied, deltas) = bookState.deltaWithChanges(
+                pairs(data.optJSONArray("b")),
+                pairs(data.optJSONArray("a")),
+                data.optLong("u"),
+                data.optLong("seq"),
+                eventTs
             )
             if (applied) {
                 feedTracker.onValidMessage(FeedStatus.Kind.BOOK)
+                if (deltas.isNotEmpty()) {
+                    listener.onBookDeltas(deltas, true, lagMs)
+                }
                 emitBook()
             } else if (!bookState.snapshot().synced) {
+                listener.onBookDeltas(emptyList(), false, lagMs)
                 listener.onBookDesync("sequence gap (u=${data.optLong("u")}) — ждём snapshot")
             }
         }
@@ -301,7 +316,6 @@ class BybitWs(
         }
     }
 
-    /** v8.1: доступ к честному состоянию книги (движок/аналитика). */
     fun bookSnapshot(): BookState.Book = bookState.snapshot()
 
     private fun parseLevels(arr: JSONArray?): List<BookLevel> {
@@ -317,7 +331,7 @@ class BybitWs(
 
 /**
  * Rolling-агрегатор ленты сделок: CVD, дельта, агрессия — Order Flow в реальном
- * времени из WS publicTrade (аналог tape_calc из mm_live, для UI).
+ * времени из WS publicTrade.
  */
 class TapeAggregator(private val window: Int = 500) {
     private val trades = ArrayDeque<BybitWs.Trade>(window)
@@ -389,8 +403,8 @@ class LiquidationAggregator {
             .put("ok", true)
             .put("sum_usd_1h", round2(sum1h))
             .put("sum_usd_24h", round2(sum24h))
-            .put("long_liq_usd_1h", round2(long1h))   // ликвидации лонгов (Sell)
-            .put("short_liq_usd_1h", round2(short1h)) // ликвидации шортов (Buy)
+            .put("long_liq_usd_1h", round2(long1h))
+            .put("short_liq_usd_1h", round2(short1h))
             .put("n", items.size)
     }
 

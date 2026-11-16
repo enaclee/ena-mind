@@ -34,7 +34,7 @@ object PythonBridge {
                 Python.start(AndroidPlatform(ctx.applicationContext))
             }
             val dataDir = File(ctx.filesDir, "enamind").apply { mkdirs() }
-            // v7.2: передаём версию скилла APK — версионный страж в chain_bridge.init
+            // Передаём версию скилла APK — версионный страж в chain_bridge.init
             // игнорирует override-скрипты старее APK (конфликт старых импортов)
             val r = JSONObject(
                 Python.getInstance()
@@ -128,7 +128,7 @@ object PythonBridge {
     fun skillFiles(): JSONObject = call("skill_files")
     fun exportDataFiles(): JSONObject = call("export_data_files")
 
-    // ================= NEURAL FORECAST ENGINE v7.0 =================
+    // ================= NEURAL FORECAST ENGINE =================
 
     /** Полный прогон движка по живому срезу (каждые ~5с из NeuralEngine). */
     fun engineFeed(symbol: String, fastJson: String): String = try {

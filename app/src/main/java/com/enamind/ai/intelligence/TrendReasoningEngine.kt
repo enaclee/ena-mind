@@ -2,6 +2,7 @@ package com.enamind.ai.intelligence
 
 import com.enamind.ai.bybit.MultiVenueDataBridge
 import com.enamind.ai.core.AppState
+import com.enamind.ai.orderflow.OrderFlowCouncilPayload
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -12,13 +13,13 @@ import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
- * Вычислительная и логическая система ботов-агентов ENA v9.0.
+ * Вычислительная и логическая система ботов-агентов ENA.
  *
  * Задачи:
- * 1) Разгрузить Python-мост: считать структуру, тренд, поток, кросс-биржевые потоки (5 площадок),
- *    скорость ленты, давление сквиза, Chain Radar и Crypto Sentinel прямо в Kotlin на Dispatchers.Default;
+ * 1) Разгрузить Python-мост: считать структуру, тренд, поток, кросс-биржевые потоки,
+ *    скорость ленты, давление сквиза, Order Flow / Absorption, Chain Radar и Crypto Sentinel прямо в Kotlin;
  * 2) Строить причинно-следственную логику (Наблюдение -> Механизм -> Вывод -> Отмена);
- * 3) Выдавать свежие прогнозы на 6ч и 24ч при каждом запросе и объединять их с Python-контуром.
+ * 3) Выдавать свежие прогнозы на 6ч и 24ч при достаточном числе реальных свечей и честно сообщать при нехватке данных.
  */
 object TrendReasoningEngine {
 
@@ -35,7 +36,8 @@ object TrendReasoningEngine {
         clockStatus: ExchangeClockSync.ClockSyncStatus? = null,
         venueSnap: MultiVenueDataBridge.VenueSnapshot? = null,
         binancePrice: Double = 0.0,
-        okxPrice: Double = 0.0
+        okxPrice: Double = 0.0,
+        orderFlow: OrderFlowCouncilPayload? = null
     ): UnifiedIntelligenceReport {
         // 1. Аудит и очистка свечей по всем ТФ с учётом биржевого времени
         val cleanByTf = LinkedHashMap<String, List<List<Double>>>()
@@ -77,6 +79,7 @@ object TrendReasoningEngine {
             venueSnap = venueSnap
         )
         val sentinelBot = runSentinelBot(sentinelEvents)
+        val ofBot = runOrderFlowIntelligenceBot(orderFlow)
 
         val bots = buildList {
             add(mtfBot)
@@ -88,6 +91,7 @@ object TrendReasoningEngine {
             add(squeezeBot)
             add(radarBot)
             add(sentinelBot)
+            ofBot?.let { add(it) }
             pythonCouncilBot(pythonResult)?.let { add(it) }
         }
 
@@ -129,7 +133,8 @@ object TrendReasoningEngine {
             learning = learning,
             quantMetrics = quantMetrics,
             walkForward = walkForward,
-            quantDiag = quantDiag
+            quantDiag = quantDiag,
+            orderFlow = orderFlow
         )
 
         val headline = buildString {
@@ -141,16 +146,24 @@ object TrendReasoningEngine {
 
         val narrative = buildString {
             append(radarSnapshot.preChartAnswer)
+            if (orderFlow != null && orderFlow.sufficientData) {
+                val lvlStr = orderFlow.levelPrice?.let { " у ${fmtPx(it)}" } ?: ""
+                append("\nOrder Flow: ${orderFlow.detectedEvent}$lvlStr (${orderFlow.signalStrength}; ${orderFlow.dataQuality}).")
+            }
             if (sentinelEvents.isNotEmpty()) {
                 val topEv = sentinelEvents.first()
                 append("\nСобытие Sentinel [${topEv.severity.labelRu}]: ${topEv.title}.")
             } else {
                 append("\nSentinel: критических аномалий по потоку и волатильности не зафиксировано.")
             }
-            val adxS = "%.0f".format(Locale.US, quantMetrics.adx)
+            val adxS = if (quantMetrics.sufficientData && quantMetrics.adx > 0.0) {
+                "ADX %.0f".format(Locale.US, quantMetrics.adx)
+            } else {
+                "ADX нет истории"
+            }
             val erS = "%.2f".format(Locale.US, quantMetrics.efficiencyRatio)
             val r2S = "%.2f".format(Locale.US, quantMetrics.regressionR2)
-            append("\nКачество данных ${mainQuality.grade} · ADX $adxS · ER $erS · R² $r2S.")
+            append("\nКачество данных ${mainQuality.grade} · $adxS · ER $erS · R² $r2S.")
             if (learning.verifiedCount >= 3 && learning.hitRatePct != null) {
                 val hrStr = "%.0f%%".format(Locale.US, learning.hitRatePct)
                 append("\nПамять самообучения: проверено ${learning.verifiedCount} прогнозов · точность $hrStr.")
@@ -239,11 +252,12 @@ object TrendReasoningEngine {
         if (weightSum == 0.0) {
             return BotSignal(
                 id = "bot_mtf",
-                name = "Бота-Тренд (MTF)",
+                name = "Бот-Тренд (MTF)",
                 category = BotCategory.TREND,
                 bias = BiasDirection.FLAT,
-                confidence = 0.25,
-                summary = "Недостаточно свечей для мульти-ТФ оценки."
+                confidence = 0.0,
+                summary = "Недостаточно свечей для мульти-ТФ оценки.",
+                hasData = false
             )
         }
 
@@ -276,8 +290,9 @@ object TrendReasoningEngine {
                 name = "Бот-Структура (HH/HL)",
                 category = BotCategory.STRUCTURE,
                 bias = BiasDirection.FLAT,
-                confidence = 0.25,
-                summary = "Жду ≥30 баров для анализа свингов."
+                confidence = 0.0,
+                summary = "Жду ≥30 баров для анализа свингов.",
+                hasData = false
             )
         }
         val highs = bars.mapNotNull { it.getOrNull(2) }
@@ -370,14 +385,15 @@ object TrendReasoningEngine {
             score <= -0.55 -> BiasDirection.DOWN
             else -> BiasDirection.FLAT
         }
-        val conf = if (activeSignals == 0) 0.20 else (0.38 + min(0.50, abs(score) * 0.25))
+        val conf = if (activeSignals == 0) 0.0 else (0.38 + min(0.50, abs(score) * 0.25))
         return BotSignal(
             id = "bot_flow",
             name = "Бот-Поток и Деривативы",
             category = BotCategory.FLOW,
             bias = bias,
             confidence = conf,
-            summary = if (notes.isEmpty()) "Ожидание ленты сделок и деривативов…" else notes.joinToString(" · ")
+            summary = if (notes.isEmpty()) "Ожидание ленты сделок и деривативов…" else notes.joinToString(" · "),
+            hasData = activeSignals > 0
         )
     }
 
@@ -466,7 +482,7 @@ object TrendReasoningEngine {
         val conf = when (radar.moneyFlowBias) {
             "ACCUMULATION", "DISTRIBUTION" -> 0.68
             "NEUTRAL" -> 0.42
-            else -> 0.20
+            else -> 0.0
         }
         return BotSignal(
             id = "bot_radar",
@@ -479,7 +495,8 @@ object TrendReasoningEngine {
                 "DISTRIBUTION" -> "Преобладает распределение и выход крупного капитала."
                 "NEUTRAL" -> "Ончейн-потоки и киты в балансе."
                 else -> "Ончейн-лента обновляется…"
-            }
+            },
+            hasData = radar.moneyFlowBias != "INSUFFICIENT"
         )
     }
 
@@ -751,8 +768,9 @@ object TrendReasoningEngine {
                 name = "Бот-Кросс-Биржи",
                 category = BotCategory.FLOW,
                 bias = BiasDirection.FLAT,
-                confidence = 0.25,
-                summary = "Подключено площадок: ${prices.size} — ожидание мультибиржевого среза…"
+                confidence = 0.0,
+                summary = "Подключено площадок: ${prices.size} — ожидание мультибиржевого среза…",
+                hasData = false
             )
         }
         val ref = bybitPrice ?: prices.values.first()
@@ -789,8 +807,9 @@ object TrendReasoningEngine {
                 name = "Бот-Скорость Ленты",
                 category = BotCategory.FLOW,
                 bias = BiasDirection.FLAT,
-                confidence = 0.22,
-                summary = "Накопление высокочастотных тиков…"
+                confidence = 0.0,
+                summary = "Накопление высокочастотных тиков…",
+                hasData = false
             )
         }
         var score = 0.0
@@ -850,8 +869,9 @@ object TrendReasoningEngine {
                 name = "Бот-Глубина Стакана",
                 category = BotCategory.FLOW,
                 bias = BiasDirection.FLAT,
-                confidence = 0.25,
-                summary = "Ожидание стакана заявок…"
+                confidence = 0.0,
+                summary = "Ожидание стакана заявок…",
+                hasData = false
             )
         }
         val avgImb = imbSum / count
@@ -904,14 +924,51 @@ object TrendReasoningEngine {
             score <= -0.45 -> BiasDirection.DOWN
             else -> BiasDirection.FLAT
         }
-        val conf = if (notes.isEmpty()) 0.25 else (0.38 + min(0.45, abs(score) * 0.4))
+        val conf = if (notes.isEmpty()) 0.0 else (0.38 + min(0.45, abs(score) * 0.4))
         return BotSignal(
             id = "bot_squeeze",
             name = "Бот-Сквиз и Плечи",
             category = BotCategory.STRUCTURE,
             bias = bias,
             confidence = conf,
-            summary = if (notes.isEmpty()) "Плечи и ликвидации в пределах нормы" else notes.joinToString(" · ")
+            summary = if (notes.isEmpty()) "Плечи и ликвидации в пределах нормы" else notes.joinToString(" · "),
+            hasData = notes.isNotEmpty()
+        )
+    }
+
+    private fun runOrderFlowIntelligenceBot(of: OrderFlowCouncilPayload?): BotSignal? {
+        if (of == null) return null
+        if (!of.sufficientData) {
+            return BotSignal(
+                id = "bot_orderflow",
+                name = "ENA Order Flow & Absorption",
+                category = BotCategory.FLOW,
+                bias = BiasDirection.FLAT,
+                confidence = 0.0,
+                summary = of.contradictingEvidence.firstOrNull() ?: "Ожидание синхронизированного потока сделок и DOM",
+                hasData = false
+            )
+        }
+        val bw = of.bullishBiasWeight.coerceIn(-0.25, 0.25)
+        val bias = when {
+            bw >= 0.06 -> BiasDirection.UP
+            bw <= -0.06 -> BiasDirection.DOWN
+            else -> BiasDirection.FLAT
+        }
+        // Жёстко ограничиваем уверенность в Совете (≤ 0.45), чтобы модуль не мог бесконтрольно перевесить существующие прогнозы и риск-фильтры
+        val boundedConf = (0.18 + abs(bw) * 1.1).coerceIn(0.18, 0.45)
+        val histStr = if (of.historicalSamples >= 8 && of.historicalReversalRatePct != null) {
+            " · история (${of.historicalSamples} соб.): развороты ${"%.0f%%".format(Locale.US, of.historicalReversalRatePct)}"
+        } else ""
+        val lvlStr = of.levelPrice?.let { " у ${fmtPx(it)}" } ?: ""
+        return BotSignal(
+            id = "bot_orderflow",
+            name = "ENA Order Flow & Absorption",
+            category = BotCategory.FLOW,
+            bias = bias,
+            confidence = boundedConf,
+            summary = "${of.detectedEvent}$lvlStr [${of.signalStrength}]$histStr",
+            hasData = true
         )
     }
 
@@ -931,28 +988,30 @@ object TrendReasoningEngine {
         learning: LearningSnapshot = LearningSnapshot(),
         quantMetrics: QuantMathKernel.QuantTrendMetrics = QuantMathKernel.computeMetrics(bars),
         walkForward: QuantMathKernel.WalkForwardReport = QuantMathKernel.WalkForwardReport(0, null, null, null, null, null, 1.0),
-        quantDiag: QuantDiagnostics = QuantDiagnostics()
+        quantDiag: QuantDiagnostics = QuantDiagnostics(),
+        orderFlow: OrderFlowCouncilPayload? = null
     ): TrendLogicSummary {
         val pyTrend = pythonResult?.takeIf { it.optBoolean("ok") }?.optJSONObject("trend")
         val pyForecast = pythonResult?.takeIf { it.optBoolean("ok") }?.optJSONObject("forecast")
 
-        val directionalBots = bots.filter { it.category != BotCategory.SENTINEL }
+        val directionalBots = bots.filter { it.category != BotCategory.SENTINEL && it.hasData }
         var upW = 0.0
         var downW = 0.0
         var flatW = 0.0
         directionalBots.forEach { b ->
             val mult = (learnedWeights[b.id] ?: 1.0).coerceIn(0.55, 1.55)
-            val w = (b.confidence.coerceIn(0.15, 1.0) * mult).coerceIn(0.10, 1.55)
+            val maxCap = if (b.id == "bot_orderflow") 0.45 else 1.55
+            val w = (b.confidence.coerceIn(0.10, 1.0) * mult).coerceIn(0.10, maxCap)
             when (b.bias) {
                 BiasDirection.UP -> upW += w
                 BiasDirection.DOWN -> downW += w
                 BiasDirection.FLAT -> flatW += w * 0.7
             }
         }
-        val sumW = (upW + downW + flatW).coerceAtLeast(1e-6)
-        var rawUp = upW / sumW
-        var rawDown = downW / sumW
-        var rawFlat = flatW / sumW
+        val sumW = (upW + downW + flatW)
+        var rawUp = if (sumW > 1e-6) upW / sumW else 1.0 / 3.0
+        var rawDown = if (sumW > 1e-6) downW / sumW else 1.0 / 3.0
+        var rawFlat = if (sumW > 1e-6) flatW / sumW else 1.0 / 3.0
 
         // Если Python-прогноз готов, смешиваем его вероятности с логическим консенсусом ботов
         if (pyForecast != null) {
@@ -1106,9 +1165,21 @@ object TrendReasoningEngine {
                     )
                 )
             }
+            if (orderFlow != null && orderFlow.sufficientData) {
+                val contraTxt = orderFlow.contradictingEvidence.firstOrNull()?.let { " (против: $it)" } ?: ""
+                add(
+                    CausalStep(
+                        index = 5,
+                        observation = "Order Flow & Absorption: ${orderFlow.detectedEvent} [${orderFlow.signalStrength}] · ${orderFlow.dataQuality}",
+                        mechanism = "Оценка исполнения стакана vs снятия заявок, пополнения ликвидности и эффективности продвижения цены",
+                        conclusion = (orderFlow.supportingEvidence.take(2).joinToString("; ") + contraTxt).ifBlank { orderFlow.detectedEvent },
+                        invalidation = "Потеря синхронизации стакана или смена направленного OFI/Delta"
+                    )
+                )
+            }
             add(
                 CausalStep(
-                    index = 5,
+                    index = 6,
                     observation = "$wfStr · $clockStr",
                     mechanism = "Log-odds калибровка сжимает вероятности при расхождении с историческим Brier или задержке свечей",
                     conclusion = "Итоговые вероятности откалиброваны под реальную статистику и качество данных (${quantDiag.dataGrade})",
@@ -1171,7 +1242,7 @@ object TrendReasoningEngine {
         venueSnap: MultiVenueDataBridge.VenueSnapshot? = null,
         learning: LearningSnapshot = LearningSnapshot(),
         nowMs: Long = System.currentTimeMillis()
-    ): OutlookSummary {
+    ): OutlookSummary? {
         val report = analyze(
             symbol = symbol,
             klinesByTf = klinesByTf,
@@ -1183,11 +1254,7 @@ object TrendReasoningEngine {
             learning = learning,
             venueSnap = venueSnap
         )
-        return if (horizonHours <= 6) {
-            report.outlook6h ?: OutlookSummary(horizonHours, "FLAT", 0.33, 0.34, 0.33, 0.0, 1.0, -1.28, 1.28, 0.35, "base", emptyList(), emptyList(), nowMs)
-        } else {
-            report.outlook24h ?: OutlookSummary(horizonHours, "FLAT", 0.33, 0.34, 0.33, 0.0, 2.2, -2.8, 2.8, 0.65, "base", emptyList(), emptyList(), nowMs)
-        }
+        return if (horizonHours <= 6) report.outlook6h else report.outlook24h
     }
 
     private fun computeOutlookFromClean(
@@ -1200,12 +1267,13 @@ object TrendReasoningEngine {
         venueSnap: MultiVenueDataBridge.VenueSnapshot?,
         pythonResult: JSONObject?,
         nowMs: Long
-    ): OutlookSummary {
+    ): OutlookSummary? {
         val hBars = cleanByTf["60"].orEmpty()
         val f15Bars = cleanByTf["15"].orEmpty()
         val baseBars = if (hBars.size >= 12) hBars else (f15Bars.ifEmpty { cleanByTf.values.firstOrNull().orEmpty() })
+        if (baseBars.size < 6) return null
         val stepHours = if (baseBars === hBars) 1.0 else if (baseBars === f15Bars) 0.25 else 1.0
-        val rawAtrPct = computeAtrPct(baseBars, 14).takeIf { it.isFinite() && it > 0.0 } ?: 0.55
+        val rawAtrPct = computeAtrPctNullable(baseBars, 14) ?: return null
         val sigmaH = (rawAtrPct * sqrt(horizonHours.toDouble() / stepHours)).coerceIn(
             if (horizonHours <= 6) 0.45 else 0.90,
             if (horizonHours <= 6) 6.5 else 14.0
@@ -1350,8 +1418,8 @@ object TrendReasoningEngine {
         return e
     }
 
-    private fun computeAtrPct(bars: List<List<Double>>, period: Int): Double {
-        if (bars.size < 3) return 0.35
+    private fun computeAtrPctNullable(bars: List<List<Double>>, period: Int): Double? {
+        if (bars.size < 3) return null
         val slice = bars.takeLast(min(bars.size, period + 1))
         var sumTrPct = 0.0
         var n = 0
@@ -1359,13 +1427,16 @@ object TrendReasoningEngine {
             val prevC = slice[i - 1].getOrNull(4) ?: continue
             val h = slice[i].getOrNull(2) ?: continue
             val l = slice[i].getOrNull(3) ?: continue
-            if (prevC <= 0) continue
+            if (prevC <= 0.0 || !h.isFinite() || !l.isFinite() || h < l) continue
             val tr = maxOf(h - l, abs(h - prevC), abs(l - prevC))
             sumTrPct += tr / prevC * 100.0
             n++
         }
-        return if (n == 0) 0.35 else sumTrPct / n
+        return if (n == 0) null else sumTrPct / n
     }
+
+    private fun computeAtrPct(bars: List<List<Double>>, period: Int): Double =
+        computeAtrPctNullable(bars, period) ?: 0.0
 
     private fun stdDev(values: List<Double>): Double {
         if (values.size < 2) return 0.0

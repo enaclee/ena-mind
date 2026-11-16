@@ -45,14 +45,14 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * ДВИЖОК (вкладка) — единый движок ENA-MIND v8.0 «ЛЕС И ПАУТИНА»:
- * - ПРОГНОЗ 15 минут (P UP/FLAT/DOWN, сессии с версионированием);
+ * ДВИЖОК — единый аналитический модуль ENA «ЛЕС И ПАУТИНА»:
+ * - ПРОГНОЗ 6 часов / 24 часа (P UP/FLAT/DOWN, сессии с обновлением);
  * - ЛЕС: 18 агентов-ветвей по пластам данных (нажмите для деталей);
  * - ПАУТИНА: связи между агентами, согласованность леса (web_coherence);
- * - ГЛУБОКИЙ АНАЛИЗ A→Б (цепочка v6.1: данные → режим → аналитики → совет →
+ * - ГЛУБОКИЙ АНАЛИЗ A→Б (данные → режим → аналитики → совет →
  *   прогноз → risk gate) с живым прогрессом узлов и audit trail;
  * - watchlist, совет, журнал вычислений, память, история.
- * Режим SHADOW (без торговли). Внешние AI не используются — только движок.
+ * Только аналитический режим без торговли. Внешние AI на расчёты не влияют.
  */
 @Composable
 fun NeuralEngineScreen(state: AppState, onOpenHistory: () -> Unit = {}) {
@@ -90,13 +90,13 @@ fun NeuralEngineScreen(state: AppState, onOpenHistory: () -> Unit = {}) {
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("ДВИЖОК v9.0 · ЛЕС И ПАУТИНА", fontSize = 12.sp, fontWeight = FontWeight.Bold,
+            Text("ДВИЖОК · ЛЕС И ПАУТИНА", fontSize = 12.sp, fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.width(8.dp))
             Box(modifier = Modifier.width(7.dp).height(7.dp)
                 .background(if (running) Color(0xFF00C896) else MaterialTheme.colorScheme.onSurfaceVariant,
                     RoundedCornerShape(4.dp)))
-            Text(" 5с-цикл · боты + агенты · SHADOW", fontSize = 9.sp,
+            Text(" 5с-цикл · боты + агенты · анализ", fontSize = 9.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.weight(1f))
             Text("${result?.optJSONObject("data")?.optString("grade") ?: "—"} · " +
@@ -146,14 +146,14 @@ fun NeuralEngineScreen(state: AppState, onOpenHistory: () -> Unit = {}) {
             Spacer(Modifier.height(8.dp))
             HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
 
-            // v8.1 (ТЗ §6): ON-CHAIN (OCIE) — второй контур
+            // ON-CHAIN (OCIE) — второй контур
             Spacer(Modifier.height(6.dp))
             OnchainPanel(result?.optJSONObject("onchain"))
 
             Spacer(Modifier.height(8.dp))
             HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
 
-            // v8.1 (ТЗ §42): MARKET DISCOVERY — найденные формации
+            // MARKET DISCOVERY — найденные формации
             Spacer(Modifier.height(6.dp))
             DiscoveryPanel(result?.optJSONObject("discovery"))
 
@@ -293,7 +293,7 @@ fun NeuralEngineScreen(state: AppState, onOpenHistory: () -> Unit = {}) {
                 val st = mem.optJSONObject("stats")
                 val checked = st?.optJSONObject("checked")
                 if (checked == null || checked.optInt("n", 0) == 0) {
-                    Text("проверенных 6-часовых прогнозов пока нет — накапливаются в SHADOW-режиме " +
+                    Text("проверенных 6-часовых прогнозов пока нет — накапливаются в аналитическом режиме " +
                         "(первая проверка через 6 часов после запуска)", fontSize = 9.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
@@ -417,7 +417,7 @@ fun NeuralEngineScreen(state: AppState, onOpenHistory: () -> Unit = {}) {
 private val NeuralEngineOrder = com.enamind.ai.core.Settings.SYMBOLS
 
 /**
- * ПАУТИНА СВЯЗЕЙ (v8.0): какие связи леса активны, где согласие и конфликты,
+ * ПАУТИНА СВЯЗЕЙ: какие связи леса активны, где согласие и конфликты,
  * согласованность леса web_coherence. Именно паутина не даёт агентам «голосовать»
  * изолированно: конфликт паутины гасит уверенность прогноза, согласие усиливает.
  */
@@ -511,7 +511,7 @@ private fun shortAgent(name: String): String = when (name) {
     else -> name.take(8)
 }
 
-// ================= v8.1: НОВЫЕ ПАНЕЛИ (ТЗ v2/v5) =================
+// ================= ПАНЕЛИ АНАЛИТИКИ =================
 
 /**
  * TREND INTELLIGENCE (§13/§18): bias (7 градаций), сила, mtf-выравнивание,

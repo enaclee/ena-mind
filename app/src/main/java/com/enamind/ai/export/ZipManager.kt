@@ -66,7 +66,7 @@ object ZipManager {
         return JSONObject().put("files", out).put("version", version)
     }
 
-    /** Создать экспортный ZIP; вернуть путь и состав. v7.1: архив подписывается (ZipCrypto). */
+    /** Создать экспортный ZIP; вернуть путь и состав (архив подписывается ZipCrypto). */
     fun export(ctx: Context, appVersion: String): JSONObject {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
@@ -135,7 +135,7 @@ object ZipManager {
                 if (faultsFile.isFile) {
                     addFile("fault_history.jsonl", faultsFile)
                 }
-                // 3) сводная память + v7.2 диагностика движка + квантовый снимок + метаданные
+                // 3) сводная память + диагностика движка + квантовый снимок + метаданные
                 addText("memory_summary.json", PythonBridge.memorySummary().toString(2))
                 try {
                     val diag = PythonBridge.callEngine("engine_diagnostics").toString(2)
@@ -149,7 +149,7 @@ object ZipManager {
                     }
                 } catch (_: Exception) {
                 }
-                // v7.2: краш-репорт CrashGuard — если приложение падало, причина едет в архив
+                // Краш-репорт CrashGuard — если приложение падало, причина едет в архив
                 try {
                     val crash = File(File(ctx.filesDir, "enamind"), "crash_report.log")
                     if (crash.isFile) addText("crash_report.log", crash.readText().take(20_000))
@@ -177,7 +177,7 @@ object ZipManager {
                         .put("secrets_included", false)
                         .toString(2)
                 )
-                // 4) v7.1: подпись — манифест хэшей всех записей + ECDSA-подпись устройства
+                // 4) Подпись — манифест хэшей всех записей + ECDSA-подпись устройства
                 for ((p, b) in entryBytes) hashes[p] = ZipCrypto.sha256(b)
                 val manifest = JSONObject()
                     .put("alg", ZipCrypto.ALG)
@@ -281,7 +281,7 @@ object ZipManager {
      * config, alerts) и, если в архиве есть python-скрипты, устанавливает
      * обновление скилла (override-каталог).
      *
-     * v7.1 — проверка подписи ZipCrypto:
+     * Проверка подписи ZipCrypto:
      * - подпись не сходится -> отказ всегда;
      * - подписана чужим ключом или без подписи -> требует confirmed=true
      *   (UI показывает диалог доверия с отпечатком ключа).
@@ -357,7 +357,7 @@ object ZipManager {
             } else if (!confirmed) {
                 return JSONObject().put("ok", false).put("need_confirm", true)
                     .put("status", "unsigned")
-                    .put("error", "архив без подписи (старый формат v7.0 или сторонний) — нужно подтверждение")
+                    .put("error", "архив без подписи (сторонний или старый формат) — нужно подтверждение")
             }
             // проход 2 (по данным в памяти): применение
             var vaultRestored = false
@@ -390,7 +390,7 @@ object ZipManager {
                         }
                     }
                     "script" -> scripts[path.removePrefix("scripts/")] = content
-                    // v7.2: SKILL.md едет в override — версионный страж отличит новый архив от старого
+                    // SKILL.md едет в override — версионный страж отличит новый архив от старого
                     "skillmd" -> scripts[path] = content
                 }
             }

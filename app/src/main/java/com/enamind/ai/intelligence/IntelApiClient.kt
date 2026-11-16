@@ -130,6 +130,56 @@ class IntelApiClient {
                 Log.w("IntelApi", "whales parse: ${e.message}")
             }
         }
+        // Бесплатный резерв OKX public trades при недоступности Binance
+        val okxInst = BybitRest.toOkxInstId(symbol)
+        val okxTxt = getText("https://www.okx.com/api/v5/market/trades?instId=$okxInst&limit=500")
+        if (okxTxt != null) {
+            try {
+                val arr = JSONObject(okxTxt).optJSONArray("data")
+                if (arr != null && arr.length() > 0) {
+                    var count = 0; var buyUsd = 0.0; var sellUsd = 0.0
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val px = o.optString("px").toDoubleOrNull() ?: continue
+                        val qty = o.optString("sz").toDoubleOrNull() ?: continue
+                        val usd = px * qty
+                        if (usd >= 100_000.0) {
+                            count++
+                            if (o.optString("side").equals("sell", ignoreCase = true)) sellUsd += usd else buyUsd += usd
+                        }
+                    }
+                    val res = WhaleResult(ok = true, count = count, buyUsd = buyUsd, sellUsd = sellUsd)
+                    whaleCache[symbol] = now to res
+                    return res
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        // Резерв Gate.io public trades
+        val gatePair = BybitRest.toGatePair(symbol)
+        val gateTxt = getText("https://api.gateio.ws/api/v4/spot/trades?currency_pair=$gatePair&limit=500")
+        if (gateTxt != null) {
+            try {
+                val arr = JSONArray(gateTxt)
+                var count = 0; var buyUsd = 0.0; var sellUsd = 0.0
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val px = o.optString("price").toDoubleOrNull() ?: continue
+                    val qty = o.optString("amount").toDoubleOrNull() ?: continue
+                    val usd = px * qty
+                    if (usd >= 100_000.0) {
+                        count++
+                        if (o.optString("side").equals("sell", ignoreCase = true)) sellUsd += usd else buyUsd += usd
+                    }
+                }
+                val res = WhaleResult(ok = true, count = count, buyUsd = buyUsd, sellUsd = sellUsd)
+                whaleCache[symbol] = now to res
+                return res
+            } catch (_: Exception) {
+            }
+        }
+
         return whaleCache[symbol]?.second ?: WhaleResult(false, 0, 0.0, 0.0)
     }
 
@@ -169,6 +219,14 @@ class IntelApiClient {
                 val obj = JSONObject(memTxt)
                 txCount = obj.optInt("count", -1).takeIf { it >= 0 }
             } catch (_: Exception) {
+            }
+        } else {
+            val bsMem = getText("https://blockstream.info/api/mempool")
+            if (bsMem != null) {
+                try {
+                    txCount = JSONObject(bsMem).optInt("count", -1).takeIf { it >= 0 }
+                } catch (_: Exception) {
+                }
             }
         }
 

@@ -5,19 +5,28 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Binance public market WebSocket (data-stream.binance.vision).
- * Combined stream: aggTrade (агрессивный поток), kline_{tf} (живые свечи для графика),
- * depth20@100ms (стакан), ticker (цена и 24ч изменение/объём).
- * m=true (buyer is maker) -> сделка инициирована ПРОДАВЦОМ (агрессивная продажа).
+ * Binance public market WebSocket + Diff Depth синхронизация стакана:
+ * Combined stream: @aggTrade, @kline_{tf}, @depth@100ms (последовательные дельты), @ticker.
+ *
+ * Восстановление локального стакана:
+ *  1) Буферизация событий @depth@100ms (с полями U, u, E, b, a).
+ *  2) Запрос REST /api/v3/depth?limit=500 -> lastUpdateId + snapshot.
+ *  3) Отбрасывание событий с u <= lastUpdateId и проверка первого моста
+ *     (U <= lastUpdateId + 1 && u >= lastUpdateId + 1).
+ *  4) Проверка непрерывности U/u -> при потере пакетов честный DESYNC и ресинк.
  */
 class BinanceWs(
-    private val symbol: String,          // BTCUSDT
+    private val symbol: String,
     private val listener: Listener,
-    private val klineInterval: String = "60"
+    private val klineInterval: String = "60",
+    private val clockOffsetMsProvider: () -> Long = { 0L }
 ) {
     interface Listener {
         fun onFlow(flow: FlowStats)
@@ -26,9 +35,11 @@ class BinanceWs(
         fun onStatus(connected: Boolean, note: String)
         fun onKline(bar: BybitWs.Kline) {}
         fun onTicker24h(price: Double, change24hPct: Double, volume24h: Double, quoteVolume24h: Double) {}
+        fun onTrade(price: Double, qty: Double, isAggressiveBuy: Boolean, exchangeTsMs: Long, lagMs: Long) {}
+        fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {}
+        fun onBookDesync(reason: String) {}
     }
 
-    /** Агрегированный поток aggTrade: окно последних N сделок. */
     data class FlowStats(
         val n: Int, val buyQty: Double, val sellQty: Double,
         val cvd: Double, val deltaPct: Double, val ageSec: Double,
@@ -39,23 +50,34 @@ class BinanceWs(
     private var ws: WebSocket? = null
     private var reconnectMs = 2000L
     private var closed = false
-    private val trades = ArrayDeque<Trade>() // (tsMs, isAggressiveBuy, qty, price)
+    private val trades = ArrayDeque<Trade>()
     private var lastTradeTs = 0L
+
+    val diffBook = BinanceDiffBookSync(maxLevels = 120)
+    private val snapshotFetching = AtomicBoolean(false)
+    private val lastSnapshotAttemptMs = AtomicLong(0L)
 
     private data class Trade(val ts: Long, val buy: Boolean, val qty: Double, val price: Double)
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // WS-стрим без read timeout
+        .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
-    private val lower = BybitRest.toBinanceSymbol(symbol).lowercase()
+    private val restHttp = OkHttpClient.Builder()
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(8, TimeUnit.SECONDS)
+        .build()
+
+    private val bnSym = BybitRest.toBinanceSymbol(symbol)
+    private val lower = bnSym.lowercase()
     private val bnIv = BybitRest.toBinanceInterval(klineInterval)
-    private val streams = "$lower@aggTrade/$lower@kline_$bnIv/$lower@depth20@100ms/$lower@ticker"
+    private val streams = "$lower@aggTrade/$lower@kline_$bnIv/$lower@depth@100ms/$lower@ticker"
 
     fun connect() {
         closed = false
+        diffBook.reset()
         val req = Request.Builder()
             .url("wss://data-stream.binance.vision/stream?streams=$streams")
             .build()
@@ -63,6 +85,7 @@ class BinanceWs(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 reconnectMs = 2000L
                 listener.onStatus(true, "Binance WS: поток подключён")
+                triggerRestSnapshotAsync()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -74,14 +97,22 @@ class BinanceWs(
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 listener.onStatus(false, "Binance WS: ${t.message ?: "обрыв"}")
+                diffBook.reset()
                 scheduleReconnect()
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 listener.onStatus(false, "Binance WS: закрыт")
+                diffBook.reset()
                 if (!closed) scheduleReconnect()
             }
         })
+    }
+
+    private fun computeLagMs(exchangeTsMs: Long): Long {
+        if (exchangeTsMs <= 1_600_000_000_000L) return 0L
+        val syncedNow = System.currentTimeMillis() + clockOffsetMsProvider()
+        return (syncedNow - exchangeTsMs).coerceIn(0L, 600_000L)
     }
 
     private fun handle(text: String) {
@@ -90,66 +121,138 @@ class BinanceWs(
         val stream = root.optString("stream")
         when {
             stream.endsWith("@aggTrade") -> {
-                val px = data.optDouble("p", 0.0)
-                val qty = data.optDouble("q", 0.0)
+                val px = data.optString("p").toDoubleOrNull() ?: data.optDouble("p", 0.0)
+                val qty = data.optString("q").toDoubleOrNull() ?: data.optDouble("q", 0.0)
                 val isBuyerMaker = data.optBoolean("m", false)
                 val ts = data.optLong("T")
+                if (!px.isFinite() || !qty.isFinite() || px <= 0.0 || qty <= 0.0) return
                 lastTradeTs = ts
+                val lagMs = computeLagMs(ts)
                 synchronized(trades) {
                     trades.addLast(Trade(ts, !isBuyerMaker, qty, px))
                     while (trades.size > 600) trades.removeFirst()
                 }
+                listener.onTrade(px, qty, !isBuyerMaker, ts, lagMs)
                 listener.onFlow(stats())
-                px.takeIf { it > 0 }?.let { listener.onPrice(it) }
+                listener.onPrice(px)
             }
             stream.contains("@kline_") -> {
                 val k = data.optJSONObject("k") ?: return
                 val ts = k.optLong("t")
-                val o = k.optDouble("o", 0.0)
-                val h = k.optDouble("h", 0.0)
-                val l = k.optDouble("l", 0.0)
-                val c = k.optDouble("c", 0.0)
-                val v = k.optDouble("v", 0.0)
+                val o = k.optString("o").toDoubleOrNull() ?: k.optDouble("o", 0.0)
+                val h = k.optString("h").toDoubleOrNull() ?: k.optDouble("h", 0.0)
+                val l = k.optString("l").toDoubleOrNull() ?: k.optDouble("l", 0.0)
+                val c = k.optString("c").toDoubleOrNull() ?: k.optDouble("c", 0.0)
+                val v = k.optString("v").toDoubleOrNull() ?: k.optDouble("v", 0.0)
                 val closedBar = k.optBoolean("x", false)
-                if (ts > 0 && o > 0 && c > 0) {
-                    listener.onKline(
-                        BybitWs.Kline(
-                            tsMs = ts,
-                            open = o,
-                            high = h,
-                            low = l,
-                            close = c,
-                            volume = v,
-                            confirm = closedBar
-                        )
-                    )
+                if (ts > 0 && o > 0 && c > 0 && listOf(o, h, l, c, v).all { it.isFinite() }) {
+                    listener.onKline(BybitWs.Kline(ts, o, h, l, c, v, closedBar))
                 }
             }
             stream.endsWith("@ticker") -> {
-                val c = data.optDouble("c", 0.0)
-                val p = data.optDouble("P", Double.NaN)
-                val v = data.optDouble("v", 0.0)
-                val q = data.optDouble("q", 0.0)
-                if (c > 0 && !p.isNaN()) {
+                val c = data.optString("c").toDoubleOrNull() ?: data.optDouble("c", 0.0)
+                val p = data.optString("P").toDoubleOrNull() ?: data.optDouble("P", Double.NaN)
+                val v = data.optString("v").toDoubleOrNull() ?: data.optDouble("v", 0.0)
+                val q = data.optString("q").toDoubleOrNull() ?: data.optDouble("q", 0.0)
+                if (c > 0 && c.isFinite() && p.isFinite()) {
                     listener.onTicker24h(c, p, v, q)
                 }
             }
             stream.contains("@depth") -> {
-                val bids = ArrayList<Pair<Double, Double>>()
-                val asks = ArrayList<Pair<Double, Double>>()
-                val bs = data.optJSONArray("bids") ?: data.optJSONArray("b")
-                val asLevels = data.optJSONArray("asks") ?: data.optJSONArray("a")
-                if (bs != null) for (i in 0 until bs.length()) {
-                    val lvl = bs.getJSONArray(i)
-                    bids.add(lvl.optDouble(0) to lvl.optDouble(1))
+                val eventTs = data.optLong("E", 0L).takeIf { it > 0L } ?: System.currentTimeMillis()
+                val lagMs = computeLagMs(eventTs)
+                val firstU = data.optLong("U", -1L)
+                val finalU = data.optLong("u", -1L)
+                val bids = parsePairs(data.optJSONArray("b") ?: data.optJSONArray("bids"))
+                val asks = parsePairs(data.optJSONArray("a") ?: data.optJSONArray("asks"))
+
+                if (firstU > 0L && finalU >= firstU) {
+                    val outcome = diffBook.onDiffEvent(firstU, finalU, bids, asks, eventTs)
+                    when (outcome.status) {
+                        BinanceDiffBookSync.Status.SYNCED -> {
+                            if (outcome.deltas.isNotEmpty()) {
+                                listener.onBookDeltas(outcome.deltas, true, lagMs)
+                            }
+                            listener.onDepth(outcome.bids, outcome.asks)
+                        }
+                        BinanceDiffBookSync.Status.NEED_SNAPSHOT -> {
+                            listener.onBookDeltas(emptyList(), false, lagMs)
+                            if (outcome.desyncReason != null) {
+                                listener.onBookDesync(outcome.desyncReason)
+                            }
+                            triggerRestSnapshotAsync()
+                        }
+                        BinanceDiffBookSync.Status.BUFFERING -> {
+                            // ждём REST snapshot
+                        }
+                    }
                 }
-                if (asLevels != null) for (i in 0 until asLevels.length()) {
-                    val lvl = asLevels.getJSONArray(i)
-                    asks.add(lvl.optDouble(0) to lvl.optDouble(1))
-                }
-                if (bids.isNotEmpty() || asks.isNotEmpty()) listener.onDepth(bids, asks)
             }
         }
+    }
+
+    private fun triggerRestSnapshotAsync() {
+        if (closed) return
+        val now = System.currentTimeMillis()
+        if (now - lastSnapshotAttemptMs.get() < 2500L) return
+        if (!snapshotFetching.compareAndSet(false, true)) return
+        lastSnapshotAttemptMs.set(now)
+        Thread {
+            try {
+                val urls = listOf(
+                    "https://data-api.binance.vision/api/v3/depth?symbol=$bnSym&limit=500",
+                    "https://api1.binance.com/api/v3/depth?symbol=$bnSym&limit=500",
+                    "https://api3.binance.com/api/v3/depth?symbol=$bnSym&limit=500"
+                )
+                for (url in urls) {
+                    if (closed) break
+                    val req = Request.Builder().url(url).header("Accept", "application/json").build()
+                    val body = try {
+                        restHttp.newCall(req).execute().use { r ->
+                            if (r.isSuccessful) r.body?.string() else null
+                        }
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (!body.isNullOrBlank()) {
+                        val obj = JSONObject(body)
+                        val lastId = obj.optLong("lastUpdateId", -1L)
+                        val bids = parsePairs(obj.optJSONArray("bids"))
+                        val asks = parsePairs(obj.optJSONArray("asks"))
+                        if (lastId > 0L && bids.isNotEmpty() && asks.isNotEmpty()) {
+                            val tsNow = System.currentTimeMillis() + clockOffsetMsProvider()
+                            val res = diffBook.applyRestSnapshot(lastId, bids, asks, tsNow)
+                            if (res.status == BinanceDiffBookSync.Status.SYNCED) {
+                                listener.onDepth(res.bids, res.asks)
+                                if (res.deltas.isNotEmpty()) {
+                                    listener.onBookDeltas(res.deltas, true, 0L)
+                                }
+                            } else if (res.desyncReason != null) {
+                                listener.onBookDesync(res.desyncReason)
+                            }
+                            break
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                snapshotFetching.set(false)
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    private fun parsePairs(arr: JSONArray?): List<Pair<Double, Double>> {
+        if (arr == null) return emptyList()
+        val out = ArrayList<Pair<Double, Double>>(arr.length())
+        for (i in 0 until arr.length()) {
+            val lvl = arr.optJSONArray(i) ?: continue
+            val p = lvl.optString(0).toDoubleOrNull() ?: lvl.optDouble(0, Double.NaN)
+            val q = lvl.optString(1).toDoubleOrNull() ?: lvl.optDouble(1, Double.NaN)
+            if (p.isFinite() && q.isFinite() && p > 0.0 && q >= 0.0) {
+                out.add(p to q)
+            }
+        }
+        return out
     }
 
     /** Статистика потока за окно (последние 600 агрегированных сделок / 120с). */
@@ -190,7 +293,173 @@ class BinanceWs(
 
     fun close() {
         closed = true
+        diffBook.reset()
         ws?.close(1000, "bye")
         ws = null
+    }
+}
+
+/**
+ * Потокобезопасный синхронизатор Binance Spot Diff Depth (`@depth@100ms` + REST `/api/v3/depth`).
+ * Проверяет sequence ID (`U`, `u`, `lastUpdateId`), буферизует дельты и инициирует ресинк при разрыве.
+ */
+class BinanceDiffBookSync(private val maxLevels: Int = 120) {
+    enum class Status { BUFFERING, SYNCED, NEED_SNAPSHOT }
+
+    data class DiffEvent(
+        val firstU: Long,
+        val finalU: Long,
+        val bids: List<Pair<Double, Double>>,
+        val asks: List<Pair<Double, Double>>,
+        val tsMs: Long
+    )
+
+    data class SyncResult(
+        val status: Status,
+        val bids: List<Pair<Double, Double>> = emptyList(),
+        val asks: List<Pair<Double, Double>> = emptyList(),
+        val deltas: List<BookState.LevelDelta> = emptyList(),
+        val lastUpdateId: Long = -1L,
+        val desyncReason: String? = null
+    )
+
+    private val book = BookState(maxLevels)
+    private val buffer = ArrayList<DiffEvent>()
+    private var synced = false
+    private var awaitingFirstBridge = false
+    private var lastAppliedU = -1L
+    var desyncCount: Long = 0L
+        private set
+
+    @Synchronized
+    fun reset() {
+        buffer.clear()
+        book.desync()
+        synced = false
+        awaitingFirstBridge = false
+        lastAppliedU = -1L
+    }
+
+    @Synchronized
+    fun isSynced(): Boolean = synced
+
+    @Synchronized
+    fun applyRestSnapshot(
+        lastUpdateId: Long,
+        bids: List<Pair<Double, Double>>,
+        asks: List<Pair<Double, Double>>,
+        tsMs: Long
+    ): SyncResult {
+        book.snapshotWithDeltas(bids, asks, lastUpdateId, tsMs)
+        lastAppliedU = lastUpdateId
+        synced = true
+        awaitingFirstBridge = true
+
+        val replayDeltas = ArrayList<BookState.LevelDelta>()
+        val queued = buffer.toList()
+        buffer.clear()
+
+        for (ev in queued) {
+            if (ev.finalU <= lastAppliedU) continue
+            if (awaitingFirstBridge) {
+                if (ev.firstU <= lastAppliedU + 1L && ev.finalU >= lastAppliedU + 1L) {
+                    val (_, ch) = book.deltaWithChanges(ev.bids, ev.asks, ev.finalU, ev.finalU, ev.tsMs)
+                    replayDeltas.addAll(ch)
+                    lastAppliedU = ev.finalU
+                    awaitingFirstBridge = false
+                } else if (ev.firstU > lastAppliedU + 1L) {
+                    // Snapshot устарел или потерян пакет моста — нужен более свежий snapshot
+                    synced = false
+                    awaitingFirstBridge = false
+                    desyncCount++
+                    book.desync()
+                    return SyncResult(
+                        status = Status.NEED_SNAPSHOT,
+                        desyncReason = "разрыв моста Binance depth (snap=$lastUpdateId, U=${ev.firstU})"
+                    )
+                }
+            } else {
+                if (ev.firstU != lastAppliedU + 1L) {
+                    synced = false
+                    desyncCount++
+                    book.desync()
+                    return SyncResult(
+                        status = Status.NEED_SNAPSHOT,
+                        desyncReason = "разрыв очереди Binance depth (wait=${lastAppliedU + 1}, got U=${ev.firstU})"
+                    )
+                }
+                val (_, ch) = book.deltaWithChanges(ev.bids, ev.asks, ev.finalU, ev.finalU, ev.tsMs)
+                replayDeltas.addAll(ch)
+                lastAppliedU = ev.finalU
+            }
+        }
+
+        val snap = book.snapshot()
+        return SyncResult(
+            status = Status.SYNCED,
+            bids = snap.bids,
+            asks = snap.asks,
+            deltas = replayDeltas,
+            lastUpdateId = lastAppliedU
+        )
+    }
+
+    @Synchronized
+    fun onDiffEvent(
+        firstU: Long,
+        finalU: Long,
+        bids: List<Pair<Double, Double>>,
+        asks: List<Pair<Double, Double>>,
+        tsMs: Long
+    ): SyncResult {
+        if (!synced) {
+            if (buffer.size > 400) buffer.removeAt(0)
+            buffer.add(DiffEvent(firstU, finalU, bids, asks, tsMs))
+            return SyncResult(status = Status.BUFFERING)
+        }
+        if (finalU <= lastAppliedU) {
+            val snap = book.snapshot()
+            return SyncResult(Status.SYNCED, snap.bids, snap.asks, emptyList(), lastAppliedU)
+        }
+        if (awaitingFirstBridge) {
+            if (firstU <= lastAppliedU + 1L && finalU >= lastAppliedU + 1L) {
+                val (_, deltas) = book.deltaWithChanges(bids, asks, finalU, finalU, tsMs)
+                lastAppliedU = finalU
+                awaitingFirstBridge = false
+                val snap = book.snapshot()
+                return SyncResult(Status.SYNCED, snap.bids, snap.asks, deltas, lastAppliedU)
+            } else if (firstU > lastAppliedU + 1L) {
+                synced = false
+                awaitingFirstBridge = false
+                desyncCount++
+                book.desync()
+                buffer.clear()
+                buffer.add(DiffEvent(firstU, finalU, bids, asks, tsMs))
+                return SyncResult(
+                    status = Status.NEED_SNAPSHOT,
+                    desyncReason = "поток Binance обогнал REST snapshot (snap=$lastAppliedU, U=$firstU)"
+                )
+            }
+            val snap = book.snapshot()
+            return SyncResult(Status.SYNCED, snap.bids, snap.asks, emptyList(), lastAppliedU)
+        }
+
+        // Основная проверка непрерывности: U должен быть <= lastAppliedU + 1
+        if (firstU > lastAppliedU + 1L) {
+            synced = false
+            desyncCount++
+            book.desync()
+            buffer.clear()
+            buffer.add(DiffEvent(firstU, finalU, bids, asks, tsMs))
+            return SyncResult(
+                status = Status.NEED_SNAPSHOT,
+                desyncReason = "потеря пакетов Binance depth (ожидался ${lastAppliedU + 1}, пришёл $firstU)"
+            )
+        }
+
+        val (_, deltas) = book.deltaWithChanges(bids, asks, finalU, finalU, tsMs)
+        lastAppliedU = finalU
+        val snap = book.snapshot()
+        return SyncResult(Status.SYNCED, snap.bids, snap.asks, deltas, lastAppliedU)
     }
 }

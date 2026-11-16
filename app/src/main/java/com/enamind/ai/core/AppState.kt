@@ -4,11 +4,14 @@ import android.content.Context
 import android.util.Log
 import com.enamind.ai.ai.AiStudioClient
 import com.enamind.ai.bybit.BinanceWs
+import com.enamind.ai.bybit.BookState
 import com.enamind.ai.bybit.BybitRest
 import com.enamind.ai.bybit.BybitWs
+import com.enamind.ai.bybit.ContractCatalogRepo
 import com.enamind.ai.bybit.LiquidationAggregator
 import com.enamind.ai.bybit.OkxWs
 import com.enamind.ai.bybit.TapeAggregator
+import com.enamind.ai.calendar.MajorCalendarRepo
 import com.enamind.ai.db.AnalysisEntity
 import com.enamind.ai.db.ApiCheckEntity
 import com.enamind.ai.db.AppDatabase
@@ -16,6 +19,8 @@ import com.enamind.ai.db.ForecastEntity
 import com.enamind.ai.db.NewsItemEntity
 import com.enamind.ai.export.ZipManager
 import com.enamind.ai.news.NewsRepo
+import com.enamind.ai.orderflow.OrderFlowEventVault
+import com.enamind.ai.orderflow.OrderFlowIntelligenceOrchestrator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -35,10 +40,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Единое состояние ENA v9.0:
- * MARKET MONITOR (Bybit V5 + автоматический fallback Binance/OKX),
- * NEURAL ENGINE (лес агентов + кросс-биржевая паутина + 6ч/24ч прогнозы + реал-тайм тренд),
- * Чат с движком + изолированный свободный ИИ-чат Google AI Studio, глубокий анализ A→Б и память.
+ * Единое состояние ENA:
+ * ORDER FLOW & ABSORPTION INTELLIGENCE, MARKET MONITOR,
+ * NEURAL ENGINE (боты + 6ч/24ч аналитика), Календарь крупных событий (раз в 15 дней),
+ * каталог всех контрактов биржи и изолированный универсальный ИИ-чат.
  */
 class AppState(
     private val ctx: Context,
@@ -46,6 +51,36 @@ class AppState(
 ) {
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val settings = Settings(ctx)
+    val contractCatalog = ContractCatalogRepo(ctx, settings)
+    val majorCalendar = MajorCalendarRepo(ctx, settings)
+    val orderFlow = OrderFlowIntelligenceOrchestrator(ctx)
+
+    private val _favoriteSymbols = MutableStateFlow(settings.favoriteSymbols)
+    val favoriteSymbols: StateFlow<Set<String>> = _favoriteSymbols
+
+    fun toggleFavoriteSymbol(sym: String) {
+        val clean = sym.trim().uppercase()
+        if (clean.isBlank()) return
+        val next = _favoriteSymbols.value.toMutableSet()
+        if (!next.add(clean)) next.remove(clean)
+        settings.favoriteSymbols = next
+        _favoriteSymbols.value = next
+    }
+
+    fun refreshContractsCatalog(force: Boolean = false) {
+        appScope.launch(Dispatchers.IO) {
+            contractCatalog.refreshSync(force = force)
+        }
+    }
+
+    fun refreshMajorCalendar(force: Boolean = true) {
+        appScope.launch(Dispatchers.IO) {
+            if (force) majorCalendar.refreshNowSync() else majorCalendar.refreshIfDueSync()
+        }
+    }
+
+    fun exportOrderFlowHistoryBundle(): OrderFlowEventVault.ExportBundle =
+        orderFlow.exportHistoryBundle()
 
     // ---------------- MARKET MONITOR ----------------
     data class MarketUi(
@@ -114,10 +149,13 @@ class AppState(
     private fun isBybitFresh(tsMs: Long, windowMs: Long = 4_000L): Boolean =
         tsMs > 0L && (System.currentTimeMillis() - tsMs) < windowMs
 
+    fun hasFreshBybitTrades(): Boolean = isBybitFresh(lastBybitTradeMs.get(), 6_000L)
+    fun hasFreshBybitBook(): Boolean = isBybitFresh(lastBybitBookMs.get(), 6_000L)
+
     /** Статистика ликвидаций для движка. */
     fun liqStats(symbol: String): JSONObject = liq.stats(symbol, System.currentTimeMillis())
 
-    // ---------------- NEURAL ENGINE v8.2 ----------------
+    // ---------------- NEURAL ENGINE ----------------
     val engine: NeuralEngine by lazy { NeuralEngine(ctx, this) }
 
     // ---------------- ГЛУБОКИЙ АНАЛИЗ A→Б ----------------
@@ -138,59 +176,13 @@ class AppState(
     private val _lastResult = MutableStateFlow<JSONObject?>(null)
     val lastResult: StateFlow<JSONObject?> = _lastResult
 
-    // ---------------- Чат с движком ----------------
-    data class ChatMessage(
-        val id: Long,
-        val fromUser: Boolean,
-        val text: String,
-        val title: String = "",
-        val busy: Boolean = false,
-        val ts: Long = System.currentTimeMillis()
-    )
-
     private val msgSeq = AtomicLong(0L)
     fun nextChatMsgId(): Long = System.currentTimeMillis() * 1000L + (msgSeq.incrementAndGet() % 1000L)
-
-    private val _chatMessages = MutableStateFlow<List<ChatMessage>>(
-        listOf(
-            ChatMessage(
-                id = 1L,
-                fromUser = false,
-                title = "ENA · SHADOW",
-                text = "Я — аналитический движок на публичных биржевых данных (Bybit, Binance, OKX, Coinbase, Kraken, ончейн). " +
-                    "Ордера не выставляются.\n\n" +
-                    "Нажмите быструю команду ниже (например «Прогноз 6ч» или «Прогноз 24ч» — каждый расчёт свежий) или напишите вопрос в чат."
-            )
-        )
-    )
-    val chatMessages: StateFlow<List<ChatMessage>> = _chatMessages
-
-    fun appendChatMessage(msg: ChatMessage) {
-        val next = _chatMessages.value + msg
-        _chatMessages.value = if (next.size > 80) next.takeLast(80) else next
-    }
-
-    fun updateChatMessage(id: Long, answer: String) {
-        _chatMessages.value = _chatMessages.value.map {
-            if (it.id == id) it.copy(text = answer, busy = false) else it
-        }
-    }
-
-    fun clearChatMessages() {
-        _chatMessages.value = listOf(
-            ChatMessage(
-                id = nextChatMsgId(),
-                fromUser = false,
-                title = "ENA · SHADOW",
-                text = "История чата очищена. Выберите команду или задайте вопрос по рынку."
-            )
-        )
-    }
 
     suspend fun requestFreshOutlook(horizonHours: Int): JSONObject =
         engine.computeFreshOutlook(horizonHours)
 
-    // ---------------- Изолированный свободный ИИ-чат (Google AI Studio) ----------------
+    // ---------------- Изолированный свободный ИИ-чат (Google AI Studio + OpenAI-совместимые) ----------------
     data class AiChatMessage(
         val id: Long,
         val fromUser: Boolean,
@@ -202,15 +194,18 @@ class AppState(
         val ts: Long = System.currentTimeMillis()
     )
 
+    private fun activeAiModelId(): String =
+        if (settings.aiProvider == Settings.PROVIDER_OPENAI_COMPAT) settings.aiOpenAiModel else settings.aiStudioModel
+
     private val _aiChatMessages = MutableStateFlow<List<AiChatMessage>>(
         listOf(
             AiChatMessage(
                 id = 1L,
                 fromUser = false,
-                modelId = settings.aiStudioModel,
-                text = "Это изолированный свободный ИИ-чат через Google AI Studio.\n" +
-                    "Он НЕ вмешивается в расчёты рынка, прогнозы и ботов ENA.\n\n" +
-                    "Вставьте ваш API-ключ Google AI Studio в Настройках → API и задайте любой вопрос."
+                modelId = activeAiModelId(),
+                text = "Это изолированный свободный ИИ-чат ENA (Google AI Studio + OpenAI-совместимые ключи).\n" +
+                    "Он НЕ вмешивается в расчёты рынка, Order Flow и ботов ENA.\n\n" +
+                    "Настройте ключ в Настройках → API и задавайте любые вопросы."
             )
         )
     )
@@ -222,8 +217,13 @@ class AppState(
     fun sendAiChatMessage(prompt: String) {
         val clean = prompt.trim()
         if (clean.isEmpty() || _aiChatBusy.value) return
-        val activeModel = settings.aiStudioModel
+        val provider = settings.aiProvider
+        val activeModel = activeAiModelId()
         val apiKey = settings.aiStudioApiKey
+        val openAiBaseUrl = settings.aiOpenAiBaseUrl
+        val openAiKey = settings.aiOpenAiApiKey
+        val openAiModel = settings.aiOpenAiModel
+
         val historySnapshot = _aiChatMessages.value
             .filter { !it.busy && !it.error && it.id != 1L }
             .map { AiStudioClient.ChatTurn(it.fromUser, it.text) }
@@ -241,7 +241,11 @@ class AppState(
                 apiKey = apiKey,
                 modelId = activeModel,
                 history = historySnapshot,
-                userPrompt = clean
+                userPrompt = clean,
+                provider = provider,
+                openAiBaseUrl = openAiBaseUrl,
+                openAiKey = openAiKey,
+                openAiModel = openAiModel
             )
             _aiChatMessages.value = _aiChatMessages.value.map { msg ->
                 if (msg.id == replyId) {
@@ -261,7 +265,7 @@ class AppState(
             AiChatMessage(
                 id = nextChatMsgId(),
                 fromUser = false,
-                modelId = settings.aiStudioModel,
+                modelId = activeAiModelId(),
                 text = "Диалог ИИ очищен. Подключение полностью изолировано от движка ENA."
             )
         )
@@ -282,16 +286,30 @@ class AppState(
         reloadKlines()
         refreshMarketStats()
         appScope.launch { refreshNews() }
+        appScope.launch { contractCatalog.refreshSync(force = false) }
+        appScope.launch { calendarAutoLoop() }
         appScope.launch { verifyOldForecasts() }
         appScope.launch { feedStatusLoop() }
         engine.start()
     }
 
-    /** Принудительное обновление новостей, Chain Radar, Crypto Sentinel и ботов логики. */
+    private suspend fun calendarAutoLoop() {
+        while (true) {
+            try {
+                majorCalendar.refreshIfDueSync()
+            } catch (e: Exception) {
+                Log.w("AppState", "calendarAutoLoop: ${e.message}")
+            }
+            delay(6 * 3600_000L) // проверка каждые 6ч: скачивает с сети только когда прошло 15 дней или кэш пуст
+        }
+    }
+
+    /** Принудительное обновление новостей, Chain Radar, Crypto Sentinel и календаря. */
     fun refreshRadarNow() {
         appScope.launch {
             try {
                 ensureFreshNews(maxAgeMs = 0L, force = true)
+                majorCalendar.refreshIfDueSync()
                 engine.refreshIntelligence(forceRadar = true)
             } catch (e: Exception) {
                 Log.w("AppState", "refreshRadarNow: ${e.message}")
@@ -395,12 +413,33 @@ class AppState(
             override fun onTrade(tr: BybitWs.Trade) {
                 lastBybitTradeMs.set(System.currentTimeMillis())
                 tape.add(tr)
+                orderFlow.streamHub.recordTrade(
+                    symbol = sym,
+                    price = tr.price,
+                    qty = tr.size,
+                    isAggressiveBuy = tr.side.equals("Buy", ignoreCase = true),
+                    exchangeTsMs = tr.tsMs,
+                    lagMs = tr.lagMs,
+                    venue = "Bybit"
+                )
                 _market.value = _market.value.copy(tape = tape.stats())
             }
 
             override fun onBook(bids: List<BybitWs.BookLevel>, asks: List<BybitWs.BookLevel>) {
                 lastBybitBookMs.set(System.currentTimeMillis())
+                orderFlow.streamHub.recordBookSnapshot(
+                    symbol = sym,
+                    bids = bids.map { it.price to it.qty },
+                    asks = asks.map { it.price to it.qty },
+                    synced = true,
+                    tsMs = System.currentTimeMillis(),
+                    venue = "Bybit"
+                )
                 _market.value = _market.value.copy(bids = bids.take(12), asks = asks.take(12))
+            }
+
+            override fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {
+                orderFlow.streamHub.recordDomDeltas(sym, deltas, synced, lagMs, "Bybit")
             }
 
             override fun onLiquidation(l: BybitWs.Liquidation) {
@@ -431,13 +470,14 @@ class AppState(
 
             override fun onBookDesync(reason: String) {
                 if (!engine.binanceConnected) {
+                    orderFlow.streamHub.recordDesync(sym, reason, "Bybit")
                     _market.value = _market.value.copy(
                         bids = emptyList(), asks = emptyList(),
                         wsNote = "стакан: $reason"
                     )
                 }
             }
-        }, klineInterval = iv).also { it.connect() }
+        }, klineInterval = iv, clockOffsetMsProvider = { engine.clockSync.status().offsetMs }).also { it.connect() }
     }
 
     private fun applyLiveBar(bar: BybitWs.Kline) {

@@ -7,7 +7,7 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * CrashGuard v7.1 — страховочная сетка диагностики.
+ * CrashGuard — страховочная сетка диагностики.
  *
  * Любое необработанное исключение в ЛЮБОМ потоке (в т.ч. OOM/StackOverflow в
  * корутинах движка) пишется в filesDir/enamind/crash_report.log (последние 3

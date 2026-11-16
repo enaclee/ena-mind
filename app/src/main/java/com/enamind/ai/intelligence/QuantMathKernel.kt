@@ -44,7 +44,9 @@ object QuantMathKernel {
         val efficiencyRatio: Double,// 0 .. 1 (Кауфман)
         val regressionSlopePctPerBar: Double,
         val regressionR2: Double,   // 0 .. 1
-        val zScoreLast: Double
+        val zScoreLast: Double,
+        val sufficientData: Boolean = true,
+        val note: String = ""
     )
 
     data class WalkForwardReport(
@@ -156,7 +158,19 @@ object QuantMathKernel {
      */
     fun computeMetrics(bars: List<List<Double>>): QuantTrendMetrics {
         if (bars.size < 16) {
-            return QuantTrendMetrics(0.0, 0.35, 15.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            return QuantTrendMetrics(
+                logReturnMeanPct = 0.0,
+                realizedVolPct = 0.0,
+                adx = 0.0,
+                plusDi = 0.0,
+                minusDi = 0.0,
+                efficiencyRatio = 0.0,
+                regressionSlopePctPerBar = 0.0,
+                regressionR2 = 0.0,
+                zScoreLast = 0.0,
+                sufficientData = false,
+                note = "Недостаточно свечей (${bars.size}/16)"
+            )
         }
 
         val closes = bars.map { it[4] }
@@ -177,7 +191,7 @@ object QuantMathKernel {
             val delta2 = lr - mean
             m2 += delta * delta2
         }
-        val std = if (k > 1) sqrt(max(0.0, m2 / (k - 1))) else 0.0035
+        val std = if (k > 1) sqrt(max(0.0, m2 / (k - 1))) else 0.0
         val lastLr = logRets.lastOrNull() ?: 0.0
         val zLast = if (std > 1e-9) (lastLr - mean) / std else 0.0
 
@@ -207,20 +221,25 @@ object QuantMathKernel {
         val slope = if (sxx > 1e-12) sxy / sxx else 0.0
         val r2 = if (sxx > 1e-12 && syy > 1e-12) ((sxy * sxy) / (sxx * syy)).coerceIn(0.0, 1.0) else 0.0
 
-        // 4. Уайлдеровский ADX (+DI / -DI) с периодом 14
+        // 4. Уайлдеровский ADX (+DI / -DI) с периодом 14 (без подстановочных чисел при нехватке истории)
         val period = 14
-        val (adx, pDi, mDi) = computeWilderAdx(highs, lows, closes, period)
+        val adxTriple = computeWilderAdx(highs, lows, closes, period)
+        val adx = adxTriple?.first ?: 0.0
+        val pDi = adxTriple?.second ?: 0.0
+        val mDi = adxTriple?.third ?: 0.0
 
         return QuantTrendMetrics(
             logReturnMeanPct = mean * 100.0,
-            realizedVolPct = (std * 100.0).coerceAtLeast(0.05),
+            realizedVolPct = std * 100.0,
             adx = adx,
             plusDi = pDi,
             minusDi = mDi,
             efficiencyRatio = er,
             regressionSlopePctPerBar = slope * 100.0,
             regressionR2 = r2,
-            zScoreLast = zLast
+            zScoreLast = zLast,
+            sufficientData = true,
+            note = if (adxTriple == null) "ADX: мало свечей (${bars.size}/${period * 2 + 2})" else ""
         )
     }
 
@@ -229,9 +248,9 @@ object QuantMathKernel {
         lows: List<Double>,
         closes: List<Double>,
         period: Int
-    ): Triple<Double, Double, Double> {
+    ): Triple<Double, Double, Double>? {
         val n = closes.size
-        if (n < period * 2 + 2) return Triple(18.0, 20.0, 20.0)
+        if (n < period * 2 + 2) return null
 
         val trList = DoubleArray(n - 1)
         val pdmList = DoubleArray(n - 1)
@@ -264,7 +283,7 @@ object QuantMathKernel {
             dxList.add(dx)
         }
 
-        if (dxList.isEmpty()) return Triple(18.0, 20.0, 20.0)
+        if (dxList.isEmpty()) return null
         var adx = dxList.take(min(period, dxList.size)).average()
         for (i in period until dxList.size) {
             adx = ((adx * (period - 1)) + dxList[i]) / period
@@ -404,13 +423,14 @@ object QuantMathKernel {
         var pf = ef / sT
         var pd = ed / sT
 
-        // При слабом качестве данных сжимаем к консервативному базовому прайору (0.30 / 0.40 / 0.30)
-        val q = dataQualityScore.coerceIn(0.15, 1.0)
+        // При неполном качестве данных сжимаем к равномерному распределению максимальной энтропии (1/3)
+        val q = dataQualityScore.coerceIn(0.0, 1.0)
         if (q < 0.90) {
             val alpha = q
-            pu = alpha * pu + (1.0 - alpha) * 0.30
-            pf = alpha * pf + (1.0 - alpha) * 0.40
-            pd = alpha * pd + (1.0 - alpha) * 0.30
+            val uniform = 1.0 / 3.0
+            pu = alpha * pu + (1.0 - alpha) * uniform
+            pf = alpha * pf + (1.0 - alpha) * uniform
+            pd = alpha * pd + (1.0 - alpha) * uniform
         }
 
         val norm = (pu + pf + pd).coerceAtLeast(1e-9)

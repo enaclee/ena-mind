@@ -54,6 +54,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.enamind.ai.orderflow.ChartOverlayData
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -62,7 +63,7 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * KlineChart v8.2 (Native Compose Canvas): свечной график OHLCV + объём + живая свеча.
+ * KlineChart (Native Compose Canvas): свечной график OHLCV + объём + живая свеча + Order Flow overlay.
  */
 @Composable
 fun KlineChart(
@@ -72,6 +73,7 @@ fun KlineChart(
     symbol: String = "",
     intervalLabel: String = "",
     sourceLabel: String = "",
+    orderFlowOverlay: ChartOverlayData? = null,
     modifier: Modifier = Modifier
 ) {
     val validBars = remember(bars) { validateBars(bars) }
@@ -432,6 +434,128 @@ fun KlineChart(
                             textLayoutResult = lastMeasured,
                             topLeft = Offset(plotW + 4.dp.toPx(), pillTop + 2.dp.toPx())
                         )
+
+                        // Order Flow Overlay (уровни S/R, ликвидность DOM, поглощение, атаки, неудачные пробои, события)
+                        if (orderFlowOverlay != null) {
+                            fun inVisibleRange(p: Double): Boolean = p.isFinite() && p in minP..maxP
+
+                            // Зоны повышенной ликвидности DOM
+                            orderFlowOverlay.highLiquidityZones.forEach { (zonePrice, side) ->
+                                if (inVisibleRange(zonePrice)) {
+                                    val zy = priceToY(zonePrice)
+                                    val zoneColor = if (side == "BID") bullColor else bearColor
+                                    drawRect(
+                                        color = zoneColor.copy(alpha = 0.14f),
+                                        topLeft = Offset(0f, (zy - 4.dp.toPx()).coerceAtLeast(candleTop)),
+                                        size = Size(plotW, 8.dp.toPx())
+                                    )
+                                }
+                            }
+
+                            // Зоны обнаруженного поглощения
+                            orderFlowOverlay.absorptionZones.forEach { absPrice ->
+                                if (inVisibleRange(absPrice)) {
+                                    val ay = priceToY(absPrice)
+                                    drawRect(
+                                        color = Color(0xFFF59E0B).copy(alpha = 0.20f),
+                                        topLeft = Offset(0f, (ay - 6.dp.toPx()).coerceAtLeast(candleTop)),
+                                        size = Size(plotW, 12.dp.toPx())
+                                    )
+                                    drawLine(
+                                        color = Color(0xFFF59E0B).copy(alpha = 0.85f),
+                                        start = Offset(0f, ay),
+                                        end = Offset(plotW, ay),
+                                        strokeWidth = 1.1.dp.toPx(),
+                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 4f), 0f)
+                                    )
+                                }
+                            }
+
+                            // Уровни поддержки
+                            orderFlowOverlay.supportLevels.forEach { sup ->
+                                if (inVisibleRange(sup)) {
+                                    val sy = priceToY(sup)
+                                    drawLine(
+                                        color = bullColor.copy(alpha = 0.72f),
+                                        start = Offset(0f, sy),
+                                        end = Offset(plotW, sy),
+                                        strokeWidth = 1.2.dp.toPx(),
+                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 6f), 0f)
+                                    )
+                                }
+                            }
+
+                            // Уровни сопротивления
+                            orderFlowOverlay.resistanceLevels.forEach { res ->
+                                if (inVisibleRange(res)) {
+                                    val ry = priceToY(res)
+                                    drawLine(
+                                        color = bearColor.copy(alpha = 0.72f),
+                                        start = Offset(0f, ry),
+                                        end = Offset(plotW, ry),
+                                        strokeWidth = 1.2.dp.toPx(),
+                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 6f), 0f)
+                                    )
+                                }
+                            }
+
+                            // Маркеры повторных атак
+                            orderFlowOverlay.attackMarkerPrices.forEachIndexed { idx, atkPrice ->
+                                if (inVisibleRange(atkPrice)) {
+                                    val ay = priceToY(atkPrice)
+                                    val mx = (plotW - 14.dp.toPx() - idx * 10.dp.toPx()).coerceAtLeast(8.dp.toPx())
+                                    drawCircle(
+                                        color = Color(0xFFF59E0B),
+                                        radius = 4.dp.toPx(),
+                                        center = Offset(mx, ay)
+                                    )
+                                }
+                            }
+
+                            // Места неудачных пробоев
+                            orderFlowOverlay.failedBreakoutPrices.forEachIndexed { idx, failPrice ->
+                                if (inVisibleRange(failPrice)) {
+                                    val fy = priceToY(failPrice)
+                                    val mx = (plotW - 20.dp.toPx() - idx * 12.dp.toPx()).coerceAtLeast(10.dp.toPx())
+                                    val r = 4.dp.toPx()
+                                    drawLine(
+                                        color = Color(0xFFFF6D00),
+                                        start = Offset(mx - r, fy - r),
+                                        end = Offset(mx + r, fy + r),
+                                        strokeWidth = 1.8.dp.toPx()
+                                    )
+                                    drawLine(
+                                        color = Color(0xFFFF6D00),
+                                        start = Offset(mx - r, fy + r),
+                                        end = Offset(mx + r, fy - r),
+                                        strokeWidth = 1.8.dp.toPx()
+                                    )
+                                }
+                            }
+
+                            // Отметки подтверждённых событий на оси времени видимых свечей
+                            val firstVisTs = visible.first()[0].toLong()
+                            val lastVisTs = visible.last()[0].toLong()
+                            orderFlowOverlay.confirmedEventMarkers.forEach { (evTs, evKind) ->
+                                if (evTs in firstVisTs..lastVisTs) {
+                                    val barIdx = visible.indexOfLast { it[0].toLong() <= evTs }.coerceIn(0, visible.lastIndex)
+                                    val ex = (barIdx + 0.5f) * slotW
+                                    val evColor = if (evKind == "BREAKOUT") bullColor else Color(0xFFA855F7)
+                                    drawLine(
+                                        color = evColor.copy(alpha = 0.78f),
+                                        start = Offset(ex, candleTop),
+                                        end = Offset(ex, candleBottom),
+                                        strokeWidth = 1.3.dp.toPx(),
+                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(5f, 4f), 0f)
+                                    )
+                                    drawCircle(
+                                        color = evColor,
+                                        radius = 4.dp.toPx(),
+                                        center = Offset(ex, candleTop + 6.dp.toPx())
+                                    )
+                                }
+                            }
+                        }
 
                         // Перекрестие при выборе свечи тапом
                         val activeIdx = inspectedIdx

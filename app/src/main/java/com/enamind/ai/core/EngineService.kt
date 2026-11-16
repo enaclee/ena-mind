@@ -14,19 +14,11 @@ import androidx.core.app.NotificationCompat
 import com.enamind.ai.MainActivity
 
 /**
- * EngineService v7.1 — foreground-сервис «фонового накопителя» NEURAL ENGINE.
+ * Foreground-сервис фонового анализатора ENA.
  *
- * Зачем: движок v7.0 жил только пока процесс приложения жив — сворачивание
- * приложения убивало конвейер, 15-минутные прогнозы не копились, память v7 не
- * росла. Сервис держит процесс живым (Android не убивает процессы с активным
- * foreground-сервисом) — конвейер, автопроверка прогнозов и запись памяти
- * продолжаются в фоне. Режим SHADOW: ордеров нет, только чтение публичных данных.
- *
- * Честные ограничения (пишем в уведомлении и настройках):
- * - Doze может растягивать интервалы циклов (5с -> до минут) — на точность
- *   15-минутных прогнозов не влияет, на плотность сессий влияет;
- * - MIUI требует «нет ограничений батареи» для фоновой работы (подсказка в настройках);
- * - сервис не держит WakeLock — экономия батареи важнее плотности тиков.
+ * Поддерживает непрерывную сборку рыночных потоков Order Flow, проверку
+ * исторических событий (1с/5с/15с/30с), 6ч/24ч контур и 15-дневный календарь.
+ * Без WakeLock — экономия батареи важнее максимальной частоты циклов.
  */
 class EngineService : Service() {
 
@@ -79,8 +71,8 @@ class EngineService : Service() {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_compass)
-            .setContentTitle("ENA · движок работает")
-            .setContentText("SHADOW: real-time упреждение · 6ч/24ч контур · аудит")
+            .setContentTitle("ENA · анализ активен")
+            .setContentText("Order Flow & Absorption · 6ч/24ч аналитика")
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(open)

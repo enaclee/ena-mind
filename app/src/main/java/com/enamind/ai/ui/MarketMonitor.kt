@@ -21,6 +21,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
@@ -32,6 +33,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -49,8 +53,8 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * РЫНОК v9.0 — современный экран мониторинга:
- * карточки выбора пары (10 активов) и таймфрейма, сводка цены, живой график OHLCV,
+ * РЫНОК — экран мониторинга:
+ * карточки выбора любых контрактов биржи + избранного и таймфрейма, сводка цены, живой график OHLCV,
  * карточки тренда и прогнозов 6ч + 24ч, мульти-биржевая паутина, Order Flow + стакан, новости.
  */
 @Composable
@@ -107,6 +111,22 @@ fun MarketMonitor(state: AppState) {
 
 @Composable
 private fun SymbolAndIntervalSelector(state: AppState, market: AppState.MarketUi) {
+    val favorites by state.favoriteSymbols.collectAsState()
+    var showPicker by remember { mutableStateOf(false) }
+
+    val quickList = remember(favorites, market.symbol) {
+        (listOf(market.symbol) + favorites.toList() + Settings.SYMBOLS).distinct()
+    }
+
+    if (showPicker) {
+        ContractPickerDialog(
+            state = state,
+            currentSymbol = market.symbol,
+            onSelect = { state.changeSymbol(it) },
+            onDismiss = { showPicker = false }
+        )
+    }
+
     val chipColors = FilterChipDefaults.filterChipColors(
         selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
         selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
@@ -119,7 +139,28 @@ private fun SymbolAndIntervalSelector(state: AppState, market: AppState.MarketUi
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Settings.SYMBOLS.forEach { sym ->
+            FilterChip(
+                selected = false,
+                onClick = { showPicker = true },
+                modifier = Modifier.testTag("market_all_contracts_button"),
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Outlined.Search,
+                        contentDescription = "Выбрать любой контракт",
+                        modifier = Modifier.size(16.dp)
+                    )
+                },
+                label = {
+                    Text(
+                        "Все пары",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                },
+                colors = chipColors
+            )
+            quickList.forEach { sym ->
                 key(sym) {
                     FilterChip(
                         selected = market.symbol == sym,

@@ -4,22 +4,19 @@ import android.content.Context
 import android.content.SharedPreferences
 
 /**
- * Настройки ENA v9.0. Секреты (API-ключи Bybit / NewsAPI / Google AI Studio) хранятся
- * ТОЛЬКО здесь, в приватном хранилище приложения, зашифрованными через Android Keystore,
- * и НИКОГДА не попадают в экспортируемые ZIP.
- *
- * Изолированный ИИ-чат Google AI Studio использует свой ключ и модель и никак не
- * вмешивается в квантовый движок и прогнозы рынка ENA.
+ * Настройки ENA. Секреты (ключи API / универсальные AI-ключи) хранятся
+ * ТОЛЬКО здесь, в приватном хранилище приложения, зашифрованными через Keystore,
+ * и НИКОГДА не попадают в экспортируемые файлы или открытые логи.
  */
 class Settings(ctx: Context) {
     private val sp: SharedPreferences =
         ctx.getSharedPreferences("enamind", Context.MODE_PRIVATE)
 
-    /** Секрет: на диске "enc:<base64>" (Keystore AES/GCM); legacy-значения читаются как есть. */
     private fun getSecret(key: String): String {
         val v = sp.getString(key, "") ?: ""
         return if (v.startsWith("enc:")) CryptoBox.decrypt(v.removePrefix("enc:")) else v
     }
+
     private fun setSecret(key: String, value: String) {
         sp.edit().putString(key, if (value.isBlank()) "" else "enc:" + CryptoBox.encrypt(value)).apply()
     }
@@ -36,10 +33,6 @@ class Settings(ctx: Context) {
         get() = sp.getString("bybit_base_url", DEFAULT_BYBIT_URL) ?: DEFAULT_BYBIT_URL
         set(v) = sp.edit().putString("bybit_base_url", v).apply()
 
-    // ---------------- приватные API Bybit (трейд-панель, ключи пользователя) ----------------
-
-    /** Ключи Bybit пользователя — ТОЛЬКО на устройстве (зашифрованы в Keystore),
-     *  только на api.bybit.com, в экспортируемые ZIP не попадают никогда. */
     var bybitApiKey: String
         get() = getSecret("bybit_api_key")
         set(v) = setSecret("bybit_api_key", v)
@@ -48,43 +41,79 @@ class Settings(ctx: Context) {
         get() = getSecret("bybit_api_secret")
         set(v) = setSecret("bybit_api_secret", v)
 
-    // ---------------- Google AI Studio (изолированный свободный ИИ-чат) ----------------
+    // ---------------- Универсальный AI-чат (Google AI Studio + OpenAI-совместимые) ----------------
 
-    /** Ключ Google AI Studio пользователя — зашифрован Keystore, в ZIP не попадает. */
+    /** Выбранный провайдер: PROVIDER_GEMINI | PROVIDER_OPENAI_COMPAT. */
+    var aiProvider: String
+        get() = sp.getString("ai_provider", PROVIDER_GEMINI) ?: PROVIDER_GEMINI
+        set(v) = sp.edit().putString(
+            "ai_provider",
+            if (v == PROVIDER_OPENAI_COMPAT) PROVIDER_OPENAI_COMPAT else PROVIDER_GEMINI
+        ).apply()
+
+    /** Ключ Google AI Studio (зашифрован Keystore). */
     var aiStudioApiKey: String
         get() = getSecret("ai_studio_api_key")
         set(v) = setSecret("ai_studio_api_key", v)
 
-    /** Выбранная бесплатная или пользовательская модель AI Studio. */
+    /** Активная модель Google AI Studio; старые отключённые версии мигрируют на gemini-3.5-flash-lite. */
     var aiStudioModel: String
-        get() = sp.getString("ai_studio_model", DEFAULT_AI_MODEL) ?: DEFAULT_AI_MODEL
-        set(v) = sp.edit().putString("ai_studio_model", v.trim().ifBlank { DEFAULT_AI_MODEL }).apply()
+        get() {
+            val raw = (sp.getString("ai_studio_model", DEFAULT_AI_MODEL) ?: DEFAULT_AI_MODEL).trim()
+            return if (raw.isBlank() || isDeprecatedGeminiModel(raw)) DEFAULT_AI_MODEL else raw
+        }
+        set(v) {
+            val clean = v.trim()
+            val resolved = if (clean.isBlank() || isDeprecatedGeminiModel(clean)) DEFAULT_AI_MODEL else clean
+            sp.edit().putString("ai_studio_model", resolved).apply()
+        }
+
+    /** Универсальный OpenAI-совместимый endpoint (напр., OpenAI, OpenRouter, Groq, DeepSeek, Together). */
+    var aiOpenAiBaseUrl: String
+        get() = sp.getString("ai_openai_base_url", DEFAULT_OPENAI_BASE_URL) ?: DEFAULT_OPENAI_BASE_URL
+        set(v) = sp.edit().putString("ai_openai_base_url", v.trim().ifBlank { DEFAULT_OPENAI_BASE_URL }).apply()
+
+    /** Ключ OpenAI-совместимого API (зашифрован Keystore). */
+    var aiOpenAiApiKey: String
+        get() = getSecret("ai_openai_api_key")
+        set(v) = setSecret("ai_openai_api_key", v)
+
+    /** ID модели для OpenAI-совместимого API. */
+    var aiOpenAiModel: String
+        get() = sp.getString("ai_openai_model", DEFAULT_OPENAI_MODEL) ?: DEFAULT_OPENAI_MODEL
+        set(v) = sp.edit().putString("ai_openai_model", v.trim().ifBlank { DEFAULT_OPENAI_MODEL }).apply()
 
     var symbol: String
         get() = sp.getString("symbol", "BTCUSDT") ?: "BTCUSDT"
-        set(v) = sp.edit().putString("symbol", v).apply()
+        set(v) = sp.edit().putString("symbol", v.trim().uppercase()).apply()
 
     var interval: String
         get() = sp.getString("interval", "60") ?: "60"
         set(v) = sp.edit().putString("interval", v).apply()
 
-    /**
-     * v7.1: фоновое накопление памяти движка. true — при работе приложения держится
-     * foreground-сервис (уведомление), конвейер и запись памяти продолжаются, когда
-     * приложение свёрнуто; false — движок живёт только пока приложение на экране.
-     * v8.1 (ТЗ §3): по умолчанию FALSE — фоновый режим включается только явным
-     * решением пользователя на онбординге/в настройках, а не молчаливым стартом.
-     */
+    /** Избранные контракты пользователя. */
+    var favoriteSymbols: Set<String>
+        get() = sp.getStringSet("favorite_symbols", null)?.map { it.uppercase() }?.toSet()
+            ?: setOf("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
+        set(v) = sp.edit().putStringSet("favorite_symbols", v.map { it.uppercase() }.toSet()).apply()
+
+    /** Время последней успешной синхронизации Календаря событий (15-дневная автоматизация). */
+    var calendarLastSyncMs: Long
+        get() = sp.getLong("calendar_last_sync_ms", 0L)
+        set(v) = sp.edit().putLong("calendar_last_sync_ms", v).apply()
+
+    var calendarLastError: String
+        get() = sp.getString("calendar_last_error", "") ?: ""
+        set(v) = sp.edit().putString("calendar_last_error", v).apply()
+
     var bgEngine: Boolean
         get() = sp.getBoolean("bg_engine", false)
         set(v) = sp.edit().putBoolean("bg_engine", v).apply()
 
-    /** v8.1 (ТЗ §3): алерты включаются пользователем; отказ не ломает анализ. */
     var alertsEnabled: Boolean
         get() = sp.getBoolean("alerts_enabled", false)
         set(v) = sp.edit().putBoolean("alerts_enabled", v).apply()
 
-    /** v8.1: онбординг пройден (показываем один раз, не при каждом запуске). */
     var onboardingDone: Boolean
         get() = sp.getBoolean("onboarding_done", false)
         set(v) = sp.edit().putBoolean("onboarding_done", v).apply()
@@ -93,8 +122,12 @@ class Settings(ctx: Context) {
 
     companion object {
         const val DEFAULT_BYBIT_URL = "https://api.bybit.com"
-        const val DEFAULT_AI_MODEL = "gemini-2.5-flash-lite"
-        /** v9.0+: расширенный watchlist из 10 ликвидных активов. */
+        const val DEFAULT_AI_MODEL = "gemini-3.5-flash-lite"
+        const val PROVIDER_GEMINI = "gemini"
+        const val PROVIDER_OPENAI_COMPAT = "openai_compat"
+        const val DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+        const val DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
         val SYMBOLS = listOf(
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
             "SUIUSDT", "AVAXUSDT", "DOGEUSDT", "OPUSDT", "LINKUSDT"
@@ -103,5 +136,13 @@ class Settings(ctx: Context) {
             "1" to "1м", "5" to "5м", "15" to "15м", "30" to "30м",
             "60" to "1ч", "240" to "4ч", "D" to "1Д"
         )
+
+        fun isDeprecatedGeminiModel(modelId: String): Boolean {
+            val m = modelId.trim().lowercase()
+            return m.startsWith("gemini-1.") ||
+                m.startsWith("gemini-2.0") ||
+                m.startsWith("gemini-2.5") ||
+                m == "gemini-pro"
+        }
     }
 }

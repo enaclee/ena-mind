@@ -10,34 +10,27 @@ import kotlin.math.sqrt
 import kotlin.math.tanh
 
 /**
- * RealTimeLeadEngine (ТЗ п.7) — высокочастотный упреждающий предиктор будущего движения
- * на ближайшие 5–15 минут в реальном времени с минимальной задержкой.
- *
- * НЕ использует ИИ-чат и не смешивается с LLM. Опирается строго на реальную микроструктуру:
- *  - живую ленту сделок (deltaPct, CVD-дивергенция),
- *  - глубину стакана (Bybit + Binance orderbook imbalance),
- *  - мультибиржевую скорость потока (Binance aggTrades/sec, агрессивные покупки, Coinbase/Kraken спред),
- *  - микро-импульс минутных свечей (Z-score & EMA),
- *  - каскады ликвидаций, экстремумы фандинга и вектор 6ч-ядра,
- *  - самообучающиеся EMA-веса из RealtimePulseVault.
+ * Оценка живой микроструктуры потока по реальным данным (без краткосрочных предсказаний и без
+ * искусственного принуждения направления при отсутствии данных).
  */
 object RealTimeLeadEngine {
 
     data class RealTimeTrendPulse(
         val symbol: String = "BTCUSDT",
         val tsMs: Long = System.currentTimeMillis(),
-        val direction: String = "LONG", // "LONG" | "SHORT"
-        val score: Double = 0.0,        // -1.0 .. +1.0
-        val confidence: Double = 0.5,   // 0.0 .. 1.0
+        val direction: String = "NO_DATA", // "LONG" | "SHORT" | "NEUTRAL" | "NO_DATA"
+        val score: Double = 0.0,           // -1.0 .. +1.0
+        val confidence: Double = 0.0,      // 0.0 .. 1.0
         val strongTrigger: Boolean = false,
         val triggerReason: String = "",
-        val leadWindowLabel: String = "5–15м (реал-тайм)",
-        val factorsSummary: String = "Инициализация живых потоков…",
+        val leadWindowLabel: String = "микроструктура (реал-тайм)",
+        val factorsSummary: String = "Ожидание живых рыночных данных…",
         val factorVotes: Map<String, String> = emptyMap(),
         val accuracyPct: Double? = null,
         val recentAccuracyPct: Double? = null,
         val verifiedCount: Int = 0,
-        val price: Double? = null
+        val price: Double? = null,
+        val sufficientData: Boolean = false
     )
 
     fun evaluate(
@@ -75,13 +68,13 @@ object RealTimeLeadEngine {
             if (!label.isNullOrBlank()) reasons += label
         }
 
-        // 1. Живая лента сделок (Bybit / fallback WS)
+        // 1. Живая лента сделок
         market.tape?.takeIf { it.n >= 5 && it.deltaPct.isFinite() }?.let { t ->
             val s = tanh(t.deltaPct / 28.0)
             val lbl = String.format(Locale.US, "Лента %+.1f%%", t.deltaPct)
             addFactor("tape_delta", s, 1.25, lbl)
             if (t.n >= 20 && abs(t.deltaPct) >= 35.0) {
-                triggers += String.format(Locale.US, "Резкий перекос ленты %+.0f%%", t.deltaPct)
+                triggers += String.format(Locale.US, "Перекос ленты %+.0f%%", t.deltaPct)
             }
         }
 
@@ -103,7 +96,7 @@ object RealTimeLeadEngine {
             addFactor("book_imbalance", tanh(avgImb * 2.2), 1.0, lbl)
         }
 
-        // 3. Мультибиржевая скорость потока, агрессивные покупки и киты (MultiVenueDataBridge)
+        // 3. Мультибиржевая скорость потока
         var maxSpreadBps = 0.0
         venueSnap?.let { vs ->
             val vel = vs.binanceTradeVelocityPerSec
@@ -115,17 +108,17 @@ object RealTimeLeadEngine {
                 val lbl = String.format(Locale.US, "Binance %.1f сд/с · пок %.0f%%", vel, buyPct)
                 addFactor("venue_velocity", s, 1.3, lbl)
                 if (vel >= 25.0 && abs(buyPct - 50.0) >= 16.0) {
-                    triggers += String.format(Locale.US, "Всплеск потока Binance %.0f сд/с", vel)
+                    triggers += String.format(Locale.US, "Всплеск потока %.0f сд/с", vel)
                 }
             }
-            if (vs.binanceWhaleSpikeUsd >= 90_000.0) {
-                val whaleDir = if ((vs.binanceAggressiveBuyPct ?: 50.0) >= 50.0) 1.0 else -1.0
-                addFactor("whale_spike", whaleDir * 0.85, 1.1, "Кит Binance $${TrendReasoningEngine.compactUsd(vs.binanceWhaleSpikeUsd)}")
-                triggers += "Крупная сделка кита $${TrendReasoningEngine.compactUsd(vs.binanceWhaleSpikeUsd)}"
+            if (vs.binanceWhaleSpikeUsd >= 90_000.0 && buyPct != null) {
+                val whaleDir = if (buyPct >= 50.0) 1.0 else -1.0
+                addFactor("whale_spike", whaleDir * 0.85, 1.1, "Крупная сделка $${TrendReasoningEngine.compactUsd(vs.binanceWhaleSpikeUsd)}")
+                triggers += "Крупная сделка $${TrendReasoningEngine.compactUsd(vs.binanceWhaleSpikeUsd)}"
             }
         }
 
-        // 4. Межбиржевой спред/опережение (Bybit / Binance / OKX / Coinbase / Kraken)
+        // 4. Межбиржевое расхождение цены
         val livePx = market.price?.takeIf { it.isFinite() && it > 0.0 }
         val venuePrices = LinkedHashMap<String, Double>()
         if (livePx != null) venuePrices["Bybit"] = livePx
@@ -145,7 +138,7 @@ object RealTimeLeadEngine {
             }
         }
 
-        // 5. Микро-импульс 1m свечей + Z-score пробой
+        // 5. Импульс реальных 1m свечей
         if (bars1m.size >= 15) {
             val window = bars1m.takeLast(20)
             val closes = window.mapNotNull { it.getOrNull(4)?.takeIf { v -> v.isFinite() && v > 0.0 } }
@@ -156,7 +149,7 @@ object RealTimeLeadEngine {
                 }
                 val lastRet = rets.last()
                 val mean = rets.average()
-                val sd = sqrt(rets.sumOf { (it - mean).pow(2) } / max(1, rets.size - 1)).coerceAtLeast(0.025)
+                val sd = sqrt(rets.sumOf { (it - mean).pow(2) } / max(1, rets.size - 1)).coerceAtLeast(1e-5)
                 val z = (lastRet - mean) / sd
                 val microDrift = 100.0 * (closes.last() - closes[closes.size - 5]) / closes[closes.size - 5]
                 val s = tanh(0.55 * z / 2.0 + 0.45 * microDrift / 0.25)
@@ -168,7 +161,7 @@ object RealTimeLeadEngine {
             }
         }
 
-        // 6. Ликвидации и сквиз-давление фандинга
+        // 6. Ликвидации и фандинг
         val liq1h = market.liq1hUsd ?: 0.0
         if (liq1h.isFinite() && liq1h >= 200_000.0) {
             triggers += "Ликвидации $${TrendReasoningEngine.compactUsd(liq1h)} (1ч)"
@@ -180,10 +173,10 @@ object RealTimeLeadEngine {
             }
         }
 
-        // 7. Контекст основного движка + Sentinel
+        // 7. Контекст основного анализа + Sentinel
         intel?.let { rep ->
             val engineEdge = (rep.trendLogic.pUp - rep.trendLogic.pDown).coerceIn(-1.0, 1.0)
-            if (engineEdge.isFinite()) {
+            if (engineEdge.isFinite() && abs(engineEdge) > 0.02) {
                 addFactor("engine_bias", tanh(engineEdge * 2.2), 0.90, "Ядро ENA ${rep.trendLogic.biasLabel}")
             }
             if (rep.sentinelEvents.any { it.severity == SentinelSeverity.CRITICAL }) {
@@ -192,19 +185,38 @@ object RealTimeLeadEngine {
             }
         }
 
-        val rawScore = if (totalWeight > 0.0) (weightedScore / totalWeight).coerceIn(-1.0, 1.0) else 0.0
+        val hasData = totalWeight > 0.0 && reasons.isNotEmpty() && livePx != null
+        if (!hasData) {
+            return RealTimeTrendPulse(
+                symbol = symbol,
+                tsMs = nowMs,
+                direction = "NO_DATA",
+                score = 0.0,
+                confidence = 0.0,
+                strongTrigger = false,
+                triggerReason = "",
+                leadWindowLabel = "микроструктура (нет данных)",
+                factorsSummary = "Недостаточно живых рыночных данных по $symbol",
+                factorVotes = votes,
+                accuracyPct = vaultSnap.accuracyPct?.takeIf { it.isFinite() },
+                recentAccuracyPct = vaultSnap.recentAccuracyPct?.takeIf { it.isFinite() },
+                verifiedCount = vaultSnap.verifiedCount,
+                price = livePx,
+                sufficientData = false
+            )
+        }
+
+        val rawScore = (weightedScore / totalWeight).coerceIn(-1.0, 1.0)
         val cleanScore = if (rawScore.isFinite()) rawScore else 0.0
-        // Упреждающий индикатор всегда показывает активный вектор (LONG или SHORT)
-        val direction = if (cleanScore >= 0.0) "LONG" else "SHORT"
-        val confidence = (0.50 + abs(cleanScore) * 0.45).coerceIn(0.50, 0.95)
+        val direction = when {
+            reasons.size >= 2 && cleanScore >= 0.14 -> "LONG"
+            reasons.size >= 2 && cleanScore <= -0.14 -> "SHORT"
+            else -> "NEUTRAL"
+        }
+        val coverage = (reasons.size / 4.0).coerceIn(0.25, 1.0)
+        val confidence = (abs(cleanScore) * coverage).coerceIn(0.0, 1.0)
         val strongTrigger = triggers.isNotEmpty()
         val triggerText = if (strongTrigger) triggers.first() else ""
-
-        val summaryText = if (reasons.isEmpty()) {
-            "Синхронизация WS-потоков $symbol…"
-        } else {
-            reasons.take(4).joinToString(" · ")
-        }
 
         return RealTimeTrendPulse(
             symbol = symbol,
@@ -214,13 +226,14 @@ object RealTimeLeadEngine {
             confidence = confidence,
             strongTrigger = strongTrigger,
             triggerReason = triggerText,
-            leadWindowLabel = "5–15м (реал-тайм)",
-            factorsSummary = summaryText,
+            leadWindowLabel = "микроструктура (реал-тайм)",
+            factorsSummary = reasons.take(4).joinToString(" · "),
             factorVotes = votes,
             accuracyPct = vaultSnap.accuracyPct?.takeIf { it.isFinite() },
             recentAccuracyPct = vaultSnap.recentAccuracyPct?.takeIf { it.isFinite() },
             verifiedCount = vaultSnap.verifiedCount,
-            price = livePx
+            price = livePx,
+            sufficientData = true
         )
     }
 }
