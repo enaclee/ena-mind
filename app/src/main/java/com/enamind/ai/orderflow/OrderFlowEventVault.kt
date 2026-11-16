@@ -8,18 +8,17 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import kotlin.math.abs
 
 /**
- * Историческая память и обучение Order Flow (ТЗ п.7).
+ * Историческая память и обучение Order Flow.
  *
  * Правила:
- *  - Каждое обнаруженное событие сохраняется в отдельной папке `order_flow_events/events.jsonl`;
+ *  - Каждое обнаруженное событие сохраняется в `order_flow_events/events.jsonl`;
  *  - Фактическая реакция цены проверяется СТРОГО вперёд во времени через 1с, 5с, 15с, 30с
- *    и горизонт таймфрейма без какого-либо заглядывания в будущее (zero look-ahead bias);
- *  - Статистика (как часто поглощение приводило к развороту vs пробою, информативные признаки,
- *    условия ошибок модели, лучшие комбинации признаков) считается только по уже проверенным событиям;
- *  - Полный экспорт JSON и CSV для кнопки «Скачать историю» в Настройках → Память.
+ *    и расширенный горизонт таймфрейма (priceTf / reactionTfPct) без заглядывания в будущее;
+ *  - Порог FLAT ~0.22% (с учётом комиссий) применяется ТОЛЬКО к расширенным ТФ-горизонтам (3m/5m/15m+),
+ *    тогда как на минутном / 30s-окне сохраняется чувствительный порог 0.045%, чтобы не обнулить
+ *    калибровку на минутном шуме.
  */
 class OrderFlowEventVault(
     private val primaryDir: File,
@@ -84,8 +83,6 @@ class OrderFlowEventVault(
 
     private val lock = Any()
     private val events = ArrayList<RecordedEvent>()
-    private var lastRecordedKeyMs = 0L
-    private var lastRecordedType = ""
 
     fun ensureInitialized() {
         synchronized(lock) {
@@ -112,15 +109,12 @@ class OrderFlowEventVault(
 
         val now = report.computedAtMs
         synchronized(lock) {
-            // Дедупликация однотипных событий чаще 20 секунд на одной цене
             val last = events.lastOrNull()
             if (last != null && last.symbol == report.symbol && last.eventType == evType &&
                 (now - last.detectedAtMs) < 20_000L
             ) {
                 return
             }
-            lastRecordedKeyMs = now
-            lastRecordedType = evType
 
             val rec = RecordedEvent(
                 id = "${report.symbol}_${now}_${evType}",
@@ -154,33 +148,59 @@ class OrderFlowEventVault(
     }
 
     /**
-     * Строго forward-only проверка исходов через 1с, 5с, 15с, 30с (и далее) по реально пришедшим тикам.
+     * Строго forward-only проверка исходов через 1с, 5с, 15с, 30с и горизонт ТФ (priceTf / reactionTfPct).
+     *  - На 30s-горизонте (и для ТФ "1") используется порог 0.045%.
+     *  - На расширенном ТФ-горизонте (3m/5m/15m+ -> horizonMs >= 180_000L), как только наступает horizonMs,
+     *    итог пересчитывается по reactionTfPct с fee-aware порогом FLAT = 0.22%.
      */
     fun verifyForwardOutcomes(
         symbol: String,
         futureTicks: List<OrderFlowStreamHub.RawTradeTick>,
-        nowMs: Long
+        nowMs: Long,
+        bars: List<List<Double>> = emptyList()
     ) {
-        if (futureTicks.isEmpty()) return
+        if (futureTicks.isEmpty() && bars.isEmpty()) return
         synchronized(lock) {
             var changed = false
             for (idx in events.indices) {
                 val ev = events[idx]
-                if (ev.symbol != symbol || ev.verifiedOutcome != "PENDING") continue
+                if (ev.symbol != symbol) continue
+
+                val horizonMs = intervalToHorizonMs(ev.interval)
+                val isExtendedTf = horizonMs >= 180_000L
+                val tfComplete = ev.priceTf != null
+                if (ev.verifiedOutcome != "PENDING" && (!isExtendedTf || tfComplete)) continue
 
                 val after = futureTicks.filter { it.exchangeTsMs > ev.detectedAtMs }
-                if (after.isEmpty() && (nowMs - ev.detectedAtMs) < 35_000L) continue
+                if (after.isEmpty() && bars.isEmpty() && (nowMs - ev.detectedAtMs) < 35_000L) continue
 
                 fun tickAtOffset(offsetMs: Long): Double? {
                     val targetTs = ev.detectedAtMs + offsetMs
                     val exact = after.firstOrNull { it.exchangeTsMs >= targetTs }
-                    return exact?.price ?: if (nowMs >= targetTs + 5_000L) after.lastOrNull()?.price else null
+                    if (exact != null) return exact.price
+                    return if (after.isNotEmpty() && nowMs >= targetTs + 5_000L) after.last().price else null
+                }
+
+                fun priceAtTfHorizon(): Double? {
+                    val targetTs = ev.detectedAtMs + horizonMs
+                    val fromTicks = after.firstOrNull { it.exchangeTsMs >= targetTs }?.price
+                    if (fromTicks != null) return fromTicks
+                    if (bars.isNotEmpty() && nowMs >= targetTs) {
+                        val bar = bars.firstOrNull { (it.getOrNull(0)?.toLong() ?: 0L) >= targetTs }
+                        val close = bar?.getOrNull(4)?.takeIf { it.isFinite() && it > 0.0 }
+                        if (close != null) return close
+                        if (nowMs >= targetTs + 15_000L) {
+                            return after.lastOrNull()?.price ?: bars.lastOrNull()?.getOrNull(4)?.takeIf { it.isFinite() && it > 0.0 }
+                        }
+                    }
+                    return null
                 }
 
                 val p1 = ev.price1s ?: tickAtOffset(1_000L)
                 val p5 = ev.price5s ?: tickAtOffset(5_000L)
                 val p15 = ev.price15s ?: tickAtOffset(15_000L)
                 val p30 = ev.price30s ?: tickAtOffset(30_000L)
+                val pTf = ev.priceTf ?: if (isExtendedTf) priceAtTfHorizon() else null
 
                 fun pct(p: Double?): Double? = p?.let { 100.0 * (it - ev.entryPrice) / ev.entryPrice }
 
@@ -188,31 +208,30 @@ class OrderFlowEventVault(
                 val r5 = pct(p5)
                 val r15 = pct(p15)
                 val r30 = pct(p30)
+                val rTf = pct(pTf)
 
-                val horizonDone = r30 != null || (nowMs - ev.detectedAtMs) >= 45_000L
-                val finalOutcome = if (horizonDone && r30 != null) {
-                    val threshold = 0.04 // мин. значимое отклонение 0.04%
-                    when {
-                        ev.isResistance && r30 <= -threshold -> "REVERSAL"
-                        ev.isResistance && r30 >= threshold -> "BREAKOUT"
-                        !ev.isResistance && r30 >= threshold -> "REVERSAL"
-                        !ev.isResistance && r30 <= -threshold -> "BREAKOUT"
-                        else -> "FLAT"
-                    }
-                } else {
-                    "PENDING"
+                val isResistanceOutcome = resolveIsResistance(ev)
+
+                val finalOutcome = when {
+                    isExtendedTf && rTf != null -> classifyOutcome(isResistanceOutcome, rTf, EXTENDED_TF_FLAT_THRESHOLD_PCT)
+                    r30 != null -> classifyOutcome(isResistanceOutcome, r30, SHORT_WINDOW_FLAT_THRESHOLD_PCT)
+                    else -> ev.verifiedOutcome
                 }
 
-                if (p1 != ev.price1s || p5 != ev.price5s || p15 != ev.price15s || p30 != ev.price30s || finalOutcome != ev.verifiedOutcome) {
+                if (p1 != ev.price1s || p5 != ev.price5s || p15 != ev.price15s ||
+                    p30 != ev.price30s || pTf != ev.priceTf || finalOutcome != ev.verifiedOutcome
+                ) {
                     events[idx] = ev.copy(
                         price1s = p1,
                         price5s = p5,
                         price15s = p15,
                         price30s = p30,
+                        priceTf = pTf,
                         reaction1sPct = r1,
                         reaction5sPct = r5,
                         reaction15sPct = r15,
                         reaction30sPct = r30,
+                        reactionTfPct = rTf,
                         verifiedOutcome = finalOutcome
                     )
                     changed = true
@@ -220,6 +239,20 @@ class OrderFlowEventVault(
             }
             if (changed) persistLocked()
         }
+    }
+
+    private fun resolveIsResistance(ev: RecordedEvent): Boolean = when (ev.eventType) {
+        "SELLER_ABSORPTION" -> true
+        "BUYER_ABSORPTION" -> false
+        else -> ev.isResistance
+    }
+
+    private fun classifyOutcome(isResistance: Boolean, reactionPct: Double, thresholdPct: Double): String = when {
+        isResistance && reactionPct <= -thresholdPct -> "REVERSAL"
+        isResistance && reactionPct >= thresholdPct -> "BREAKOUT"
+        !isResistance && reactionPct >= thresholdPct -> "REVERSAL"
+        !isResistance && reactionPct <= -thresholdPct -> "BREAKOUT"
+        else -> "FLAT"
     }
 
     fun computeStats(symbolFilter: String? = null): EmpiricalStats {
@@ -276,7 +309,7 @@ class OrderFlowEventVault(
     }
 
     /**
-     * Экспорт полной истории Order Flow + 1с/5с/15с/30с + статистики разворотов для кнопки «Скачать историю».
+     * Экспорт полной истории Order Flow + 1с/5с/15с/30с/ТФ + статистики разворотов для кнопки «Скачать историю».
      */
     fun exportHistoryBundle(): ExportBundle {
         synchronized(lock) {
@@ -286,7 +319,7 @@ class OrderFlowEventVault(
             }
             val arr = JSONArray()
             val csv = StringBuilder()
-            csv.appendLine("id,symbol,exchange,interval,detected_utc,event_type,grade,entry_price,level_price,delta_pct,norm_ofi,absorption_ratio,progress_eff,replenish_rate,persistence,repeated_attacks,reaction_1s_pct,reaction_5s_pct,reaction_15s_pct,reaction_30s_pct,verified_outcome")
+            csv.appendLine("id,symbol,exchange,interval,detected_utc,event_type,grade,entry_price,level_price,delta_pct,norm_ofi,absorption_ratio,progress_eff,replenish_rate,persistence,repeated_attacks,reaction_1s_pct,reaction_5s_pct,reaction_15s_pct,reaction_30s_pct,reaction_tf_pct,verified_outcome")
 
             for (ev in events) {
                 arr.put(toJson(ev))
@@ -313,6 +346,7 @@ class OrderFlowEventVault(
                         ev.reaction5sPct?.let { fmt(it) } ?: "",
                         ev.reaction15sPct?.let { fmt(it) } ?: "",
                         ev.reaction30sPct?.let { fmt(it) } ?: "",
+                        ev.reactionTfPct?.let { fmt(it) } ?: "",
                         csvCell(ev.verifiedOutcome)
                     ).joinToString(",")
                 )
@@ -405,10 +439,12 @@ class OrderFlowEventVault(
         put("price5s", ev.price5s ?: JSONObject.NULL)
         put("price15s", ev.price15s ?: JSONObject.NULL)
         put("price30s", ev.price30s ?: JSONObject.NULL)
+        put("priceTf", ev.priceTf ?: JSONObject.NULL)
         put("reaction1sPct", ev.reaction1sPct ?: JSONObject.NULL)
         put("reaction5sPct", ev.reaction5sPct ?: JSONObject.NULL)
         put("reaction15sPct", ev.reaction15sPct ?: JSONObject.NULL)
         put("reaction30sPct", ev.reaction30sPct ?: JSONObject.NULL)
+        put("reactionTfPct", ev.reactionTfPct ?: JSONObject.NULL)
         put("verifiedOutcome", ev.verifiedOutcome)
     }
 
@@ -452,10 +488,12 @@ class OrderFlowEventVault(
             price5s = optNullableDouble("price5s"),
             price15s = optNullableDouble("price15s"),
             price30s = optNullableDouble("price30s"),
+            priceTf = optNullableDouble("priceTf"),
             reaction1sPct = optNullableDouble("reaction1sPct"),
             reaction5sPct = optNullableDouble("reaction5sPct"),
             reaction15sPct = optNullableDouble("reaction15sPct"),
             reaction30sPct = optNullableDouble("reaction30sPct"),
+            reactionTfPct = optNullableDouble("reactionTfPct"),
             verifiedOutcome = o.optString("verifiedOutcome", "PENDING")
         )
     }
@@ -463,5 +501,16 @@ class OrderFlowEventVault(
     companion object {
         private const val FILE_NAME = "events.jsonl"
         private const val MAX_EVENTS = 1500
+        internal const val SHORT_WINDOW_FLAT_THRESHOLD_PCT = 0.045
+        internal const val EXTENDED_TF_FLAT_THRESHOLD_PCT = 0.22
+
+        fun intervalToHorizonMs(interval: String): Long = when (interval.trim()) {
+            "1" -> 60_000L
+            "3" -> 180_000L
+            "5" -> 300_000L
+            "15" -> 900_000L
+            "30", "60", "240", "D" -> 900_000L
+            else -> 300_000L
+        }
     }
 }

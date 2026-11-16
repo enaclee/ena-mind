@@ -2,6 +2,7 @@ package com.enamind.ai.bybit
 
 import android.content.Context
 import android.util.Log
+import com.enamind.ai.core.NetworkHub
 import com.enamind.ai.core.Settings
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -11,7 +12,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 
 /**
  * Динамический каталог всех доступных USDT-контрактов биржи (Bybit Linear -> Binance Futures/Spot -> OKX SWAP).
@@ -28,7 +28,8 @@ class ContractCatalogRepo(
         val tickSize: Double?,
         val minOrderQty: Double?,
         val maxLeverage: Double?,
-        val source: String
+        val source: String,
+        val qtyStep: Double? = null
     )
 
     data class CatalogState(
@@ -39,10 +40,7 @@ class ContractCatalogRepo(
         val lastSyncMs: Long = 0L
     )
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(7, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient = NetworkHub.restClient(7L, 10L, 10L)
 
     private val cacheFile = File(File(ctx.filesDir, "enamind"), "contracts_catalog.json")
 
@@ -71,7 +69,8 @@ class ContractCatalogRepo(
                         tickSize = o.optDouble("tickSize", Double.NaN).takeIf { it.isFinite() && it > 0 },
                         minOrderQty = o.optDouble("minOrderQty", Double.NaN).takeIf { it.isFinite() && it > 0 },
                         maxLeverage = o.optDouble("maxLeverage", Double.NaN).takeIf { it.isFinite() && it > 0 },
-                        source = o.optString("source", "cache")
+                        source = o.optString("source", "cache"),
+                        qtyStep = o.optDouble("qtyStep", Double.NaN).takeIf { it.isFinite() && it > 0 }
                     )
                 )
             }
@@ -126,8 +125,14 @@ class ContractCatalogRepo(
         }
     }
 
+    fun findContract(symbol: String): ContractInfo? =
+        _state.value.contracts.firstOrNull { it.symbol.equals(symbol, ignoreCase = true) }
+
     fun findTickSize(symbol: String): Double? =
-        _state.value.contracts.firstOrNull { it.symbol.equals(symbol, ignoreCase = true) }?.tickSize
+        findContract(symbol)?.tickSize
+
+    fun findQtyStep(symbol: String): Double? =
+        findContract(symbol)?.qtyStep
 
     private fun fetchBybitLinear(baseUrl: String): Pair<List<ContractInfo>, String>? {
         val all = ArrayList<ContractInfo>()
@@ -193,6 +198,7 @@ class ContractCatalogRepo(
                         .put("minOrderQty", c.minOrderQty ?: JSONObject.NULL)
                         .put("maxLeverage", c.maxLeverage ?: JSONObject.NULL)
                         .put("source", c.source)
+                        .put("qtyStep", c.qtyStep ?: JSONObject.NULL)
                 )
             }
             cacheFile.writeText(
@@ -233,10 +239,12 @@ class ContractCatalogRepo(
                     if (sym.isBlank() || quote != "USDT") continue
                     if (status.isNotBlank() && status != "Trading") continue
                     val base = o.optString("baseCoin").uppercase(Locale.ROOT).ifBlank { sym.removeSuffix("USDT") }
-                    val tick = o.optJSONObject("priceFilter")?.optString("tickSize")?.toDoubleOrNull()
-                    val minQty = o.optJSONObject("lotSizeFilter")?.optString("minOrderQty")?.toDoubleOrNull()
-                    val maxLev = o.optJSONObject("leverageFilter")?.optString("maxLeverage")?.toDoubleOrNull()
-                    out.add(ContractInfo(sym, base, quote, tick, minQty, maxLev, "Bybit"))
+                    val tick = o.optJSONObject("priceFilter")?.optString("tickSize")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    val lotObj = o.optJSONObject("lotSizeFilter")
+                    val minQty = lotObj?.optString("minOrderQty")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    val qStep = lotObj?.optString("qtyStep")?.toDoubleOrNull()?.takeIf { it > 0 } ?: minQty
+                    val maxLev = o.optJSONObject("leverageFilter")?.optString("maxLeverage")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    out.add(ContractInfo(sym, base, quote, tick, minQty, maxLev, "Bybit", qStep))
                 }
                 out to cursor
             } catch (_: Exception) {
@@ -259,17 +267,21 @@ class ContractCatalogRepo(
                     val base = o.optString("baseAsset").uppercase(Locale.ROOT).ifBlank { sym.removeSuffix("USDT") }
                     var tick: Double? = null
                     var minQty: Double? = null
+                    var qStep: Double? = null
                     val filters = o.optJSONArray("filters")
                     if (filters != null) {
                         for (j in 0 until filters.length()) {
                             val f = filters.optJSONObject(j) ?: continue
                             when (f.optString("filterType")) {
                                 "PRICE_FILTER" -> tick = f.optString("tickSize").toDoubleOrNull()?.takeIf { it > 0 }
-                                "LOT_SIZE" -> minQty = f.optString("minQty").toDoubleOrNull()?.takeIf { it > 0 }
+                                "LOT_SIZE" -> {
+                                    minQty = f.optString("minQty").toDoubleOrNull()?.takeIf { it > 0 }
+                                    qStep = f.optString("stepSize").toDoubleOrNull()?.takeIf { it > 0 } ?: minQty
+                                }
                             }
                         }
                     }
-                    out.add(ContractInfo(sym, base, quote, tick, minQty, null, source))
+                    out.add(ContractInfo(sym, base, quote, tick, minQty, null, source, qStep))
                 }
                 out
             } catch (_: Exception) {
@@ -293,8 +305,9 @@ class ContractCatalogRepo(
                     val sym = "${base}USDT"
                     val tick = o.optString("tickSz").toDoubleOrNull()?.takeIf { it > 0 }
                     val minQty = o.optString("minSz").toDoubleOrNull()?.takeIf { it > 0 }
+                    val qStep = o.optString("lotSz").toDoubleOrNull()?.takeIf { it > 0 } ?: minQty
                     val maxLev = o.optString("lever").toDoubleOrNull()?.takeIf { it > 0 }
-                    out.add(ContractInfo(sym, base, "USDT", tick, minQty, maxLev, "OKX"))
+                    out.add(ContractInfo(sym, base, "USDT", tick, minQty, maxLev, "OKX", qStep))
                 }
                 out
             } catch (_: Exception) {

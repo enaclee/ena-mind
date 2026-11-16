@@ -197,7 +197,7 @@ fun ContractPickerDialog(
                     Text(
                         err,
                         fontSize = 11.sp,
-                        color = Color.EnaYellow
+                        color = enaAmberText()
                     )
                 }
 
@@ -299,7 +299,7 @@ fun ContractPickerDialog(
                                         Icon(
                                             imageVector = if (isFav) Icons.Filled.Star else Icons.Outlined.StarOutline,
                                             contentDescription = if (isFav) "Убрать из избранного" else "В избранное",
-                                            tint = if (isFav) Color.EnaYellow else MaterialTheme.colorScheme.onSurfaceVariant
+                                            tint = if (isFav) enaAmberText() else MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
                                 }

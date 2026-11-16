@@ -54,6 +54,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.enamind.ai.bot.BotChartOverlay
+import com.enamind.ai.bot.TradeSide
 import com.enamind.ai.orderflow.ChartOverlayData
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -63,7 +65,7 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * KlineChart (Native Compose Canvas): свечной график OHLCV + объём + живая свеча + Order Flow overlay.
+ * KlineChart (Native Compose Canvas): свечной график OHLCV + объём + живая свеча + Order Flow & Bot overlay.
  */
 @Composable
 fun KlineChart(
@@ -74,6 +76,7 @@ fun KlineChart(
     intervalLabel: String = "",
     sourceLabel: String = "",
     orderFlowOverlay: ChartOverlayData? = null,
+    botOverlay: BotChartOverlay? = null,
     modifier: Modifier = Modifier
 ) {
     val validBars = remember(bars) { validateBars(bars) }
@@ -552,6 +555,82 @@ fun KlineChart(
                                         color = evColor,
                                         radius = 4.dp.toPx(),
                                         center = Offset(ex, candleTop + 6.dp.toPx())
+                                    )
+                                }
+                            }
+                        }
+
+                        // Trade Bot Overlay (ENTRY, TP MIN, TRAIL FLOOR, TP MAX, STOP / LIQ + маркеры сделок)
+                        if (botOverlay != null &&
+                            (symbol.isBlank() || botOverlay.symbol.equals(symbol, ignoreCase = true))
+                        ) {
+                            fun drawBotPriceLine(
+                                linePrice: Double?,
+                                tagLabel: String,
+                                lineColor: Color,
+                                dashed: Boolean
+                            ) {
+                                if (linePrice == null || !linePrice.isFinite() || linePrice !in minP..maxP) return
+                                val ly = priceToY(linePrice)
+                                drawLine(
+                                    color = lineColor.copy(alpha = 0.9f),
+                                    start = Offset(0f, ly),
+                                    end = Offset(plotW, ly),
+                                    strokeWidth = if (dashed) 1.3.dp.toPx() else 1.7.dp.toPx(),
+                                    pathEffect = if (dashed) PathEffect.dashPathEffect(floatArrayOf(9f, 5f), 0f) else null
+                                )
+                                val tm = textMeasurer.measure(
+                                    tagLabel,
+                                    style = axisTextStyle.copy(color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                )
+                                val pillH = tm.size.height + 3.dp.toPx()
+                                val pillW = tm.size.width + 8.dp.toPx()
+                                val pillTopY = (ly - pillH - 2.dp.toPx()).coerceIn(candleTop, candleBottom - pillH)
+                                drawRoundRect(
+                                    color = lineColor.copy(alpha = 0.88f),
+                                    topLeft = Offset(4.dp.toPx(), pillTopY),
+                                    size = Size(pillW, pillH),
+                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(4.dp.toPx(), 4.dp.toPx())
+                                )
+                                drawText(
+                                    textLayoutResult = tm,
+                                    topLeft = Offset(8.dp.toPx(), pillTopY + 1.5.dp.toPx())
+                                )
+                            }
+
+                            val entrySideLabel = botOverlay.side?.labelRu ?: "POS"
+                            drawBotPriceLine(botOverlay.entryPrice, "ENTRY $entrySideLabel", Color(0xFF3B82F6), dashed = false)
+                            drawBotPriceLine(botOverlay.tpMinPrice, "TP MIN", Color(0xFF10B981), dashed = true)
+                            drawBotPriceLine(botOverlay.trailFloorPrice, "TRAIL FLOOR", Color(0xFFF59E0B), dashed = false)
+                            drawBotPriceLine(botOverlay.tpMaxPrice, "TP MAX", Color(0xFF059669), dashed = true)
+                            if (botOverlay.stopLossPrice != null) {
+                                drawBotPriceLine(botOverlay.stopLossPrice, "STOP LOSS", Color(0xFFEF4444), dashed = true)
+                            } else {
+                                drawBotPriceLine(botOverlay.estLiquidationPrice, "EST LIQ", Color(0xFFDC2626), dashed = true)
+                            }
+
+                            val firstVisTs = visible.first()[0].toLong()
+                            val lastVisTs = visible.last()[0].toLong()
+                            botOverlay.markers.forEach { mk ->
+                                if (mk.tsMs in firstVisTs..lastVisTs && mk.price in minP..maxP) {
+                                    val barIdx = visible.indexOfLast { it[0].toLong() <= mk.tsMs }.coerceIn(0, visible.lastIndex)
+                                    val mx = (barIdx + 0.5f) * slotW
+                                    val my = priceToY(mk.price)
+                                    val mkColor = when {
+                                        mk.isEntry && mk.side == TradeSide.BUY -> Color(0xFF10B981)
+                                        mk.isEntry -> Color(0xFFEF4444)
+                                        mk.won == true -> Color(0xFF3B82F6)
+                                        else -> Color(0xFFF59E0B)
+                                    }
+                                    drawCircle(
+                                        color = Color.White,
+                                        radius = 5.5.dp.toPx(),
+                                        center = Offset(mx, my)
+                                    )
+                                    drawCircle(
+                                        color = mkColor,
+                                        radius = if (mk.isEntry) 4.dp.toPx() else 3.2.dp.toPx(),
+                                        center = Offset(mx, my)
                                     )
                                 }
                             }

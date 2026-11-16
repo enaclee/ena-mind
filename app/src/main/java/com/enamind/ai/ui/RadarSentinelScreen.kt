@@ -430,7 +430,7 @@ private fun CryptoSentinelCard(events: List<SentinelEvent>, market: AppState.Mar
     val warn = events.count { it.severity == SentinelSeverity.WARNING }
     val (badgeTxt, badgeClr) = when {
         crit > 0 -> "$crit КРИТИЧНО" to Color.EnaRed
-        warn > 0 -> "$warn ВНИМАНИЕ" to Color.EnaYellow
+        warn > 0 -> "$warn ВНИМАНИЕ" to enaAmberText()
         events.isNotEmpty() -> "${events.size} СОБЫТ." to MaterialTheme.colorScheme.primary
         else -> "СПОКОЙНО" to Color.EnaGreen
     }
@@ -462,7 +462,7 @@ private fun CryptoSentinelCard(events: List<SentinelEvent>, market: AppState.Mar
                 events.forEach { ev ->
                     val sevColor = when (ev.severity) {
                         SentinelSeverity.CRITICAL -> Color.EnaRed
-                        SentinelSeverity.WARNING -> Color.EnaYellow
+                        SentinelSeverity.WARNING -> enaAmberText()
                         SentinelSeverity.INFO -> MaterialTheme.colorScheme.primary
                     }
                     Surface(
@@ -717,7 +717,7 @@ private fun ReasoningBrainCard(
                         Text(
                             fo.optString("error").ifBlank { "Недостаточно свежих свечей для расчёта ${h}ч" },
                             fontSize = 10.5.sp,
-                            color = Color.EnaYellow
+                            color = enaAmberText()
                         )
                     }
                 }
@@ -769,14 +769,15 @@ private fun ReasoningBrainCard(
         }
 
         if (logic.conflicts.isNotEmpty()) {
+            val amber = enaAmberText()
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(10.dp),
-                color = Color.EnaYellow.copy(alpha = 0.12f),
-                border = BorderStroke(1.dp, Color.EnaYellow.copy(alpha = 0.4f))
+                color = amber.copy(alpha = 0.12f),
+                border = BorderStroke(1.dp, amber.copy(alpha = 0.4f))
             ) {
                 Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Text("Обнаружены противоречия:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.EnaYellow)
+                    Text("Обнаружены противоречия:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = amber)
                     logic.conflicts.forEach { c ->
                         Text("• $c", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface)
                     }
@@ -1102,11 +1103,12 @@ private fun MajorCalendarCardBlock(
         }
 
         calendarState.error?.let { err ->
+            val amber = enaAmberText()
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(10.dp),
-                color = Color.EnaYellow.copy(alpha = 0.12f),
-                border = BorderStroke(0.8.dp, Color.EnaYellow.copy(alpha = 0.4f))
+                color = amber.copy(alpha = 0.12f),
+                border = BorderStroke(0.8.dp, amber.copy(alpha = 0.4f))
             ) {
                 Text(
                     err,
@@ -1183,7 +1185,7 @@ private fun MajorCalendarCardBlock(
 @Composable
 private fun CalendarEventRow(ev: MajorCalendarRepo.CalendarEvent) {
     val catColor = if (ev.category == MajorCalendarRepo.EventCategory.MACRO) {
-        Color.EnaYellow
+        enaAmberText()
     } else {
         MaterialTheme.colorScheme.primary
     }

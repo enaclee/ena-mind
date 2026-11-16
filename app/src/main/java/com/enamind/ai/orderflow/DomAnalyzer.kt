@@ -8,23 +8,32 @@ import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
- * DOM Analyzer — анализ последовательности обновлений стакана в реальном времени.
+ * DOM Analyzer — анти-шумовой анализ последовательности обновлений стакана (HFT / MLOFI / CTR).
  *
- * Ключевой принцип честности:
- *  - Каждое уменьшение объёма на уровне стакана сопоставляется со сделками в синхронизированном
- *    окне (±250 мс) по близкой цене:
- *      * Если встречная сделка произошла -> это ИСПОЛНЕНИЕ (executedQty);
- *      * Если сделок в это время на уровне не было -> это СНЯТИЕ / ОТМЕНА (cancelledQty).
- *  - Пополнение ликвидности после исполнения фиксируется, но НИКОГДА не объявляется
- *    «подтверждённым iceberg» по одному лишь факту пополнения.
+ * Ключевые принципы честности и защиты от «раздувания рынка»:
+ *  1. MLOFI считается только по top-5 уровням книги с затухающими весами [1.0, 0.70, 0.45, 0.30, 0.20]
+ *     и нормируется на реальный объём top-5, а не 0.8% от спреда.
+ *  2. Пополнение ликвидности (replenishment) учитывается СТРОГО на пассивной стороне исполнения
+ *     в окне 50..500 мс ПОСЛЕ реальной сматченной сделки (`executedQty > 0`) на том же уровне цены,
+ *     отсеивая 20ms HFT-мигания котировок.
+ *  3. `levelPersistenceRatio` рассчитывается строго внутри единой зоны (`focusZone`), чтобы
+ *     глобальные отмены не делились на ближние снижения и не занижали устойчивость ложно.
+ *  4. `churnInflationRatio` (Cancel-to-Trade Ratio) измеряет долю фиктивных снятий относительно сделок.
  */
 object DomAnalyzer {
 
     private const val MATCH_WINDOW_MS = 250L
+    private const val MIN_REPLENISH_DELAY_MS = 50L
+    private const val MAX_REPLENISH_DELAY_MS = 500L
+    private val MLOFI_WEIGHTS = doubleArrayOf(1.0, 0.70, 0.45, 0.30, 0.20)
+
+    private data class ExecRecord(val tsMs: Long, val passiveSide: String, val qty: Double)
 
     fun analyze(
         micro: OrderFlowStreamHub.VenueMicroSnapshot?,
-        nowMs: Long
+        nowMs: Long,
+        activeLevelPrice: Double? = null,
+        zoneTolerance: Double? = null
     ): DomSnapshotMetrics {
         if (micro == null || !micro.bookSynced || micro.bids.isEmpty() || micro.asks.isEmpty()) {
             val reason = micro?.desyncReason ?: "Стакан не синхронизирован"
@@ -36,12 +45,23 @@ object DomAnalyzer {
             )
         }
 
-        val bids = micro.bids
-        val asks = micro.asks
-        val bestBid = bids.maxOfOrNull { it.first } ?: 0.0
-        val bestAsk = asks.minOfOrNull { it.first } ?: 0.0
+        val bids = micro.bids.sortedByDescending { it.first }
+        val asks = micro.asks.sortedBy { it.first }
+        val bestBid = bids.firstOrNull()?.first ?: 0.0
+        val bestAsk = asks.firstOrNull()?.first ?: 0.0
         val mid = if (bestBid > 0 && bestAsk > 0) (bestBid + bestAsk) / 2.0 else max(bestBid, bestAsk)
         val priceTol = (mid * 0.0005).coerceAtLeast(abs(bestAsk - bestBid) * 1.5).coerceAtLeast(1e-8)
+
+        // Топ-5 границы для MLOFI и фокусной зоны анализа
+        val topBids = bids.take(5)
+        val topAsks = asks.take(5)
+        val top5MinBid = topBids.lastOrNull()?.first ?: bestBid
+        val top5MaxAsk = topAsks.lastOrNull()?.first ?: bestAsk
+        val top5ActiveMass = (topBids.sumOf { it.second } + topAsks.sumOf { it.second }).coerceAtLeast(1e-9)
+
+        val focusCenter = activeLevelPrice?.takeIf { it.isFinite() && it > 0.0 } ?: mid
+        val focusHalfWidth = zoneTolerance?.takeIf { it.isFinite() && it > 0.0 }
+            ?: max(abs(bestAsk - bestBid) * 3.0, mid * 0.0018).coerceAtLeast(1e-8)
 
         val bidTotal = bids.sumOf { it.second }
         val askTotal = asks.sumOf { it.second }
@@ -71,19 +91,18 @@ object DomAnalyzer {
 
         var addCount = 0
         var cancelCount = 0
-        var ofi = 0.0
-        var absOfiMass = 0.0
+        var weightedOfi = 0.0
+        var absWeightedOfiMass = 0.0
         var executedQty = 0.0
         var cancelledQty = 0.0
         var replenishCount = 0
         var replenishQty = 0.0
-        var totalDrops = 0
-        var survivedDrops = 0
+        var focusDrops = 0
+        var focusCancels = 0
         val removedLargeWalls = mutableListOf<String>()
 
-        // Последнее исполнение по уровню (key = bucket int) для обнаружения пополнения после исполнения
-        val recentExecutedAtPrice = HashMap<Long, Long>()
-        // Суммарный объём подходящих сделок для потребления при матчинге (чтобы 1 сделка не списывала 10 снятий)
+        // Последнее реальное исполнение (tsMs + passiveSide) по ценовому бакету
+        val recentExecutedAtBucket = HashMap<Long, ExecRecord>()
         val availableTradeQty = DoubleArray(trades.size) { trades[it].qty }
 
         val allBookSizes = (bids.map { it.second } + asks.map { it.second }).filter { it > 0 }
@@ -96,27 +115,34 @@ object DomAnalyzer {
         for (ev in deltas) {
             val d = ev.delta
             val dq = d.deltaQty
-            val nearSpread = mid <= 0.0 || abs(d.price - mid) <= mid * 0.008 // фокус в пределах 0.8% от спреда
+            val inFocusZone = focusCenter <= 0.0 ||
+                abs(d.price - focusCenter) <= focusHalfWidth ||
+                (d.price in top5MinBid..top5MaxAsk)
 
-            if (nearSpread) {
-                val signedFlow = if (d.side == "BID") dq else -dq
-                ofi += signedFlow
-                absOfiMass += abs(dq)
+            // MLOFI по top-5 уровням с весовым затуханием
+            val levelWeight = mlofiWeight(d.price, d.side, topBids, topAsks, priceTol)
+            if (levelWeight > 0.0) {
+                val signedFlow = (if (d.side == "BID") dq else -dq) * levelWeight
+                weightedOfi += signedFlow
+                absWeightedOfiMass += abs(dq) * levelWeight
             }
 
             val bucket = (d.price / priceTol).toLong()
             if (dq > 0.0) {
                 addCount++
-                val execTs = recentExecutedAtPrice[bucket]
-                if (execTs != null && (d.tsMs - execTs) in 0L..12_000L) {
-                    replenishCount++
-                    replenishQty += dq
+                val exec = recentExecutedAtBucket[bucket]
+                if (exec != null && exec.passiveSide == d.side && exec.qty > 0.0) {
+                    val dt = d.tsMs - exec.tsMs
+                    if (dt in MIN_REPLENISH_DELAY_MS..MAX_REPLENISH_DELAY_MS) {
+                        replenishCount++
+                        replenishQty += dq
+                    }
                 }
             } else if (dq < 0.0) {
                 val dropQty = -dq
-                if (nearSpread) totalDrops++
-                // Сопоставляем снятие/снижение со встречными сделками в ±MATCH_WINDOW_MS
-                // Уровень BID исполняется рыночными продажами (isAggressiveBuy == false), ASK — покупками
+                if (inFocusZone) focusDrops++
+
+                // BID исполняется рыночными продажами (isAggressiveBuy == false), ASK — покупками
                 val expectAggBuy = (d.side == "ASK")
                 var matchedQty = 0.0
                 for (i in trades.indices) {
@@ -137,12 +163,14 @@ object DomAnalyzer {
                 val cancelPart = (dropQty - matchedQty).coerceAtLeast(0.0)
                 if (matchedQty > 0.0) {
                     executedQty += matchedQty
-                    recentExecutedAtPrice[bucket] = d.tsMs
-                    if (nearSpread && d.newQty > 0.0) survivedDrops++
+                    recentExecutedAtBucket[bucket] = ExecRecord(d.tsMs, d.side, matchedQty)
                 }
                 if (cancelPart > 1e-9) {
                     cancelledQty += cancelPart
                     cancelCount++
+                    if (inFocusZone && cancelPart >= dropQty * 0.5) {
+                        focusCancels++
+                    }
                     if (d.prevQty >= largeThreshold && cancelPart >= d.prevQty * 0.7 && d.newQty <= d.prevQty * 0.2) {
                         removedLargeWalls += "${d.side} ${formatPrice(d.price)}"
                     }
@@ -157,13 +185,29 @@ object DomAnalyzer {
             RestingOrderZone(p, q, "ASK", spanSec)
         }
 
-        val normOfi = if (absOfiMass > 1e-9) (ofi / absOfiMass).coerceIn(-1.0, 1.0) else 0.0
+        // CTR (Cancel-to-Trade Ratio) измеряет искусственное раздувание/снятия стакана
+        val churnInflationRatio = when {
+            executedQty > 1e-9 -> (cancelledQty / executedQty).coerceIn(0.0, 99.0)
+            cancelledQty > 0.0 -> 99.0
+            else -> 0.0
+        }
+        // Если CTR слишком высок, подавляем вес стаканного OFI против шума
+        val ctrDamping = when {
+            churnInflationRatio >= 12.0 -> 0.35
+            churnInflationRatio >= 6.0 -> 0.65
+            else -> 1.0
+        }
+        val ofiDenom = max(absWeightedOfiMass, top5ActiveMass * 0.10).coerceAtLeast(1e-9)
+        val normOfi = ((weightedOfi / ofiDenom) * ctrDamping).coerceIn(-1.0, 1.0)
+
         val addRate = addCount / spanSec
         val cancelRate = cancelCount / spanSec
-        val denomRep = max(1e-9, executedQty)
-        val replenishRate = if (executedQty > 0.0) (replenishQty / denomRep).coerceIn(0.0, 3.0) else 0.0
-        val persistenceRatio = if (totalDrops > 0) {
-            (1.0 - (cancelCount.toDouble() / max(1, totalDrops))).coerceIn(0.0, 1.0)
+        val replenishRate = if (executedQty > 1e-9) {
+            (replenishQty / executedQty).coerceIn(0.0, 3.0)
+        } else 0.0
+
+        val persistenceRatio = if (focusDrops > 0) {
+            (1.0 - (focusCancels.toDouble() / max(1, focusDrops))).coerceIn(0.0, 1.0)
         } else 0.5
 
         val pullDetected = removedLargeWalls.isNotEmpty() || (cancelledQty > executedQty * 3.0 && cancelledQty > bidTotal * 0.25)
@@ -177,6 +221,10 @@ object DomAnalyzer {
             if (replenishCount >= 2) {
                 append("Повторное пополнение после сделок (${replenishCount}x)")
             }
+            if (churnInflationRatio >= 8.0) {
+                if (isNotEmpty()) append(" · ")
+                append("Высокий HFT-шум стакана (CTR ×${String.format(Locale.US, "%.1f", churnInflationRatio)})")
+            }
             if (pullNote.isNotBlank()) {
                 if (isNotEmpty()) append(" · ")
                 append(pullNote)
@@ -184,7 +232,7 @@ object DomAnalyzer {
         }
 
         return DomSnapshotMetrics(
-            ofi = ofi,
+            ofi = weightedOfi,
             normalizedOfi = normOfi,
             bidTotal = bidTotal,
             askTotal = askTotal,
@@ -207,10 +255,26 @@ object DomAnalyzer {
             sufficientData = true,
             note = String.format(
                 Locale.US,
-                "Исп.: %s · Снято: %s · Пополн.: %d (из %d дельт)",
-                compact(executedQty), compact(cancelledQty), replenishCount, deltas.size
-            )
+                "Исп.: %s · Снято: %s · Пополн.: %d (CTR ×%.1f)",
+                compact(executedQty), compact(cancelledQty), replenishCount, churnInflationRatio
+            ),
+            churnInflationRatio = churnInflationRatio
         )
+    }
+
+    private fun mlofiWeight(
+        price: Double,
+        side: String,
+        topBids: List<Pair<Double, Double>>,
+        topAsks: List<Pair<Double, Double>>,
+        tol: Double
+    ): Double {
+        val list = if (side == "BID") topBids else topAsks
+        for (i in list.indices) {
+            if (i >= MLOFI_WEIGHTS.size) break
+            if (abs(list[i].first - price) <= tol) return MLOFI_WEIGHTS[i]
+        }
+        return 0.0
     }
 
     private fun compact(v: Double): String = when {

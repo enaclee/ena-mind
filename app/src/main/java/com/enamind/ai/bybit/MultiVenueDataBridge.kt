@@ -1,12 +1,12 @@
 package com.enamind.ai.bybit
 
 import com.enamind.ai.core.FaultMonitor
+import com.enamind.ai.core.NetworkHub
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 
 /**
  * MultiVenueDataBridge (ТЗ п.4, п.7) — расширенный высокочастотный мост данных.
@@ -36,10 +36,7 @@ class MultiVenueDataBridge {
         val venuePrices: Map<String, Double> = emptyMap()
     )
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(6, TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient = NetworkHub.restClient(connectTimeoutSec = 5L, readTimeoutSec = 6L, writeTimeoutSec = 8L)
 
     private val cache = ConcurrentHashMap<String, VenueSnapshot>()
 
@@ -172,6 +169,8 @@ class MultiVenueDataBridge {
     }
 
     private fun getText(url: String, label: String): String? {
+        val host = NetworkHub.extractHost(url)
+        if (NetworkHub.isHostRateLimited(host)) return null
         return try {
             val req = Request.Builder()
                 .url(url)
@@ -180,17 +179,21 @@ class MultiVenueDataBridge {
                 .build()
             http.newCall(req).execute().use { r ->
                 if (!r.isSuccessful) {
+                    if (r.code == 429) {
+                        NetworkHub.recordRateLimit(host, r.header("Retry-After")?.toLongOrNull() ?: 25L)
+                    }
                     if (r.code == 429 || r.code >= 500) {
                         FaultMonitor.recordFault(
                             component = label,
                             kind = FaultMonitor.Kind.NETWORK,
                             severity = FaultMonitor.Severity.WARNING,
-                            message = "HTTP ${r.code} на $url",
+                            message = "HTTP ${r.code} от $url",
                             recovery = "Переход на другие биржевые мосты"
                         )
                     }
                     null
                 } else {
+                    NetworkHub.clearRateLimit(host)
                     r.body?.string()?.takeIf { it.isNotBlank() }
                 }
             }

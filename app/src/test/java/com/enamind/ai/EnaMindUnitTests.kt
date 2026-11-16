@@ -458,7 +458,7 @@ class EnaMindUnitTests {
             assertTrue(fp.sufficientData)
             assertNotNull(fp.pocPrice)
 
-            // Simulate a detected buyer absorption near resistance 3000.0
+            // Simulate a detected seller absorption near resistance 3000.0 (buyers attacking ask wall)
             val report = OrderFlowReport(
                 symbol = "ETHUSDT",
                 exchangeSource = "Binance",
@@ -474,7 +474,7 @@ class EnaMindUnitTests {
                     phase = LevelAttackPhase.POSSIBLE_ABSORPTION
                 ),
                 absorption = com.enamind.ai.orderflow.AbsorptionMetrics(
-                    side = AbsorptionSide.BUYER_ABSORPTION,
+                    side = AbsorptionSide.SELLER_ABSORPTION,
                     detected = true,
                     confirmed = false,
                     reliability = ReliabilityGrade.MODERATE,
@@ -506,7 +506,7 @@ class EnaMindUnitTests {
             assertTrue(bundle.jsonText.contains("ETHUSDT"))
             assertTrue(bundle.jsonText.contains("REVERSAL"))
             assertTrue(bundle.csvText.contains("reaction_30s_pct"))
-            assertTrue(bundle.csvText.contains("BUYER_ABSORPTION"))
+            assertTrue(bundle.csvText.contains("SELLER_ABSORPTION"))
         } finally {
             dir.deleteRecursively()
         }
@@ -615,7 +615,7 @@ class EnaMindUnitTests {
                     "quoteCoin": "USDT",
                     "status": "Trading",
                     "priceFilter": {"tickSize": "0.0001"},
-                    "lotSizeFilter": {"minOrderQty": "1"},
+                    "lotSizeFilter": {"minOrderQty": "1", "qtyStep": "0.1"},
                     "leverageFilter": {"maxLeverage": "50"}
                   },
                   {
@@ -633,6 +633,7 @@ class EnaMindUnitTests {
         assertEquals(1, parsed!!.first.size)
         assertEquals("SUIUSDT", parsed.first[0].symbol)
         assertEquals(0.0001, parsed.first[0].tickSize ?: 0.0, 1e-8)
+        assertEquals(0.1, parsed.first[0].qtyStep ?: 0.0, 1e-8)
         assertEquals(50.0, parsed.first[0].maxLeverage ?: 0.0, 1e-6)
         assertEquals("next123", parsed.second)
     }
@@ -666,5 +667,336 @@ class EnaMindUnitTests {
         val json = report.toEngineJson()
         assertEquals("INSUFFICIENT", json.getJSONObject("prediction").getString("status"))
         assertTrue(json.getJSONObject("prediction").getJSONObject("features").isNull("sigma_6h_pct"))
+    }
+
+    @Test
+    fun `domAnalyzer filters 20ms HFT quote churn without fake replenishment and damps MLOFI`() {
+        val baseTs = 1_700_000_000_000L
+        // 1 small real execution + 20ms cancel/re-add spoofing churn on ASK without trades
+        val deltas = listOf(
+            OrderFlowStreamHub.RawDomDeltaEvent(
+                "BTCUSDT",
+                BookState.LevelDelta(100.0, 12.0, 11.0, -1.0, "ASK", baseTs, 1L),
+                3L,
+                "Bybit"
+            ),
+            // Cancelled without trade, then added back 20ms later -> must NOT count as replenishment (< 50ms & no exec on that cancel)
+            OrderFlowStreamHub.RawDomDeltaEvent(
+                "BTCUSDT",
+                BookState.LevelDelta(101.0, 30.0, 10.0, -20.0, "ASK", baseTs + 600L, 2L),
+                3L,
+                "Bybit"
+            ),
+            OrderFlowStreamHub.RawDomDeltaEvent(
+                "BTCUSDT",
+                BookState.LevelDelta(101.0, 10.0, 30.0, +20.0, "ASK", baseTs + 620L, 3L),
+                3L,
+                "Bybit"
+            ),
+            OrderFlowStreamHub.RawDomDeltaEvent(
+                "BTCUSDT",
+                BookState.LevelDelta(101.0, 30.0, 10.0, -20.0, "ASK", baseTs + 700L, 4L),
+                3L,
+                "Bybit"
+            ),
+            OrderFlowStreamHub.RawDomDeltaEvent(
+                "BTCUSDT",
+                BookState.LevelDelta(101.0, 10.0, 30.0, +20.0, "ASK", baseTs + 720L, 5L),
+                3L,
+                "Bybit"
+            )
+        )
+        val trades = listOf(
+            OrderFlowStreamHub.RawTradeTick("BTCUSDT", 100.0, 1.0, true, baseTs + 20L, 3L, "Bybit")
+        )
+        val micro = OrderFlowStreamHub.VenueMicroSnapshot(
+            symbol = "BTCUSDT",
+            primaryVenue = "Bybit",
+            trades = trades,
+            domDeltas = deltas,
+            bids = listOf(99.5 to 15.0, 99.0 to 10.0),
+            asks = listOf(100.0 to 11.0, 101.0 to 30.0),
+            bookSynced = true,
+            desyncReason = null,
+            lastTradeTsMs = baseTs + 20L,
+            lastBookTsMs = baseTs + 720L,
+            avgLagMs = 3L
+        )
+        val dom = DomAnalyzer.analyze(micro, baseTs + 800L)
+        assertTrue(dom.sufficientData)
+        assertEquals(1.0, dom.executedQty, 1e-6)
+        assertEquals(40.0, dom.cancelledQty, 1e-6)
+        assertTrue(dom.churnInflationRatio >= 12.0)
+        assertEquals(0, dom.replenishmentEvents)
+    }
+
+    @Test
+    fun `absorptionDetector resolves SELLER_ABSORPTION on resistance and BUYER_ABSORPTION on support and rejects adverse trend`() {
+        val baseTs = 1_700_000_000_000L
+        // Scenario 1: Aggressive buyers attack 100.0 resistance repeatedly with zero net progress -> SELLER_ABSORPTION
+        val buyTrades = (0 until 20).map { i ->
+            val px = if (i in listOf(3, 8, 13)) 99.80 else 100.0
+            OrderFlowStreamHub.RawTradeTick("BTCUSDT", px, 2.0, i != 18, baseTs + i * 200L, 2L, "Bybit")
+        }
+        val buyFp = FootprintEngine.analyze(buyTrades, tickSize = 0.05, bars = emptyList())
+        val resDom = com.enamind.ai.orderflow.DomSnapshotMetrics(
+            normalizedOfi = -0.10,
+            executedQty = 20.0,
+            cancelledQty = 2.0,
+            replenishmentRate = 0.45,
+            replenishmentEvents = 3,
+            levelPersistenceRatio = 0.85,
+            synchronized = true,
+            lagMs = 2L,
+            deltaSequenceCount = 12,
+            sufficientData = true
+        )
+        val sellerAbs = AbsorptionDetector.analyze(
+            trades = buyTrades,
+            footprint = buyFp,
+            dom = resDom,
+            bars = emptyList(),
+            candidateResistance = 100.0,
+            candidateSupport = 98.0
+        )
+        assertTrue(sellerAbs.detected)
+        assertEquals(AbsorptionSide.SELLER_ABSORPTION, sellerAbs.side)
+
+        // Scenario 2: Aggressive sellers attack 98.0 support repeatedly with zero net progress -> BUYER_ABSORPTION
+        val sellTrades = (0 until 20).map { i ->
+            val px = if (i in listOf(3, 8, 13)) 98.20 else 98.0
+            OrderFlowStreamHub.RawTradeTick("BTCUSDT", px, 2.0, i == 18, baseTs + i * 200L, 2L, "Bybit")
+        }
+        val sellFp = FootprintEngine.analyze(sellTrades, tickSize = 0.05, bars = emptyList())
+        val supDom = resDom.copy(normalizedOfi = 0.10)
+        val buyerAbs = AbsorptionDetector.analyze(
+            trades = sellTrades,
+            footprint = sellFp,
+            dom = supDom,
+            bars = emptyList(),
+            candidateResistance = 100.0,
+            candidateSupport = 98.0
+        )
+        assertTrue(buyerAbs.detected)
+        assertEquals(AbsorptionSide.BUYER_ABSORPTION, buyerAbs.side)
+
+        // Scenario 3: Price already broke violently against aggressive buyers -> progressEfficiency < -0.25 -> NOT absorption
+        val failedBuyTrades = (0 until 20).map { i ->
+            val px = 100.0 - i * 0.15
+            OrderFlowStreamHub.RawTradeTick("BTCUSDT", px, 2.0, i < 18, baseTs + i * 200L, 2L, "Bybit")
+        }
+        val failedFp = FootprintEngine.analyze(failedBuyTrades, tickSize = 0.05, bars = emptyList())
+        val rejectedAbs = AbsorptionDetector.analyze(
+            trades = failedBuyTrades,
+            footprint = failedFp,
+            dom = resDom,
+            bars = emptyList(),
+            candidateResistance = 100.0,
+            candidateSupport = 96.0
+        )
+        assertFalse(rejectedAbs.detected)
+        assertEquals(AbsorptionSide.NONE, rejectedAbs.side)
+    }
+
+    @Test
+    fun `levelAttackDetector enforces proximity gate and flat radar breakout guard`() {
+        val baseTs = 1_700_000_000_000L
+        val bars = (0 until 30).map { i ->
+            val ts = (baseTs - (30 - i) * 60_000L).toDouble()
+            val c = 100.0 + (i % 4) * 0.2
+            val h = if (i == 15) 105.0 else c + 0.25
+            val l = if (i == 10) 95.0 else c - 0.25
+            listOf(ts, c - 0.05, h, l, c, 100.0)
+        }
+        val tradesFar = (0 until 20).map { i ->
+            OrderFlowStreamHub.RawTradeTick("BTCUSDT", 100.3, 2.0, true, baseTs + i * 100L, 2L, "Bybit")
+        }
+        val fp = FootprintEngine.analyze(tradesFar, tickSize = 0.1, bars = bars)
+        val dom = com.enamind.ai.orderflow.DomSnapshotMetrics(
+            normalizedOfi = 0.4,
+            executedQty = 20.0,
+            synchronized = true,
+            deltaSequenceCount = 10,
+            sufficientData = true
+        )
+        // Far from 105.0 and 95.0 (> 1% away) -> Proximity Gate yields LevelAttackPhase.NONE
+        val farRes = LevelAttackDetector.analyze(
+            currentPrice = 100.3,
+            bars = bars,
+            trades = tradesFar,
+            footprint = fp,
+            dom = dom,
+            absorption = com.enamind.ai.orderflow.AbsorptionMetrics(),
+            tickSize = 0.1,
+            quantAdx = 26.0,
+            quantEfficiencyRatio = 0.55
+        )
+        assertEquals(LevelAttackPhase.NONE, farRes.attackState.phase)
+
+        // Breakout accepted beyond 105.0, but Radar says flat (ADX=14, ER=0.12) -> CONFIRMED_BREAKOUT blocked
+        val breakoutBars = bars.dropLast(2) + listOf(
+            listOf((baseTs - 60_000L).toDouble(), 105.0, 105.5, 104.9, 105.4, 250.0),
+            listOf(baseTs.toDouble(), 105.4, 105.7, 105.2, 105.6, 260.0)
+        )
+        val breakoutTrades = (0 until 20).map { i ->
+            OrderFlowStreamHub.RawTradeTick("BTCUSDT", 105.1 + i * 0.02, 2.0, true, baseTs + i * 100L, 2L, "Bybit")
+        }
+        val brFp = FootprintEngine.analyze(breakoutTrades, tickSize = 0.1, bars = breakoutBars)
+        val flatBlocked = LevelAttackDetector.analyze(
+            currentPrice = 105.12,
+            bars = breakoutBars,
+            trades = breakoutTrades,
+            footprint = brFp,
+            dom = dom,
+            absorption = com.enamind.ai.orderflow.AbsorptionMetrics(),
+            tickSize = 0.1,
+            quantAdx = 14.0,
+            quantEfficiencyRatio = 0.12
+        )
+        assertFalse(flatBlocked.attackState.phase == LevelAttackPhase.CONFIRMED_BREAKOUT)
+    }
+
+    @Test
+    fun `scenarioAnalyzer detects hard conflict and resets glow to neutral`() {
+        val baseTs = 1_700_000_000_000L
+        val trades = (0 until 20).map { i ->
+            OrderFlowStreamHub.RawTradeTick("BTCUSDT", 100.0 + i * 0.01, 2.0, true, baseTs + i * 100L, 2L, "Bybit")
+        }
+        val fp = FootprintEngine.analyze(trades, tickSize = 0.05, bars = emptyList())
+        // Negative MLOFI (-0.30) while tape Delta is strongly positive -> hard conflict
+        val domConflict = com.enamind.ai.orderflow.DomSnapshotMetrics(
+            normalizedOfi = -0.30,
+            executedQty = 15.0,
+            synchronized = true,
+            deltaSequenceCount = 8,
+            sufficientData = true
+        )
+        val synth = ScenarioAnalyzer.synthesize(
+            symbol = "BTCUSDT",
+            price = 100.2,
+            freshness = DataFreshness.LIVE,
+            footprint = fp,
+            dom = domConflict,
+            absorption = com.enamind.ai.orderflow.AbsorptionMetrics(),
+            attack = LevelAttackState(),
+            vaultStats = OrderFlowEventVault.EmpiricalStats(),
+            quantAdx = 24.0,
+            quantEfficiencyRatio = 0.45,
+            candleChangePct = 0.25
+        )
+        assertEquals(MarketDominance.CONFLICT, synth.dominance)
+        assertEquals(GlowColorState.NEUTRAL, synth.glow.colorState)
+        assertTrue(synth.glow.conflictDetected)
+        assertEquals(0.0, synth.councilPayload.bullishBiasWeight, 1e-6)
+    }
+
+    @Test
+    fun `orderFlowEventVault separates 30s minute threshold from extended 15m flat threshold`() {
+        val dir = createTempDirectory("of_vault_tf_test").toFile()
+        try {
+            val vault = OrderFlowEventVault(primaryDir = dir)
+            vault.ensureInitialized()
+            val t0 = 1_700_000_000_000L
+
+            val fp1 = FootprintEngine.analyze(
+                trades = (0 until 10).map {
+                    OrderFlowStreamHub.RawTradeTick("BTCUSDT", 1000.0, 1.0, true, t0 - 500L + it * 20L, 2L, "Bybit")
+                },
+                tickSize = 0.5,
+                bars = emptyList()
+            )
+            // 1) Interval "1" (1m -> non-extended): reaction of -0.10% at +30s exceeds 0.045% -> REVERSAL
+            vault.recordEvent(
+                OrderFlowReport(
+                    symbol = "BTCUSDT",
+                    exchangeSource = "Bybit",
+                    interval = "1",
+                    price = 1000.0,
+                    computedAtMs = t0,
+                    freshness = DataFreshness.LIVE,
+                    dominance = MarketDominance.POSSIBLE_ABSORPTION,
+                    footprint = fp1,
+                    levelAttack = LevelAttackState(levelPrice = 1000.0, isResistance = true, phase = LevelAttackPhase.POSSIBLE_ABSORPTION),
+                    absorption = com.enamind.ai.orderflow.AbsorptionMetrics(side = AbsorptionSide.SELLER_ABSORPTION, detected = true)
+                )
+            )
+            vault.verifyForwardOutcomes(
+                symbol = "BTCUSDT",
+                futureTicks = listOf(
+                    OrderFlowStreamHub.RawTradeTick("BTCUSDT", 999.0, 1.0, false, t0 + 30_500L, 2L, "Bybit")
+                ),
+                nowMs = t0 + 36_000L
+            )
+            val stats1m = vault.computeStats("BTCUSDT")
+            assertEquals(1, stats1m.reversalCount)
+
+            // 2) Interval "15" (15m extended): 0.10% move at +15m (< 0.22% fee threshold) -> FLAT
+            val t1 = t0 + 60_000L
+            vault.recordEvent(
+                OrderFlowReport(
+                    symbol = "SOLUSDT",
+                    exchangeSource = "Bybit",
+                    interval = "15",
+                    price = 1000.0,
+                    computedAtMs = t1,
+                    freshness = DataFreshness.LIVE,
+                    dominance = MarketDominance.POSSIBLE_ABSORPTION,
+                    footprint = fp1,
+                    levelAttack = LevelAttackState(levelPrice = 1000.0, isResistance = true, phase = LevelAttackPhase.POSSIBLE_ABSORPTION),
+                    absorption = com.enamind.ai.orderflow.AbsorptionMetrics(side = AbsorptionSide.SELLER_ABSORPTION, detected = true)
+                )
+            )
+            vault.verifyForwardOutcomes(
+                symbol = "SOLUSDT",
+                futureTicks = listOf(
+                    OrderFlowStreamHub.RawTradeTick("SOLUSDT", 999.0, 1.0, false, t1 + 30_500L, 2L, "Bybit"),
+                    OrderFlowStreamHub.RawTradeTick("SOLUSDT", 999.0, 1.0, false, t1 + 905_000L, 2L, "Bybit")
+                ),
+                nowMs = t1 + 910_000L
+            )
+            val stats15m = vault.computeStats("SOLUSDT")
+            assertEquals(1, stats15m.verifiedEvents)
+            assertEquals(0, stats15m.reversalCount)
+            assertEquals(0, stats15m.breakoutCount)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `aiStudioClient builds multimodal Gemini and OpenAI payloads with image and text attachments`() {
+        val attachments = listOf(
+            AiStudioClient.ChatAttachment(
+                id = "img1",
+                displayName = "chart.png",
+                mimeType = "image/png",
+                sizeBytes = 128L,
+                isImage = true,
+                base64Data = "AQID"
+            ),
+            AiStudioClient.ChatAttachment(
+                id = "txt1",
+                displayName = "notes.txt",
+                mimeType = "text/plain",
+                sizeBytes = 32L,
+                isImage = false,
+                textPreview = "Sample log line"
+            )
+        )
+        val geminiParts = AiStudioClient.buildGeminiUserParts("Проверь", attachments)
+        assertEquals(2, geminiParts.length())
+        assertTrue(geminiParts.getJSONObject(0).getString("text").contains("notes.txt"))
+        assertEquals("image/png", geminiParts.getJSONObject(1).getJSONObject("inlineData").getString("mimeType"))
+
+        val openAiPayload = AiStudioClient.buildOpenAiPayload(
+            modelId = "gpt-4o-mini",
+            history = emptyList(),
+            userPrompt = "Проверь",
+            attachments = attachments
+        )
+        val msgContent = openAiPayload.getJSONArray("messages").getJSONObject(0).getJSONArray("content")
+        assertEquals(2, msgContent.length())
+        assertTrue(msgContent.getJSONObject(0).getString("text").contains("Sample log line"))
+        assertEquals("image_url", msgContent.getJSONObject(1).getString("type"))
     }
 }

@@ -1,8 +1,14 @@
 package com.enamind.ai.core
 
 import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
 import android.util.Log
 import com.enamind.ai.ai.AiStudioClient
+import com.enamind.ai.bot.BotFloatingOverlayManager
+import com.enamind.ai.bot.BotForegroundService
+import com.enamind.ai.bot.BotVaultStore
+import com.enamind.ai.bot.TradeBotEngine
 import com.enamind.ai.bybit.BinanceWs
 import com.enamind.ai.bybit.BookState
 import com.enamind.ai.bybit.BybitRest
@@ -32,10 +38,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Base64
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
@@ -54,6 +61,7 @@ class AppState(
     val contractCatalog = ContractCatalogRepo(ctx, settings)
     val majorCalendar = MajorCalendarRepo(ctx, settings)
     val orderFlow = OrderFlowIntelligenceOrchestrator(ctx)
+    val botVault = BotVaultStore(ctx)
 
     private val _favoriteSymbols = MutableStateFlow(settings.favoriteSymbols)
     val favoriteSymbols: StateFlow<Set<String>> = _favoriteSymbols
@@ -158,6 +166,40 @@ class AppState(
     // ---------------- NEURAL ENGINE ----------------
     val engine: NeuralEngine by lazy { NeuralEngine(ctx, this) }
 
+    // ---------------- TRADE BOT + FLOATING HUD ----------------
+    val botOverlayManager: BotFloatingOverlayManager by lazy {
+        BotFloatingOverlayManager(ctx) {
+            botEngine.stopAndCloseMarket("Остановлен из плавающего HUD")
+        }
+    }
+
+    val botEngine: TradeBotEngine by lazy {
+        TradeBotEngine(
+            vaultStore = botVault,
+            contractCatalog = contractCatalog,
+            reportProvider = { orderFlow.report.value },
+            marketProvider = { _market.value },
+            quantAdxErProvider = {
+                val q = engine.intelligence.value?.quant
+                q?.adx to q?.efficiencyRatio
+            },
+            clockSync = engine.clockSync,
+            onServiceStateChanged = { shouldRun ->
+                if (shouldRun) BotForegroundService.start(ctx) else BotForegroundService.stop(ctx)
+            },
+            onNotify = { notif ->
+                BotForegroundService.postHighPriorityAlert(ctx, notif.title, notif.body)
+            }
+        )
+    }
+
+    fun selectBotSymbol(sym: String) {
+        val clean = sym.trim().uppercase()
+        if (clean.isBlank()) return
+        botEngine.updateConfig { it.copy(symbol = clean) }
+        changeSymbol(clean)
+    }
+
     // ---------------- ГЛУБОКИЙ АНАЛИЗ A→Б ----------------
     data class ChainNodeUi(
         val name: String, val status: String,
@@ -187,6 +229,7 @@ class AppState(
         val id: Long,
         val fromUser: Boolean,
         val text: String,
+        val attachmentLabels: List<String> = emptyList(),
         val modelId: String = "",
         val latencyMs: Long = 0L,
         val error: Boolean = false,
@@ -205,7 +248,7 @@ class AppState(
                 modelId = activeAiModelId(),
                 text = "Это изолированный свободный ИИ-чат ENA (Google AI Studio + OpenAI-совместимые ключи).\n" +
                     "Он НЕ вмешивается в расчёты рынка, Order Flow и ботов ENA.\n\n" +
-                    "Настройте ключ в Настройках → API и задавайте любые вопросы."
+                    "Настройте ключ в Настройках → API и задавайте любые вопросы или прикрепляйте фото и файлы."
             )
         )
     )
@@ -214,9 +257,108 @@ class AppState(
     private val _aiChatBusy = MutableStateFlow(false)
     val aiChatBusy: StateFlow<Boolean> = _aiChatBusy
 
-    fun sendAiChatMessage(prompt: String) {
+    suspend fun loadChatAttachment(uri: Uri): AiStudioClient.ChatAttachment? = withContext(Dispatchers.IO) {
+        runCatching {
+            val cr = ctx.contentResolver
+            var displayName = "attachment"
+            var reportedSize = -1L
+            cr.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                    if (nameIdx >= 0) displayName = c.getString(nameIdx) ?: displayName
+                    if (sizeIdx >= 0 && !c.isNull(sizeIdx)) reportedSize = c.getLong(sizeIdx)
+                }
+            }
+            val rawMime = cr.getType(uri).orEmpty().ifBlank { guessMimeFromName(displayName) }
+            val isImage = rawMime.startsWith("image/", ignoreCase = true)
+            val isPdf = rawMime.equals("application/pdf", ignoreCase = true)
+            val maxBytes = when {
+                isPdf -> 4L * 1024L * 1024L
+                isImage -> 2_500_000L
+                else -> 512_000L
+            }
+            if (reportedSize > maxBytes) {
+                toast("Файл $displayName слишком большой (лимит ${maxBytes / 1024} КБ)")
+                return@withContext null
+            }
+            val bytes = cr.openInputStream(uri)?.use { input ->
+                val out = java.io.ByteArrayOutputStream()
+                val buf = ByteArray(8192)
+                var total = 0L
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    total += n
+                    if (total > maxBytes) {
+                        toast("Файл $displayName превышает лимит ${maxBytes / 1024} КБ")
+                        return@withContext null
+                    }
+                    out.write(buf, 0, n)
+                }
+                out.toByteArray()
+            } ?: return@withContext null
+
+            if (bytes.isEmpty()) return@withContext null
+
+            if (isImage) {
+                AiStudioClient.ChatAttachment(
+                    id = UUID.randomUUID().toString(),
+                    displayName = displayName,
+                    mimeType = rawMime,
+                    sizeBytes = bytes.size.toLong(),
+                    isImage = true,
+                    base64Data = Base64.getEncoder().encodeToString(bytes),
+                    textPreview = null
+                )
+            } else if (isPdf) {
+                AiStudioClient.ChatAttachment(
+                    id = UUID.randomUUID().toString(),
+                    displayName = displayName,
+                    mimeType = "application/pdf",
+                    sizeBytes = bytes.size.toLong(),
+                    isImage = false,
+                    base64Data = Base64.getEncoder().encodeToString(bytes),
+                    textPreview = null
+                )
+            } else {
+                val decoded = String(bytes, Charsets.UTF_8)
+                val preview = if (decoded.length > 24_000) {
+                    decoded.take(24_000) + "\n… [обрезано до 24000 символов]"
+                } else {
+                    decoded
+                }
+                AiStudioClient.ChatAttachment(
+                    id = UUID.randomUUID().toString(),
+                    displayName = displayName,
+                    mimeType = rawMime.ifBlank { "text/plain" },
+                    sizeBytes = bytes.size.toLong(),
+                    isImage = false,
+                    base64Data = null,
+                    textPreview = preview
+                )
+            }
+        }.onFailure {
+            toast("Не удалось прочитать файл: ${it.message}")
+        }.getOrNull()
+    }
+
+    private fun guessMimeFromName(name: String): String {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return when (ext) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "webp" -> "image/webp"
+            "pdf" -> "application/pdf"
+            "json" -> "application/json"
+            "csv" -> "text/csv"
+            else -> "text/plain"
+        }
+    }
+
+    fun sendAiChatMessage(prompt: String, attachments: List<AiStudioClient.ChatAttachment> = emptyList()) {
         val clean = prompt.trim()
-        if (clean.isEmpty() || _aiChatBusy.value) return
+        if ((clean.isEmpty() && attachments.isEmpty()) || _aiChatBusy.value) return
         val provider = settings.aiProvider
         val activeModel = activeAiModelId()
         val apiKey = settings.aiStudioApiKey
@@ -230,8 +372,11 @@ class AppState(
 
         val userId = nextChatMsgId()
         val replyId = nextChatMsgId()
+        val displayUserText = clean.ifBlank { "Проанализируй приложенные файлы." }
+        val attLabels = attachments.map { it.displayName }
+
         _aiChatMessages.value = (_aiChatMessages.value + listOf(
-            AiChatMessage(id = userId, fromUser = true, text = clean),
+            AiChatMessage(id = userId, fromUser = true, text = displayUserText, attachmentLabels = attLabels),
             AiChatMessage(id = replyId, fromUser = false, text = "Думаю ($activeModel)…", modelId = activeModel, busy = true)
         )).takeLast(100)
         _aiChatBusy.value = true
@@ -241,7 +386,8 @@ class AppState(
                 apiKey = apiKey,
                 modelId = activeModel,
                 history = historySnapshot,
-                userPrompt = clean,
+                userPrompt = displayUserText,
+                attachments = attachments,
                 provider = provider,
                 openAiBaseUrl = openAiBaseUrl,
                 openAiKey = openAiKey,
@@ -290,6 +436,12 @@ class AppState(
         appScope.launch { calendarAutoLoop() }
         appScope.launch { verifyOldForecasts() }
         appScope.launch { feedStatusLoop() }
+        appScope.launch {
+            StorageGuard.pruneBotCaches(ctx)
+            botEngine.uiState.collect { st ->
+                botOverlayManager.updateState(st)
+            }
+        }
         engine.start()
     }
 
@@ -686,7 +838,7 @@ class AppState(
 
     private suspend fun fetchFng() = withContext(Dispatchers.IO) {
         try {
-            val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).build()
+            val http = NetworkHub.restClient(connectTimeoutSec = 8L, readTimeoutSec = 10L)
             val req = Request.Builder().url("https://api.alternative.me/fng/?limit=7").build()
             http.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@withContext
@@ -936,10 +1088,10 @@ class AppState(
                 withContext(Dispatchers.IO) {
                     val t0 = System.currentTimeMillis()
                     try {
-                        val http = OkHttpClient.Builder()
-                            .connectTimeout(timeoutSec, TimeUnit.SECONDS)
-                            .readTimeout(timeoutSec, TimeUnit.SECONDS)
-                            .build()
+                        val http = NetworkHub.restClient(
+                            connectTimeoutSec = timeoutSec,
+                            readTimeoutSec = timeoutSec
+                        )
                         http.newCall(Request.Builder().url(url).build()).execute().use { r ->
                             val ms = System.currentTimeMillis() - t0
                             when {

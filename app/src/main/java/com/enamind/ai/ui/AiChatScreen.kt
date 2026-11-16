@@ -1,6 +1,10 @@
 package com.enamind.ai.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,34 +23,43 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.InputChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -54,22 +67,23 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.enamind.ai.ai.AiStudioClient
 import com.enamind.ai.core.AppState
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
- * Изолированный свободный ИИ-чат Google AI Studio (ТЗ п.5).
+ * Изолированный свободный ИИ-чат Google AI Studio + OpenAI-совместимые провайдеры.
  *
- * НЕ имеет доступа к NeuralEngine, TrendReasoningEngine, PythonBridge или памяти прогнозов,
- * поэтому собеседник не может исказить квантовые расчёты и торговые метрики ENA.
+ * НЕ имеет доступа к NeuralEngine, TrendReasoningEngine, Order Flow или ботам ENA.
+ * Поддерживает чистый текстовый ввод и прикрепление фото/файлов для мультимодальных моделей.
  */
 @Composable
 fun AiChatScreen(
@@ -83,8 +97,47 @@ fun AiChatScreen(
     val activeModel = if (isOpenAi) state.settings.aiOpenAiModel else state.settings.aiStudioModel
     val providerTitle = if (isOpenAi) "OpenAI API" else "Google AI Studio"
     var inputText by remember { mutableStateOf("") }
+    var attachMenuOpen by remember { mutableStateOf(false) }
+    val pendingAttachments = remember { mutableStateListOf<AiStudioClient.ChatAttachment>() }
     val listState = rememberLazyListState()
     val clipboard = LocalClipboardManager.current
+    val uiScope = rememberCoroutineScope()
+    val amberText = enaAmberText()
+    val greenText = enaGreenText()
+
+    val pickImageLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            uiScope.launch {
+                val att = state.loadChatAttachment(uri)
+                if (att != null) {
+                    if (pendingAttachments.size >= 5) {
+                        state.toast("Максимум 5 вложений в одном сообщении")
+                    } else {
+                        pendingAttachments.add(att)
+                    }
+                }
+            }
+        }
+    }
+
+    val pickDocLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            uiScope.launch {
+                val att = state.loadChatAttachment(uri)
+                if (att != null) {
+                    if (pendingAttachments.size >= 5) {
+                        state.toast("Максимум 5 вложений в одном сообщении")
+                    } else {
+                        pendingAttachments.add(att)
+                    }
+                }
+            }
+        }
+    }
 
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
@@ -92,12 +145,23 @@ fun AiChatScreen(
         }
     }
 
+    fun submitMessage() {
+        val txt = inputText.trim()
+        if ((txt.isNotEmpty() || pendingAttachments.isNotEmpty()) && !busy) {
+            val atts = pendingAttachments.toList()
+            inputText = ""
+            pendingAttachments.clear()
+            state.sendAiChatMessage(txt, atts)
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .imePadding()
+            .testTag("ai_chat_screen")
     ) {
-        // Верхняя панель статуса ИИ-чата (изоляция + провайдер + модель + быстрый вход в настройки)
+        // Верхняя панель статуса ИИ-чата
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -130,7 +194,7 @@ fun AiChatScreen(
                         text = "$activeModel · ${if (hasKey) "ключ задан" else "ключ не задан"} · изолирован от движка",
                         style = MaterialTheme.typography.bodySmall,
                         fontSize = 10.5.sp,
-                        color = if (hasKey) Color.EnaGreen else Color.EnaYellow,
+                        color = if (hasKey) greenText else amberText,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -168,8 +232,8 @@ fun AiChatScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 2.dp),
                 shape = RoundedCornerShape(14.dp),
-                color = Color.EnaYellow.copy(alpha = 0.11f),
-                border = BorderStroke(0.8.dp, Color.EnaYellow.copy(alpha = 0.42f))
+                color = amberText.copy(alpha = 0.11f),
+                border = BorderStroke(0.8.dp, amberText.copy(alpha = 0.42f))
             ) {
                 Row(
                     modifier = Modifier
@@ -197,106 +261,186 @@ fun AiChatScreen(
             }
         }
 
-        SelectionContainer(
+        // Лента сообщений: weight(1f) без внешнего SelectionContainer, чтобы панель ввода никогда не выдавливалась
+        LazyColumn(
+            state = listState,
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f)
+                .weight(1f),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                items(messages, key = { it.id }) { m ->
-                    AiMessageBubble(
-                        m = m,
-                        onCopy = {
-                            clipboard.setText(AnnotatedString(m.text))
-                            state.toast("Скопировано")
-                        }
-                    )
-                }
+            items(messages, key = { it.id }) { m ->
+                AiMessageBubble(
+                    m = m,
+                    onCopy = {
+                        clipboard.setText(AnnotatedString(m.text))
+                        state.toast("Скопировано")
+                    }
+                )
             }
         }
 
-        // Поле ввода и отправка
+        // Поле ввода, прикрепление фото/файлов и отправка
         Surface(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("ai_chat_input_bar"),
             color = MaterialTheme.colorScheme.surface,
             border = BorderStroke(0.75.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
         ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value = inputText,
-                    onValueChange = { inputText = it },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("ai_chat_input"),
-                    placeholder = {
-                        Text(
-                            "Свободный вопрос ИИ…",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
-                        )
-                    },
-                    singleLine = false,
-                    maxLines = 4,
-                    shape = RoundedCornerShape(20.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                        unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant,
-                        focusedContainerColor = MaterialTheme.colorScheme.background,
-                        unfocusedContainerColor = MaterialTheme.colorScheme.background
-                    ),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                    keyboardActions = KeyboardActions(
-                        onSend = {
-                            val txt = inputText.trim()
-                            if (txt.isNotEmpty() && !busy) {
-                                inputText = ""
-                                state.sendAiChatMessage(txt)
-                            }
+            Column(modifier = Modifier.fillMaxWidth()) {
+                if (pendingAttachments.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 12.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        pendingAttachments.forEach { att ->
+                            InputChip(
+                                selected = true,
+                                onClick = { pendingAttachments.removeAll { it.id == att.id } },
+                                label = {
+                                    Text(
+                                        att.displayName,
+                                        fontSize = 11.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.widthIn(max = 150.dp)
+                                    )
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = if (att.isImage) Icons.Outlined.Image else Icons.Outlined.Description,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                },
+                                trailingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Close,
+                                        contentDescription = "Удалить вложение",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            )
                         }
-                    )
-                )
-                Spacer(Modifier.width(8.dp))
-                IconButton(
-                    onClick = {
-                        val txt = inputText.trim()
-                        if (txt.isNotEmpty() && !busy) {
-                            inputText = ""
-                            state.sendAiChatMessage(txt)
-                        }
-                    },
-                    enabled = inputText.isNotBlank() && !busy,
+                    }
+                }
+
+                Row(
                     modifier = Modifier
-                        .size(48.dp)
-                        .testTag("ai_chat_send"),
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = MaterialTheme.colorScheme.primary,
-                        contentColor = MaterialTheme.colorScheme.onPrimary,
-                        disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
-                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (busy) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            strokeWidth = 2.dp,
-                            color = MaterialTheme.colorScheme.primary
+                    Box {
+                        IconButton(
+                            onClick = { attachMenuOpen = true },
+                            enabled = !busy,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("ai_chat_attach")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.AttachFile,
+                                contentDescription = "Прикрепить фото или файл",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        DropdownMenu(
+                            expanded = attachMenuOpen,
+                            onDismissRequest = { attachMenuOpen = false }
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Фото / скриншот") },
+                                leadingIcon = {
+                                    Icon(Icons.Outlined.Image, contentDescription = null)
+                                },
+                                onClick = {
+                                    attachMenuOpen = false
+                                    pickImageLauncher.launch(
+                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                    )
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Файл (TXT, JSON, CSV, код, PDF)") },
+                                leadingIcon = {
+                                    Icon(Icons.Outlined.Description, contentDescription = null)
+                                },
+                                onClick = {
+                                    attachMenuOpen = false
+                                    pickDocLauncher.launch(
+                                        arrayOf(
+                                            "text/*",
+                                            "application/json",
+                                            "application/pdf",
+                                            "text/csv",
+                                            "*/*"
+                                        )
+                                    )
+                                }
+                            )
+                        }
+                    }
+
+                    OutlinedTextField(
+                        value = inputText,
+                        onValueChange = { inputText = it },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("ai_chat_input"),
+                        placeholder = {
+                            Text(
+                                "Сообщение для ИИ…",
+                                fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f)
+                            )
+                        },
+                        singleLine = false,
+                        maxLines = 4,
+                        shape = RoundedCornerShape(20.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant,
+                            focusedContainerColor = MaterialTheme.colorScheme.background,
+                            unfocusedContainerColor = MaterialTheme.colorScheme.background
+                        ),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                        keyboardActions = KeyboardActions(onSend = { submitMessage() })
+                    )
+
+                    Spacer(Modifier.width(6.dp))
+
+                    IconButton(
+                        onClick = { submitMessage() },
+                        enabled = (inputText.isNotBlank() || pendingAttachments.isNotEmpty()) && !busy,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("ai_chat_send"),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                            disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                    } else {
-                        Icon(
-                            Icons.AutoMirrored.Filled.Send,
-                            contentDescription = "Отправить в ИИ-чат",
-                            modifier = Modifier.size(20.dp)
-                        )
+                    ) {
+                        if (busy) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        } else {
+                            Icon(
+                                Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Отправить в ИИ-чат",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -347,6 +491,40 @@ private fun AiMessageBubble(
                     )
                     Spacer(Modifier.height(4.dp))
                 }
+                if (m.attachmentLabels.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .horizontalScroll(rememberScrollState())
+                            .padding(bottom = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        m.attachmentLabels.forEach { lbl ->
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                                border = BorderStroke(0.6.dp, MaterialTheme.colorScheme.outlineVariant)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.AttachFile,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(12.dp),
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(
+                                        lbl,
+                                        fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
                 if (m.busy) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(
@@ -362,13 +540,15 @@ private fun AiMessageBubble(
                         )
                     }
                 } else {
-                    Text(
-                        text = m.text,
-                        fontSize = 13.sp,
-                        lineHeight = 18.sp,
-                        color = if (m.fromUser) MaterialTheme.colorScheme.onPrimaryContainer
-                        else MaterialTheme.colorScheme.onSurface
-                    )
+                    SelectionContainer {
+                        Text(
+                            text = m.text,
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp,
+                            color = if (m.fromUser) MaterialTheme.colorScheme.onPrimaryContainer
+                            else MaterialTheme.colorScheme.onSurface
+                        )
+                    }
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),

@@ -3,6 +3,7 @@ package com.enamind.ai.bybit
 import android.util.Log
 import com.enamind.ai.core.FaultMonitor
 import com.enamind.ai.core.FeedStatus
+import com.enamind.ai.core.NetworkHub
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -10,7 +11,10 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 
 /**
@@ -58,15 +62,13 @@ class BybitWs(
         val close: Double, val volume: Double, val confirm: Boolean
     )
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
-        .build()
+    private val client: OkHttpClient = NetworkHub.wsClient(pingIntervalSec = 20L, connectTimeoutSec = 10L)
 
-    private var ws: WebSocket? = null
-    private var closedByUser = false
-    private var reconnectDelayMs = 1000L
+    @Volatile private var ws: WebSocket? = null
+    @Volatile private var closedByUser = false
+    @Volatile private var reconnectDelayMs = 1000L
+    private val generation = AtomicLong(0L)
+    @Volatile private var pendingReconnect: ScheduledFuture<*>? = null
 
     val feedTracker = FeedStatus.Tracker(
         setOf(
@@ -79,14 +81,24 @@ class BybitWs(
     companion object {
         const val URL = "wss://stream.bybit.com/v5/public/linear"
         private const val TAG = "BybitWs"
+        private val reconnectExec = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "BybitWs-Reconnect").apply { isDaemon = true }
+        }
     }
 
     fun connect() {
+        pendingReconnect?.cancel(false)
+        pendingReconnect = null
         closedByUser = false
+        val gen = generation.incrementAndGet()
         feedTracker.onConnecting()
         val req = Request.Builder().url(URL).build()
         ws = client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (gen != generation.get() || closedByUser) {
+                    webSocket.close(1000, "stale")
+                    return
+                }
                 reconnectDelayMs = 1000L
                 Log.i(TAG, "WS open $symbol")
                 feedTracker.onOpen()
@@ -102,10 +114,11 @@ class BybitWs(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                handle(text)
+                if (gen == generation.get() && !closedByUser) handle(text)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (gen != generation.get() || closedByUser) return
                 Log.w(TAG, "WS fail: ${t.message}")
                 feedTracker.onFailure(t.message)
                 FaultMonitor.recordFault(
@@ -116,34 +129,35 @@ class BybitWs(
                     recovery = "Авто-переподключение и резервный поток Binance/OKX"
                 )
                 listener.onStatus(false, t.message ?: "ошибка сети")
-                scheduleReconnect()
+                scheduleReconnect(gen)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (gen != generation.get()) return
                 feedTracker.onClosed(reason)
                 listener.onStatus(false, "закрыто: $reason")
-                if (!closedByUser) scheduleReconnect()
+                if (!closedByUser) scheduleReconnect(gen)
             }
         })
     }
 
     fun close() {
         closedByUser = true
+        generation.incrementAndGet()
+        pendingReconnect?.cancel(false)
+        pendingReconnect = null
         ws?.close(1000, "bye")
         ws = null
     }
 
-    private fun scheduleReconnect() {
-        if (closedByUser) return
+    private fun scheduleReconnect(gen: Long) {
+        if (closedByUser || gen != generation.get()) return
         val d = reconnectDelayMs
         reconnectDelayMs = (reconnectDelayMs * 2).coerceAtMost(15000L)
-        Thread {
-            try {
-                Thread.sleep(d)
-                if (!closedByUser) connect()
-            } catch (_: InterruptedException) {
-            }
-        }.apply { isDaemon = true }.start()
+        pendingReconnect?.cancel(false)
+        pendingReconnect = reconnectExec.schedule({
+            if (!closedByUser && gen == generation.get()) connect()
+        }, d, TimeUnit.MILLISECONDS)
     }
 
     private fun computeLagMs(exchangeTsMs: Long): Long {

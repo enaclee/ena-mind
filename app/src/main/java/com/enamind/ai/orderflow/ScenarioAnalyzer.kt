@@ -2,17 +2,21 @@ package com.enamind.ai.orderflow
 
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.sign
 
 /**
  * Построение конкурирующих сценариев A (возможный разворот) и B (возможный пробой),
  * понятного текстового объяснения ENA на русском языке, калиброванной оценки достоверности
  * и аналитического сигнала Dynamic Market Glow.
  *
- * Жёсткие ограничения:
- *  - НЕ выдаёт гарантированных прогнозов и автоматических BUY/SELL сигналов;
- *  - НЕ включает зелёный/красный свет по одному изолированному показателю;
- *  - При нехватке/рассинхроне данных переводит Glow в нейтральный режим и сообщает об этом;
- *  - НЕ путает обнаруженное поглощение с уже подтверждённым разворотом.
+ * Исправления анти-шума и консенсуса:
+ *  - Корректная полярность AbsorptionSide:
+ *      * SELLER_ABSORPTION = продавцы удерживают сопротивление (поглощают покупателей);
+ *      * BUYER_ABSORPTION = покупатели удерживают поддержку (поглощают продавцов).
+ *  - Согласование с ядром Радара (quantAdx / quantEfficiencyRatio) и наклоном свечи:
+ *    при противоречии свечи, Радара и потока (или сильном расхождении Delta vs OFI)
+ *    выставляется MarketDominance.CONFLICT и Glow переходит в нейтральный режим.
+ *  - Предупреждение о раздувании котировок (CTR churnInflationRatio >= 10x).
  */
 object ScenarioAnalyzer {
 
@@ -34,7 +38,10 @@ object ScenarioAnalyzer {
         dom: DomSnapshotMetrics,
         absorption: AbsorptionMetrics,
         attack: LevelAttackState,
-        vaultStats: OrderFlowEventVault.EmpiricalStats
+        vaultStats: OrderFlowEventVault.EmpiricalStats,
+        quantAdx: Double? = null,
+        quantEfficiencyRatio: Double? = null,
+        candleChangePct: Double? = null
     ): SynthesisResult {
         if (freshness == DataFreshness.INSUFFICIENT || freshness == DataFreshness.DESYNC || !footprint.sufficientData || !dom.sufficientData) {
             val reason = when (freshness) {
@@ -61,7 +68,8 @@ object ScenarioAnalyzer {
                     strength = 0f,
                     speedFactor = 0.45f,
                     independentFactors = 0,
-                    reason = reason
+                    reason = reason,
+                    conflictDetected = false
                 ),
                 councilPayload = OrderFlowCouncilPayload(
                     detectedEvent = "INSUFFICIENT_DATA",
@@ -79,26 +87,36 @@ object ScenarioAnalyzer {
             )
         }
 
-        // 1. Определение доминирования
+        val conflictInfo = detectConflict(
+            fp = footprint,
+            dom = dom,
+            quantAdx = quantAdx,
+            quantEfficiencyRatio = quantEfficiencyRatio,
+            candleChangePct = candleChangePct
+        )
+
+        // 1. Определение доминирования с учётом конфликта свечи/Радара/потока
         val dominance = when {
-            attack.phase == LevelAttackPhase.CONFIRMED_BREAKOUT -> MarketDominance.CONFIRMED_BREAKOUT
+            attack.phase == LevelAttackPhase.CONFIRMED_BREAKOUT && !conflictInfo.hardConflict -> MarketDominance.CONFIRMED_BREAKOUT
             attack.phase == LevelAttackPhase.CONFIRMED_REJECTION -> MarketDominance.CONFIRMED_REJECTION
             absorption.detected -> MarketDominance.POSSIBLE_ABSORPTION
+            conflictInfo.hardConflict -> MarketDominance.CONFLICT
             footprint.deltaPct >= 14.0 && dom.normalizedOfi >= 0.15 -> MarketDominance.BUYERS_DOMINATE
             footprint.deltaPct <= -14.0 && dom.normalizedOfi <= -0.15 -> MarketDominance.SELLERS_DOMINATE
             else -> MarketDominance.CONTESTED
         }
 
-        // 2. Построение двух сценариев одновременно (A — разворот, B — пробой)
+        // 2. Построение конкурирующих сценариев A (разворот) и B (пробой)
         val levelTxt = attack.levelPrice?.let { fmtPx(it) } ?: footprint.pocPrice?.let { fmtPx(it) } ?: "текущий узел"
         val isRes = attack.isResistance
 
         val scenarioA = buildReversalScenario(isRes, levelTxt, footprint, dom, absorption, attack)
         val scenarioB = buildBreakoutScenario(isRes, levelTxt, footprint, dom, absorption, attack)
 
-        // 3. Оценка достоверности (без произвольных процентов!)
+        // 3. Оценка достоверности
         val alignedCount = countAlignedMetrics(footprint, dom, absorption, attack)
         val grade = when {
+            conflictInfo.hardConflict -> ReliabilityGrade.WEAK
             attack.phase == LevelAttackPhase.CONFIRMED_BREAKOUT ||
                 attack.phase == LevelAttackPhase.CONFIRMED_REJECTION ||
                 absorption.confirmed -> ReliabilityGrade.CONFIRMED
@@ -107,7 +125,6 @@ object ScenarioAnalyzer {
             else -> ReliabilityGrade.WEAK
         }
 
-        // Вероятности показываются ТОЛЬКО если есть достаточная историческая выборка в OrderFlowEventVault
         val hasCalibratedHistory = vaultStats.verifiedEvents >= 8
         val absProb = if (hasCalibratedHistory) vaultStats.absorptionConfirmationRatePct else null
         val revProb = if (hasCalibratedHistory) vaultStats.reversalRatePct else null
@@ -122,6 +139,9 @@ object ScenarioAnalyzer {
             "Вероятности откалибруются автоматически после накопления ≥8 проверенных событий (сейчас ${vaultStats.verifiedEvents})."
         }
 
+        val noiseNote = if (dom.churnInflationRatio >= 10.0) {
+            " · CTR ${fmtD(dom.churnInflationRatio)}x"
+        } else ""
         val confidence = ConfidenceAssessment(
             grade = grade,
             alignedFactorsCount = alignedCount,
@@ -129,11 +149,11 @@ object ScenarioAnalyzer {
             calibratedReversalProbPct = revProb,
             calibratedBreakoutProbPct = brkProb,
             historicalSampleSize = vaultStats.verifiedEvents,
-            dataQualityNote = "Согласовано независимых признаков: $alignedCount · задержка стакана ${if (dom.lagMs >= 0) "${dom.lagMs} мс" else "локально"}",
+            dataQualityNote = "Согласовано признаков: $alignedCount · задержка ${if (dom.lagMs >= 0) "${dom.lagMs} мс" else "лок."}$noiseNote",
             historicalInsight = histInsight
         )
 
-        // 4. Человеческое объяснение ENA (отвечает на 7 ключевых вопросов раздела 1 ТЗ)
+        // 4. Человеческое объяснение ENA
         val explanation = buildHumanExplanation(
             symbol = symbol,
             price = price,
@@ -143,14 +163,28 @@ object ScenarioAnalyzer {
             fp = footprint,
             dom = dom,
             absM = absorption,
-            atk = attack
+            atk = attack,
+            conflictNote = conflictInfo.reason
         )
 
-        // 5. Dynamic Market Glow (многофакторный расчёт без единичных ложных срабатываний)
-        val glow = computeGlowSignal(freshness, footprint, dom, absorption, attack)
+        // 5. Dynamic Market Glow (многофакторный консенсус без фликеров при конфликте)
+        val glow = computeGlowSignal(
+            freshness = freshness,
+            fp = footprint,
+            dom = dom,
+            absM = absorption,
+            atk = attack,
+            quantAdx = quantAdx,
+            quantEfficiencyRatio = quantEfficiencyRatio,
+            candleChangePct = candleChangePct
+        )
 
-        // 6. Пакет для Neural Council (с жёстким ограничением влияния на вес [-0.25 .. +0.25])
-        val rawBiasWeight = computeCouncilWeight(dominance, footprint, dom, absorption, attack)
+        // 6. Пакет для Neural Council (жёстко [-0.25 .. +0.25])
+        val rawBiasWeight = if (conflictInfo.hardConflict) {
+            0.0
+        } else {
+            computeCouncilWeight(dominance, footprint, dom, absorption, attack)
+        }
         val payload = OrderFlowCouncilPayload(
             detectedEvent = "${dominance.name} / ${attack.phase.name}",
             levelPrice = attack.levelPrice,
@@ -158,7 +192,7 @@ object ScenarioAnalyzer {
             supportingEvidence = absorption.supportingFactors.ifEmpty {
                 listOf("Delta ${fmtPct(footprint.deltaPct)}", "OFI ${fmtD(dom.normalizedOfi)}", "Исп. ${fmtCompact(dom.executedQty)}")
             },
-            contradictingEvidence = absorption.conflictingFactors,
+            contradictingEvidence = (absorption.conflictingFactors + listOfNotNull(conflictInfo.reason)).distinct(),
             dataQuality = "${freshness.labelRu} (${footprint.tradesAnalyzed} сделок / ${dom.deltaSequenceCount} дельт)",
             historicalReversalRatePct = vaultStats.reversalRatePct,
             historicalBreakoutRatePct = vaultStats.breakoutRatePct,
@@ -176,6 +210,52 @@ object ScenarioAnalyzer {
             glow = glow,
             councilPayload = payload
         )
+    }
+
+    private data class ConflictAssessment(val hardConflict: Boolean, val reason: String?)
+
+    private fun detectConflict(
+        fp: FootprintSummary,
+        dom: DomSnapshotMetrics,
+        quantAdx: Double?,
+        quantEfficiencyRatio: Double?,
+        candleChangePct: Double?
+    ): ConflictAssessment {
+        // 1. Delta против нормированного MLOFI стакана
+        val deltaVsOfi = abs(fp.deltaPct) >= 10.0 &&
+            abs(dom.normalizedOfi) >= 0.16 &&
+            sign(fp.deltaPct) != sign(dom.normalizedOfi)
+        if (deltaVsOfi) {
+            return ConflictAssessment(
+                hardConflict = true,
+                reason = "Расхождение ленты и стакана: Delta ${fmtPct(fp.deltaPct)} против OFI ${fmtD(dom.normalizedOfi)}"
+            )
+        }
+
+        // 2. Свеча двигается против CVD и агрессивной дельты
+        if (candleChangePct != null && candleChangePct.isFinite() && abs(candleChangePct) >= 0.10 && abs(fp.deltaPct) >= 12.0) {
+            val candleVsFlow = (candleChangePct > 0.10 && fp.deltaPct <= -12.0 && fp.cvdSlope <= 0.0) ||
+                (candleChangePct < -0.10 && fp.deltaPct >= 12.0 && fp.cvdSlope >= 0.0)
+            if (candleVsFlow) {
+                return ConflictAssessment(
+                    hardConflict = true,
+                    reason = "Конфликт свечи (${fmtPct(candleChangePct)}) и кумулятивного потока (Delta ${fmtPct(fp.deltaPct)})"
+                )
+            }
+        }
+
+        // 3. Ядро Радара фиксирует плоский флет (ADX < 18 && ER < 0.20)
+        val radarFlat = quantAdx != null && quantEfficiencyRatio != null &&
+            quantAdx.isFinite() && quantEfficiencyRatio.isFinite() &&
+            quantAdx < 18.0 && quantEfficiencyRatio < 0.20
+        if (radarFlat && abs(fp.deltaPct) >= 12.0 && abs(dom.normalizedOfi) < 0.25) {
+            return ConflictAssessment(
+                hardConflict = true,
+                reason = "Флет по Радару (ADX ${fmtD(quantAdx ?: 0.0)}, ER ${fmtD(quantEfficiencyRatio ?: 0.0)}) — всплеск потока отфильтрован"
+            )
+        }
+
+        return ConflictAssessment(false, null)
     }
 
     private fun buildReversalScenario(
@@ -197,8 +277,10 @@ object ScenarioAnalyzer {
         val invalid = mutableListOf<String>()
 
         if (isResistance) {
-            if (fp.netDelta > 0) pro += "Покупатели активно бьют по рынку (Delta ${fmtPct(fp.deltaPct)}), создавая повышенный оборот у уровня"
-            if (absM.side == AbsorptionSide.BUYER_ABSORPTION && absM.detected) pro += "Выявлены признаки поглощения покупок (эффективность хода ${fmtD(absM.priceProgressEfficiency)})"
+            if (fp.netDelta > 0) pro += "Покупатели активно бьют по рынку (Delta ${fmtPct(fp.deltaPct)}), создавая высокий оборот у уровня"
+            if (absM.side == AbsorptionSide.SELLER_ABSORPTION && absM.detected) {
+                pro += "Продавцы поглощают покупки на сопротивлении (эффективность хода ${fmtD(absM.priceProgressEfficiency)})"
+            }
             if (dom.replenishmentEvents >= 2) pro += "Ликвидность продавцов пополняется после исполнений (${dom.replenishmentEvents}x)"
             if (atk.attackProgressPct <= 0.1) pro += "Цена практически не продвигается вверх, несмотря на рыночный напор"
 
@@ -211,7 +293,9 @@ object ScenarioAnalyzer {
             invalid += "Закрепление свечи выше $levelTxt на снижающейся встречной ликвидности Ask"
         } else {
             if (fp.netDelta < 0) pro += "Продавцы давят рыночными ордерами (Delta ${fmtPct(fp.deltaPct)})"
-            if (absM.side == AbsorptionSide.SELLER_ABSORPTION && absM.detected) pro += "Выявлены признаки поглощения продаж покупателями"
+            if (absM.side == AbsorptionSide.BUYER_ABSORPTION && absM.detected) {
+                pro += "Покупатели поглощают продажи на поддержке (эффективность ${fmtD(absM.priceProgressEfficiency)})"
+            }
             if (dom.replenishmentEvents >= 2) pro += "Встречный спрос Bid восстанавливается после исполнений (${dom.replenishmentEvents}x)"
             if (atk.attackProgressPct >= -0.1) pro += "Давление вниз не даёт существенного снижения цены"
 
@@ -254,7 +338,9 @@ object ScenarioAnalyzer {
             if (dom.normalizedOfi > 0.15) pro += "OFI (${fmtD(dom.normalizedOfi)}) поддерживает движение вверх"
             if (atk.acceptedBeyondLevel) pro += "Цена начала закрепляться выше уровня"
 
-            if (absM.detected && absM.side == AbsorptionSide.BUYER_ABSORPTION) contra += "Обнаружено поглощение покупок (риск ложного пробоя)"
+            if (absM.detected && absM.side == AbsorptionSide.SELLER_ABSORPTION) {
+                contra += "Обнаружено поглощение покупателей продавцами (риск ложного пробоя)"
+            }
             if (dom.replenishmentEvents >= 2) contra += "Встречные Ask-заявки продолжают пополняться (${dom.replenishmentEvents}x)"
             if (absM.attackExhaustion >= 0.55) contra += "Сила повторных атак снижается"
 
@@ -267,7 +353,9 @@ object ScenarioAnalyzer {
             if (dom.normalizedOfi < -0.15) pro += "OFI (${fmtD(dom.normalizedOfi)}) указывает на давление вниз"
             if (atk.acceptedBeyondLevel) pro += "Цена удерживается ниже поддержки"
 
-            if (absM.detected && absM.side == AbsorptionSide.SELLER_ABSORPTION) contra += "Крупные продажи поглощаются покупателями на уровне"
+            if (absM.detected && absM.side == AbsorptionSide.BUYER_ABSORPTION) {
+                contra += "Крупные продажи поглощаются покупателями на поддержке"
+            }
             if (dom.replenishmentEvents >= 2) contra += "На Bid появляется повторное пополнение ликвидности (${dom.replenishmentEvents}x)"
             if (absM.attackExhaustion >= 0.55) contra += "Импульс продавцов теряет эффективность"
 
@@ -291,7 +379,8 @@ object ScenarioAnalyzer {
         fp: FootprintSummary,
         dom: DomSnapshotMetrics,
         absM: AbsorptionMetrics,
-        atk: LevelAttackState
+        atk: LevelAttackState,
+        conflictNote: String?
     ): String {
         val sideActive = when {
             fp.deltaPct >= 10.0 -> "покупатели"
@@ -303,8 +392,9 @@ object ScenarioAnalyzer {
         return buildString {
             when (dominance) {
                 MarketDominance.POSSIBLE_ABSORPTION -> {
-                    val attacker = if (absM.side == AbsorptionSide.BUYER_ABSORPTION) "Покупатели активно атакуют" else "Продавцы активно давят на"
-                    val defender = if (absM.side == AbsorptionSide.BUYER_ABSORPTION) "продавцов" else "покупателей"
+                    val buyersAttacking = absM.side == AbsorptionSide.SELLER_ABSORPTION
+                    val attacker = if (buyersAttacking) "Покупатели активно атакуют" else "Продавцы активно давят на"
+                    val defender = if (buyersAttacking) "продавцов" else "покупателей"
                     append("$attacker $levelWord ($symbol). За последние ${atk.touchCount.coerceAtLeast(1)} попытки агрессивный поток вырос (Delta ${fmtPct(fp.deltaPct)}), однако цена практически не продвинулась. ")
                     if (dom.replenishmentEvents >= 2) {
                         append("На уровне сохраняется и пополняется встречная ликвидность $defender (${dom.replenishmentEvents}x после сделок). ")
@@ -313,8 +403,8 @@ object ScenarioAnalyzer {
                     }
                     append("Обнаружены признаки возможного поглощения. Разворот пока НЕ подтверждён. ")
                     append(
-                        if (absM.side == AbsorptionSide.BUYER_ABSORPTION) {
-                            "Если покупательское давление ослабнет и цена уйдёт ниже $levelTxt, вероятность снижения может увеличиться; при доисполнении Ask возможен пробой вверх."
+                        if (buyersAttacking) {
+                            "Если покупательское давление ослабнет и цена уйдёт ниже $levelTxt, вероятность снижения увеличится; при доисполнении Ask возможен пробой вверх."
                         } else {
                             "Если давление продавцов ослабнет и цена закрепится выше $levelTxt, вероятен отскок вверх; при истощении Bid — пробой вниз."
                         }
@@ -327,7 +417,12 @@ object ScenarioAnalyzer {
                 }
 
                 MarketDominance.CONFIRMED_BREAKOUT -> {
-                    append("Пробой $levelWord ($symbol) получил подтверждение: ликвидность на уровне была исполнена (исп. ${fmtCompact(dom.executedQty)}), цена закрепилась за границей с поддержкой потока (Delta ${fmtPct(fp.deltaPct)}, OFI ${fmtD(dom.normalizedOfi)}).")
+                    append("Пробой $levelWord ($symbol) получил подтверждение: ликвидность на уровне исполнена (исп. ${fmtCompact(dom.executedQty)}), цена закрепилась за границей с поддержкой потока (Delta ${fmtPct(fp.deltaPct)}, OFI ${fmtD(dom.normalizedOfi)}).")
+                }
+
+                MarketDominance.CONFLICT -> {
+                    append("По $symbol зафиксирован конфликт сигналов: ${conflictNote ?: "лента и стакан расходятся"}. ")
+                    append("Свечение и агрессивные входы приглушены до разрешения противоречия.")
                 }
 
                 MarketDominance.BUYERS_DOMINATE -> {
@@ -342,21 +437,28 @@ object ScenarioAnalyzer {
                     append("По $symbol наблюдается борьба сторон ($sideActive, Delta ${fmtPct(fp.deltaPct)}, OFI ${fmtD(dom.normalizedOfi)}) рядом с $levelWord. Явного подтверждённого преимущества пока нет — ожидаем реакцию на уровень.")
                 }
             }
+
+            if (dom.churnInflationRatio >= 10.0) {
+                append(" Внимание: повышенный HFT-шум отмен (CTR ${fmtD(dom.churnInflationRatio)}x) — признаки фильтруются.")
+            }
         }
     }
 
     /**
      * Аналитическая логика Dynamic Market Glow:
-     *  - Зелёный: преимущество покупателей; Красный: преимущество продавцов; Нейтральный: неопределённость / сбой / один фактор.
-     *  - Яркость = число и согласованность независимых факторов (Delta, CVD, OFI, Footprint, Absorption, Level Attack/Breakout).
-     *  - Никогда не включает Зелёный/Красный на одном изолированном показателе; не путает возможное поглощение с уже подтверждённым разворотом.
+     *  - Зелёный: преимущество покупателей; Красный: преимущество продавцов; Нейтральный: неопределённость / конфликт / один фактор.
+     *  - Яркость = число и согласованность независимых факторов (Delta, CVD, MLOFI, Footprint, Level Attack/Breakout).
+     *  - При конфликте свечи/Радара и потока или CTR-раздувании без исполнений — жёстко уходит в NEUTRAL с conflictDetected=true.
      */
     internal fun computeGlowSignal(
         freshness: DataFreshness,
         fp: FootprintSummary,
         dom: DomSnapshotMetrics,
         absM: AbsorptionMetrics,
-        atk: LevelAttackState
+        atk: LevelAttackState,
+        quantAdx: Double? = null,
+        quantEfficiencyRatio: Double? = null,
+        candleChangePct: Double? = null
     ): GlowSignal {
         if (freshness == DataFreshness.INSUFFICIENT || freshness == DataFreshness.DESYNC ||
             freshness == DataFreshness.STALE || !fp.sufficientData || !dom.sufficientData
@@ -366,7 +468,20 @@ object ScenarioAnalyzer {
                 strength = 0f,
                 speedFactor = 0.45f,
                 independentFactors = 0,
-                reason = "Нейтральный режим: ${freshness.labelRu}"
+                reason = "Нейтральный режим: ${freshness.labelRu}",
+                conflictDetected = false
+            )
+        }
+
+        val conflict = detectConflict(fp, dom, quantAdx, quantEfficiencyRatio, candleChangePct)
+        if (conflict.hardConflict) {
+            return GlowSignal(
+                colorState = GlowColorState.NEUTRAL,
+                strength = 0.10f,
+                speedFactor = 0.5f,
+                independentFactors = 0,
+                reason = conflict.reason ?: "Конфликт свечи, Радара и потока — нейтральный режим",
+                conflictDetected = true
             )
         }
 
@@ -382,7 +497,7 @@ object ScenarioAnalyzer {
         if (fp.cvdSlope > 0 && fp.cvd > 0) { bullVotes++; intensitySum += 0.55 }
         else if (fp.cvdSlope < 0 && fp.cvd < 0) { bearVotes++; intensitySum += 0.55 }
 
-        // 3. DOM OFI
+        // 3. DOM MLOFI
         if (dom.normalizedOfi >= 0.16) { bullVotes++; intensitySum += abs(dom.normalizedOfi).coerceIn(0.2, 1.0) }
         else if (dom.normalizedOfi <= -0.16) { bearVotes++; intensitySum += abs(dom.normalizedOfi).coerceIn(0.2, 1.0) }
 
@@ -390,7 +505,7 @@ object ScenarioAnalyzer {
         if (fp.stackedAskCount >= 3 || dom.bookImbalancePct >= 15.0) { bullVotes++; intensitySum += 0.6 }
         else if (fp.stackedBidCount >= 3 || dom.bookImbalancePct <= -15.0) { bearVotes++; intensitySum += 0.6 }
 
-        // 5. Подтверждённый отказ / пробой уровня (НЕ путаем возможное поглощение с подтверждённым разворотом!)
+        // 5. Подтверждённый отказ / пробой уровня
         when (atk.phase) {
             LevelAttackPhase.CONFIRMED_BREAKOUT -> {
                 if (atk.isResistance) { bullVotes += 2; intensitySum += 1.0 }
@@ -401,45 +516,47 @@ object ScenarioAnalyzer {
                 else { bullVotes += 2; intensitySum += 1.0 }
             }
             LevelAttackPhase.POSSIBLE_ABSORPTION, LevelAttackPhase.ATTACKER_EXHAUSTION -> {
-                // Поглощение НЕ включает противоположный цвет само по себе; оно лишь ослабляет уверенность атакующей стороны!
                 intensitySum *= 0.65
             }
             else -> Unit
         }
 
-        // Запрет переключения цвета на 1 изолированном признаке: требуем ≥ 2 независимых голосов с явным перевесом
         val netVotes = bullVotes - bearVotes
         val dominantVotes = maxOf(bullVotes, bearVotes)
-        val hasConflict = bullVotes >= 2 && bearVotes >= 2
+        val hasVoteConflict = bullVotes >= 2 && bearVotes >= 2
 
         val color = when {
-            hasConflict -> GlowColorState.NEUTRAL
+            hasVoteConflict -> GlowColorState.NEUTRAL
             netVotes >= 2 && bullVotes >= 2 -> GlowColorState.GREEN
             netVotes <= -2 && bearVotes >= 2 -> GlowColorState.RED
             else -> GlowColorState.NEUTRAL
         }
 
-        // Если обнаружено неподтверждённое поглощение против атакующих — приглушаем или уходим в нейтраль (честность ТЗ п.9)
+        // Неподтверждённое поглощение ПРОТИВ атакующих гасит цвет до нейтрали
         val dampedByAbsorption = absM.detected && !absM.confirmed && (
-            (color == GlowColorState.GREEN && absM.side == AbsorptionSide.BUYER_ABSORPTION) ||
-                (color == GlowColorState.RED && absM.side == AbsorptionSide.SELLER_ABSORPTION)
+            (color == GlowColorState.GREEN && absM.side == AbsorptionSide.SELLER_ABSORPTION) ||
+                (color == GlowColorState.RED && absM.side == AbsorptionSide.BUYER_ABSORPTION)
             )
 
         val finalColor = if (dampedByAbsorption) GlowColorState.NEUTRAL else color
-        val rawStrength = if (finalColor == GlowColorState.NEUTRAL) {
+        var rawStrength = if (finalColor == GlowColorState.NEUTRAL) {
             0.12f
         } else {
             ((abs(netVotes) / 4.5) * 0.55 + (intensitySum / maxOf(1, dominantVotes)) * 0.45).toFloat().coerceIn(0.22f, 1.0f)
         }
-        val pressureRate = ((dom.addRatePerSec + dom.cancelRatePerSec) / 14.0).toFloat().coerceIn(0.5f, 2.2f)
+        // При высоком HFT-раздувании снижаем интенсивность свечения
+        if (dom.churnInflationRatio >= 15.0 && finalColor != GlowColorState.NEUTRAL) {
+            rawStrength = (rawStrength * 0.72f).coerceAtLeast(0.22f)
+        }
+        val pressureRate = ((dom.addRatePerSec + dom.cancelRatePerSec) / 14.0).toFloat().coerceIn(0.5f, 2.0f)
 
         val reason = when (finalColor) {
             GlowColorState.GREEN -> "Преимущество покупателей ($bullVotes факторов, яркость ${(rawStrength * 100).toInt()}%)"
             GlowColorState.RED -> "Преимущество продавцов ($bearVotes факторов, яркость ${(rawStrength * 100).toInt()}%)"
-            GlowColorState.NEUTRAL -> if (dampedByAbsorption) {
-                "Нейтрально: обнаружено возможное поглощение — разворот пока не подтверждён"
-            } else {
-                "Нейтрально: баланс сил или недостаточно согласованных признаков"
+            GlowColorState.NEUTRAL -> when {
+                hasVoteConflict -> "Нейтрально: конфликт факторов (быки $bullVotes vs медведи $bearVotes)"
+                dampedByAbsorption -> "Нейтрально: обнаружено возможное поглощение — разворот пока не подтверждён"
+                else -> "Нейтрально: баланс сил или недостаточно согласованных признаков"
             }
         }
 
@@ -448,7 +565,8 @@ object ScenarioAnalyzer {
             strength = rawStrength,
             speedFactor = pressureRate,
             independentFactors = dominantVotes,
-            reason = reason
+            reason = reason,
+            conflictDetected = hasVoteConflict
         )
     }
 
@@ -478,7 +596,7 @@ object ScenarioAnalyzer {
             MarketDominance.CONFIRMED_BREAKOUT -> if (atk.isResistance) 0.22 else -0.22
             MarketDominance.CONFIRMED_REJECTION -> if (atk.isResistance) -0.22 else 0.22
             MarketDominance.POSSIBLE_ABSORPTION -> if (absM.confirmed) {
-                if (absM.side == AbsorptionSide.BUYER_ABSORPTION) -0.14 else 0.14
+                if (absM.side == AbsorptionSide.SELLER_ABSORPTION) -0.14 else 0.14
             } else 0.0
             MarketDominance.BUYERS_DOMINATE -> ((fp.deltaPct / 100.0) * 0.15 + dom.normalizedOfi * 0.10).coerceIn(0.05, 0.20)
             MarketDominance.SELLERS_DOMINATE -> ((fp.deltaPct / 100.0) * 0.15 + dom.normalizedOfi * 0.10).coerceIn(-0.20, -0.05)

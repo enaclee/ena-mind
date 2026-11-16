@@ -1,21 +1,21 @@
 package com.enamind.ai.ai
 
 import com.enamind.ai.core.FaultMonitor
+import com.enamind.ai.core.NetworkHub
 import com.enamind.ai.core.Settings
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 
 /**
  * Изолированный универсальный ИИ-клиент ENA:
- *  - Google AI Studio (Gemini 3.5 Flash-Lite / актуальные модели через v1beta API + загрузка списка моделей по ключу);
- *  - OpenAI-совместимый API (OpenAI, OpenRouter, DeepSeek, Groq, Together и любые совместимые endpoint'ы).
+ *  - Google AI Studio (Gemini 3.5 Flash-Lite / актуальные модели через v1beta API + загрузка списка моделей);
+ *  - OpenAI-совместимый API (OpenAI, OpenRouter, DeepSeek, Groq, Together и др.);
+ *  - Мультимодальная передача вложений (фото/изображения и текстовые файлы/код/логи/CSV/JSON).
  *
- * Никак не вмешивается в расчёты рынка, Order Flow и ботов ENA.
+ * Никак не вмешивается в расчёты рынка, Order Flow и торговых ботов ENA.
  * Секретные ключи никогда не пишутся в логи и ошибки.
  */
 object AiStudioClient {
@@ -25,6 +25,16 @@ object AiStudioClient {
         val title: String,
         val badge: String,
         val description: String
+    )
+
+    data class ChatAttachment(
+        val id: String,
+        val displayName: String,
+        val mimeType: String,
+        val sizeBytes: Long,
+        val isImage: Boolean,
+        val base64Data: String? = null,
+        val textPreview: String? = null
     )
 
     val FREE_MODELS = listOf(
@@ -65,17 +75,14 @@ object AiStudioClient {
         val displayName: String
     )
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
-        .build()
+    private val http get() = NetworkHub.restClient(connectTimeoutSec = 15L, readTimeoutSec = 45L, writeTimeoutSec = 20L)
 
     fun sendChat(
         apiKey: String,
         modelId: String,
         history: List<ChatTurn>,
         userPrompt: String,
+        attachments: List<ChatAttachment> = emptyList(),
         systemInstruction: String = DEFAULT_SYSTEM_PROMPT,
         provider: String = Settings.PROVIDER_GEMINI,
         openAiBaseUrl: String = Settings.DEFAULT_OPENAI_BASE_URL,
@@ -89,6 +96,7 @@ object AiStudioClient {
                 modelId = openAiModel.ifBlank { modelId },
                 history = history,
                 userPrompt = userPrompt,
+                attachments = attachments,
                 systemInstruction = systemInstruction
             )
         } else {
@@ -97,6 +105,7 @@ object AiStudioClient {
                 modelId = modelId,
                 history = history,
                 userPrompt = userPrompt,
+                attachments = attachments,
                 systemInstruction = systemInstruction
             )
         }
@@ -107,6 +116,7 @@ object AiStudioClient {
         modelId: String,
         history: List<ChatTurn>,
         userPrompt: String,
+        attachments: List<ChatAttachment>,
         systemInstruction: String
     ): AiReply {
         val cleanKey = apiKey.trim()
@@ -135,10 +145,12 @@ object AiStudioClient {
                 )
             }
         }
+
+        val userParts = buildGeminiUserParts(userPrompt, attachments)
         contents.put(
             JSONObject()
                 .put("role", "user")
-                .put("parts", JSONArray().put(JSONObject().put("text", userPrompt)))
+                .put("parts", userParts)
         )
 
         val payload = JSONObject().apply {
@@ -234,6 +246,7 @@ object AiStudioClient {
         modelId: String,
         history: List<ChatTurn>,
         userPrompt: String,
+        attachments: List<ChatAttachment>,
         systemInstruction: String
     ): AiReply {
         val cleanKey = apiKey.trim()
@@ -256,26 +269,13 @@ object AiStudioClient {
         }
 
         val t0 = System.currentTimeMillis()
-        val messages = JSONArray()
-        if (systemInstruction.isNotBlank()) {
-            messages.put(JSONObject().put("role", "system").put("content", systemInstruction))
-        }
-        history.takeLast(14).forEach { turn ->
-            if (turn.text.isNotBlank()) {
-                messages.put(
-                    JSONObject()
-                        .put("role", if (turn.fromUser) "user" else "assistant")
-                        .put("content", turn.text)
-                )
-            }
-        }
-        messages.put(JSONObject().put("role", "user").put("content", userPrompt))
-
-        val payload = JSONObject()
-            .put("model", cleanModel)
-            .put("messages", messages)
-            .put("temperature", 0.7)
-            .put("max_tokens", 2048)
+        val payload = buildOpenAiPayload(
+            modelId = cleanModel,
+            history = history,
+            userPrompt = userPrompt,
+            attachments = attachments,
+            systemInstruction = systemInstruction
+        )
 
         val endpoint = if (cleanBase.endsWith("/chat/completions")) cleanBase else "$cleanBase/chat/completions"
         val req = Request.Builder()
@@ -325,9 +325,87 @@ object AiStudioClient {
         }
     }
 
-    /**
-     * Загрузка актуального списка поддерживающих generateContent моделей по ключу Google AI Studio.
-     */
+    internal fun buildGeminiUserParts(userPrompt: String, attachments: List<ChatAttachment>): JSONArray {
+        val parts = JSONArray()
+        val textBlocks = StringBuilder()
+        if (userPrompt.isNotBlank()) textBlocks.append(userPrompt)
+        attachments.filter { !it.isImage && !it.textPreview.isNullOrBlank() }.forEach { att ->
+            if (textBlocks.isNotEmpty()) textBlocks.append("\n\n")
+            textBlocks.append("[Файл: ${att.displayName} (${att.mimeType})]\n")
+            textBlocks.append(att.textPreview)
+        }
+        val finalText = textBlocks.toString().ifBlank { "Проанализируй приложенные файлы." }
+        parts.put(JSONObject().put("text", finalText))
+
+        attachments.forEach { att ->
+            val b64 = att.base64Data?.takeIf { it.isNotBlank() }
+            if (b64 != null && (att.isImage || att.mimeType == "application/pdf")) {
+                parts.put(
+                    JSONObject().put(
+                        "inlineData",
+                        JSONObject()
+                            .put("mimeType", att.mimeType)
+                            .put("data", b64)
+                    )
+                )
+            }
+        }
+        return parts
+    }
+
+    internal fun buildOpenAiPayload(
+        modelId: String,
+        history: List<ChatTurn>,
+        userPrompt: String,
+        attachments: List<ChatAttachment> = emptyList(),
+        systemInstruction: String = ""
+    ): JSONObject {
+        val messages = JSONArray()
+        if (systemInstruction.isNotBlank()) {
+            messages.put(JSONObject().put("role", "system").put("content", systemInstruction))
+        }
+        history.takeLast(14).forEach { turn ->
+            if (turn.text.isNotBlank()) {
+                messages.put(JSONObject().put("role", if (turn.fromUser) "user" else "assistant").put("content", turn.text))
+            }
+        }
+
+        val textBody = buildString {
+            if (userPrompt.isNotBlank()) append(userPrompt)
+            attachments.filter { !it.isImage && !it.textPreview.isNullOrBlank() }.forEach { att ->
+                if (isNotEmpty()) append("\n\n")
+                append("[Файл: ${att.displayName} (${att.mimeType})]\n")
+                append(att.textPreview)
+            }
+            if (isBlank() && attachments.any { it.isImage }) append("Проанализируй изображение.")
+        }
+
+        val imageAtts = attachments.filter { it.isImage && !it.base64Data.isNullOrBlank() }
+        if (imageAtts.isEmpty()) {
+            messages.put(JSONObject().put("role", "user").put("content", textBody))
+        } else {
+            val contentArr = JSONArray()
+            contentArr.put(JSONObject().put("type", "text").put("text", textBody))
+            imageAtts.forEach { img ->
+                contentArr.put(
+                    JSONObject()
+                        .put("type", "image_url")
+                        .put(
+                            "image_url",
+                            JSONObject().put("url", "data:${img.mimeType};base64,${img.base64Data}")
+                        )
+                )
+            }
+            messages.put(JSONObject().put("role", "user").put("content", contentArr))
+        }
+
+        return JSONObject()
+            .put("model", modelId)
+            .put("messages", messages)
+            .put("temperature", 0.7)
+            .put("max_tokens", 2048)
+    }
+
     fun fetchGeminiModels(apiKey: String): Pair<List<AvailableModel>, String?> {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) return emptyList<AvailableModel>() to "Укажите ключ Google AI Studio"
@@ -344,7 +422,7 @@ object AiStudioClient {
                 val out = ArrayList<AvailableModel>()
                 for (i in 0 until models.length()) {
                     val m = models.optJSONObject(i) ?: continue
-                    val fullName = m.optString("name") // e.g., models/gemini-3.5-flash-lite
+                    val fullName = m.optString("name")
                     val id = fullName.removePrefix("models/").trim()
                     if (!id.startsWith("gemini-") || Settings.isDeprecatedGeminiModel(id)) continue
                     val methods = m.optJSONArray("supportedGenerationMethods")
@@ -369,16 +447,7 @@ object AiStudioClient {
         modelId: String,
         history: List<ChatTurn>,
         userPrompt: String
-    ): JSONObject {
-        val messages = JSONArray()
-        history.forEach { turn ->
-            messages.put(JSONObject().put("role", if (turn.fromUser) "user" else "assistant").put("content", turn.text))
-        }
-        messages.put(JSONObject().put("role", "user").put("content", userPrompt))
-        return JSONObject()
-            .put("model", modelId)
-            .put("messages", messages)
-    }
+    ): JSONObject = buildOpenAiPayload(modelId, history, userPrompt)
 
     fun testConnection(
         apiKey: String,

@@ -3,12 +3,12 @@ package com.enamind.ai.intelligence
 import android.util.Log
 import com.enamind.ai.bybit.BybitRest
 import com.enamind.ai.core.FaultMonitor
+import com.enamind.ai.core.NetworkHub
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 
 /**
  * Публичный read-only клиент разведданных Chain Radar (без API-ключей):
@@ -38,10 +38,7 @@ class IntelApiClient {
         val sources: Map<String, String> = emptyMap()
     )
 
-    private val http: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient = NetworkHub.restClient(connectTimeoutSec = 6L, readTimeoutSec = 8L, writeTimeoutSec = 8L)
 
     private val whaleCache = ConcurrentHashMap<String, Pair<Long, WhaleResult>>()
     @Volatile private var mempoolCache: Pair<Long, MempoolResult>? = null
@@ -351,7 +348,8 @@ class IntelApiClient {
     }
 
     private fun getText(url: String): String? {
-        val host = url.substringAfter("//").substringBefore("/")
+        val host = NetworkHub.extractHost(url)
+        if (NetworkHub.isHostRateLimited(host)) return null
         return try {
             val req = Request.Builder()
                 .url(url)
@@ -360,6 +358,9 @@ class IntelApiClient {
                 .build()
             http.newCall(req).execute().use { r ->
                 if (!r.isSuccessful) {
+                    if (r.code == 429) {
+                        NetworkHub.recordRateLimit(host, r.header("Retry-After")?.toLongOrNull() ?: 25L)
+                    }
                     if (r.code == 429 || r.code >= 500) {
                         FaultMonitor.recordFault(
                             component = "Radar API ($host)",
@@ -371,6 +372,7 @@ class IntelApiClient {
                     }
                     null
                 } else {
+                    NetworkHub.clearRateLimit(host)
                     FaultMonitor.markHealthy("Radar API ($host)")
                     r.body?.string()?.takeIf { it.isNotBlank() }
                 }

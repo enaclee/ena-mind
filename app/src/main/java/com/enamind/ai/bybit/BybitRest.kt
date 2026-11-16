@@ -1,6 +1,7 @@
 package com.enamind.ai.bybit
 
 import com.enamind.ai.core.FaultMonitor
+import com.enamind.ai.core.NetworkHub
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.OkHttpClient
@@ -9,7 +10,7 @@ import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -37,10 +38,7 @@ class BybitRest(private val baseUrl: String) {
         val source: String = ""
     )
 
-    val http: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(6, TimeUnit.SECONDS)
-        .build()
+    val http: OkHttpClient = NetworkHub.restClient(connectTimeoutSec = 5L, readTimeoutSec = 6L, writeTimeoutSec = 8L)
 
     private val bybitCooldownUntilMs = AtomicLong(0L)
     private val klineCache = java.util.concurrent.ConcurrentHashMap<String, CachedKlines>()
@@ -232,10 +230,10 @@ class BybitRest(private val baseUrl: String) {
         limit: Int,
         onDone: (KlinesResult) -> Unit
     ) {
-        Thread {
+        restExec.execute {
             val res = klinesUnifiedSync(symbol, interval, limit)
             onDone(res)
-        }.apply { isDaemon = true }.start()
+        }
     }
 
     /** Резервные рыночные метрики (24ч тикер Binance + funding/OI/LSR OKX) при недоступности Bybit. */
@@ -458,7 +456,7 @@ class BybitRest(private val baseUrl: String) {
 
     /** Проверка доступности Bybit V5 /v5/market/time (с разбором result.timeSecond и HTTP-кода). */
     fun ping(onDone: (Boolean, String) -> Unit) {
-        Thread {
+        restExec.execute {
             val t0 = System.currentTimeMillis()
             val url = baseUrl.trimEnd('/') + "/v5/market/time"
             val (txt, err) = executeText(url)
@@ -474,20 +472,23 @@ class BybitRest(private val baseUrl: String) {
                             ?: (body.optLong("time", 0L) / 1000L).takeIf { it > 0 }?.toString()
                             ?: "ok"
                         onDone(true, "HTTP 200, ${ms}мс (t=$sec)")
-                        return@Thread
+                        return@execute
                     }
                     onDone(false, "retCode=$rc: ${body.optString("retMsg")}")
-                    return@Thread
+                    return@execute
                 } catch (_: Exception) {
                 }
             }
             markBybitDown()
             onDone(false, err ?: "нет ответа (fallback: Binance/OKX)")
-        }.apply { isDaemon = true }.start()
+        }
     }
 
     private fun executeText(url: String): Pair<String?, String?> {
-        val host = url.substringAfter("//").substringBefore("/")
+        val host = NetworkHub.extractHost(url)
+        if (NetworkHub.isHostRateLimited(host)) {
+            return null to "HTTP 429 cooldown ($host)"
+        }
         val req = Request.Builder()
             .url(url)
             .header("User-Agent", "ena-terminal/9.0")
@@ -498,6 +499,10 @@ class BybitRest(private val baseUrl: String) {
                 if (!resp.isSuccessful) {
                     val code = resp.code
                     val msg = if (code == 403) "HTTP 403 (блокировка региона/WAF)" else "HTTP $code"
+                    if (code == 429) {
+                        val retrySec = resp.header("Retry-After")?.toLongOrNull() ?: 20L
+                        NetworkHub.recordRateLimit(host, retrySec)
+                    }
                     if (code >= 500 || code == 429) {
                         FaultMonitor.recordFault(
                             component = "REST ($host)",
@@ -513,6 +518,7 @@ class BybitRest(private val baseUrl: String) {
                 if (body.isNullOrBlank()) {
                     null to "пустой ответ"
                 } else {
+                    NetworkHub.clearRateLimit(host)
                     FaultMonitor.markHealthy("REST ($host)")
                     body to null
                 }
@@ -553,6 +559,10 @@ class BybitRest(private val baseUrl: String) {
     }
 
     companion object {
+        private val restExec = Executors.newFixedThreadPool(3) { r ->
+            Thread(r, "BybitRest-Pool").apply { isDaemon = true }
+        }
+
         fun baseCurrency(symbol: String): String =
             symbol.uppercase()
                 .removeSuffix("-SWAP")

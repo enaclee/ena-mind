@@ -3,16 +3,20 @@ package com.enamind.ai.orderflow
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
-import kotlin.math.min
 
 /**
- * C. Absorption Detector — многофакторный детектор поглощения покупателей и продавцов.
+ * C. Absorption Detector — многофакторный детектор поглощения с корректной полярностью пассивной стороны:
  *
- * Жёсткое правило честности:
- *  - Ни один отдельный признак (только высокая Delta, только пополнение или только пауза цены)
- *    НЕ объявляется достаточным доказательством поглощения.
- *  - Требуется согласованная совокупность минимум 3 независимых признаков (для POSSIBLE)
- *    и ≥ 5 с сохранением/пополнением встречной ликвидности и истощением атак (для CONFIRMED).
+ *  - Агрессивные ПОКУПКИ (Delta > 0) не продвигают цену на сопротивлении -> SELLER_ABSORPTION
+ *    (продавцы лимитами поглощают покупателей -> риск разворота ВНИЗ).
+ *  - Агрессивные ПРОДАЖИ (Delta < 0) не продвигают цену на поддержке -> BUYER_ABSORPTION
+ *    (покупатели лимитами поглощают продавцов -> риск разворота ВВЕРХ).
+ *
+ * Двойная защита:
+ *  - Эффективность хода цены (progressEfficiency) ограничивается диапазоном [-0.25 .. 0.30]:
+ *    если цена активно пошла ПРОТИВ потока (< -0.25) или УШЛА за потоком (> 0.30), это не поглощение.
+ *  - При раздутом стакане без реальных исполнений (executedQty == 0 при высоком HFT-CTR) ложное
+ *    поглощение отклоняется.
  */
 object AbsorptionDetector {
 
@@ -47,12 +51,10 @@ object AbsorptionDetector {
         val priceRange = ((prices.maxOrNull() ?: lastPrice) - (prices.minOrNull() ?: lastPrice)).coerceAtLeast(1e-9)
         val spanSec = ((trades.last().exchangeTsMs - trades.first().exchangeTsMs).coerceAtLeast(1000L)) / 1000.0
 
-        // Базовая нормальная волатильность по реальным барам для корректного сравнения продвижения цены
         val typicalBarRangePct = computeTypicalBarRangePct(bars)
         val actualMovePct = 100.0 * (lastPrice - firstPrice) / max(1e-9, firstPrice)
         val rangePct = 100.0 * priceRange / max(1e-9, firstPrice)
 
-        // Разбиваем поток на 3 временных окна (под-атаки) для проверки истощения атак (Attack Exhaustion)
         val chunk = max(4, trades.size / 3)
         val earlyTrades = trades.take(chunk)
         val lateTrades = trades.takeLast(chunk)
@@ -62,13 +64,12 @@ object AbsorptionDetector {
         val earlyMovePct = 100.0 * (earlyTrades.last().price - earlyTrades.first().price) / max(1e-9, earlyTrades.first().price)
         val lateMovePct = 100.0 * (lateTrades.last().price - lateTrades.first().price) / max(1e-9, lateTrades.first().price)
 
-        // Определяем сторону возможного поглощения:
-        // Поглощение покупателей: агрессивный поток положительный (Ask > Bid), но цена застряла / не растёт у сопротивления
-        // Поглощение продавцов: агрессивный поток отрицательный (Bid > Ask), но цена удерживается / не падает у поддержки
-        val buyPressureDominant = footprint.netDelta > 0.0 && footprint.deltaPct >= 10.0
-        val sellPressureDominant = footprint.netDelta < 0.0 && footprint.deltaPct <= -10.0
+        // Delta > 0 -> агрессивны покупатели -> на сопротивлении поглощают пассивные ПРОДАВЦЫ (SELLER_ABSORPTION)
+        // Delta < 0 -> агрессивны продавцы -> на поддержке поглощают пассивные ПОКУПАТЕЛИ (BUYER_ABSORPTION)
+        val aggressiveBuyPressure = footprint.netDelta > 0.0 && footprint.deltaPct >= 12.0
+        val aggressiveSellPressure = footprint.netDelta < 0.0 && footprint.deltaPct <= -12.0
 
-        if (!buyPressureDominant && !sellPressureDominant) {
+        if (!aggressiveBuyPressure && !aggressiveSellPressure) {
             return AbsorptionMetrics(
                 side = AbsorptionSide.NONE,
                 detected = false,
@@ -84,39 +85,40 @@ object AbsorptionDetector {
             )
         }
 
-        val isBuyerAbsorptionCandidate = buyPressureDominant
-        val aggVol = if (isBuyerAbsorptionCandidate) footprint.totalAskVolume else footprint.totalBidVolume
-        val targetLevel = if (isBuyerAbsorptionCandidate) {
+        // isSellerAbsorbing == true -> пассивные продавцы удерживают сопротивление (SELLER_ABSORPTION)
+        val isSellerAbsorbing = aggressiveBuyPressure
+        val aggVol = if (isSellerAbsorbing) footprint.totalAskVolume else footprint.totalBidVolume
+        val targetLevel = if (isSellerAbsorbing) {
             candidateResistance ?: footprint.pocPrice
         } else {
             candidateSupport ?: footprint.pocPrice
         }
 
-        // 1. Price Progress Efficiency: сколько % движения цены (в ожидаемую сторону) получено на единицу дисбаланса/волатильности
-        val favorableMovePct = if (isBuyerAbsorptionCandidate) actualMovePct else -actualMovePct
+        // 1. Signed Price Progress Efficiency: движение цены в сторону агрессивного потока / типичная норма
+        val favorableMovePct = if (isSellerAbsorbing) actualMovePct else -actualMovePct
         val denomNorm = max(0.05, typicalBarRangePct ?: rangePct.coerceAtLeast(0.08))
         val progressEfficiency = (favorableMovePct / denomNorm).coerceIn(-1.5, 3.0)
-        // При поглощении цена либо стоит, либо даже сползает против атакующих (progressEfficiency <= 0.35)
-        val poorProgress = progressEfficiency <= 0.35
+        // Истинное поглощение: цена почти не продвинулась и не ушла сильно против потока
+        val poorProgress = progressEfficiency in -0.25..0.30
 
-        // 2. Absorption Ratio: отношение агрессивного давления (|Delta%|) к реальному продвижению цены
+        // 2. Absorption Ratio
         val rawAr = (abs(footprint.deltaPct) / 100.0) * (1.0 - progressEfficiency.coerceIn(0.0, 1.0))
         val absorptionRatio = (0.5 * rawAr + 0.3 * (dom.replenishmentRate / 2.0).coerceIn(0.0, 1.0) + 0.2 * dom.levelPersistenceRatio)
             .coerceIn(0.0, 1.0)
 
-        // 3. Повторные атаки на один ценовой узел
+        // 3. Повторные атаки на уровень
         val refLevel = targetLevel ?: lastPrice
-        val tol = max(footprint.priceStep * 2.5, refLevel * 0.0012)
-        val repeatedAttacks = countRepeatedTouches(trades, refLevel, tol, isBuyerAbsorptionCandidate)
+        val tol = max(footprint.priceStep * 2.5, refLevel * 0.0008)
+        val repeatedAttacks = countRepeatedTouches(trades, refLevel, tol, isSellerAbsorbing)
 
-        // 4. Истощение атакующей стороны: ранние атаки двигали цену лучше или имели большую дельту, чем поздние
+        // 4. Истощение атак (Attack Exhaustion)
         val earlyEff = if (abs(earlyDelta) > 1e-9) {
-            (if (isBuyerAbsorptionCandidate) earlyMovePct else -earlyMovePct) / abs(earlyDelta)
+            (if (isSellerAbsorbing) earlyMovePct else -earlyMovePct) / abs(earlyDelta)
         } else 0.0
         val lateEff = if (abs(lateDelta) > 1e-9) {
-            (if (isBuyerAbsorptionCandidate) lateMovePct else -lateMovePct) / abs(lateDelta)
+            (if (isSellerAbsorbing) lateMovePct else -lateMovePct) / abs(lateDelta)
         } else 0.0
-        val fadingAggression = if (isBuyerAbsorptionCandidate) {
+        val fadingAggression = if (isSellerAbsorbing) {
             lateDelta < earlyDelta * 0.75 || (lateMovePct <= 0.0 && abs(lateDelta) > 0)
         } else {
             lateDelta > earlyDelta * 0.75 || (lateMovePct >= 0.0 && abs(lateDelta) > 0)
@@ -128,23 +130,27 @@ object AbsorptionDetector {
             else -> 0.15
         }
 
-        // 5. Многофакторное голосование (ЗА и ПРОТИВ)
+        // 5. Многофакторное голосование
         val supporting = ArrayList<String>()
         val conflicting = ArrayList<String>()
         var factorHits = 0
 
         if (abs(footprint.deltaPct) >= 14.0) {
             factorHits++
-            supporting += "Высокий агрессивный объём ${if (isBuyerAbsorptionCandidate) "покупок" else "продаж"} (Delta ${fmtPct(footprint.deltaPct)})"
+            supporting += "Высокий агрессивный объём ${if (isSellerAbsorbing) "покупок" else "продаж"} (Delta ${fmtPct(footprint.deltaPct)})"
         } else {
             conflicting += "Умеренная Delta (${fmtPct(footprint.deltaPct)}) без явного экстремума"
         }
 
         if (poorProgress) {
             factorHits++
-            supporting += "Цена почти не продвинулась (${fmtPct(actualMovePct)} при норме ~${fmtPct(denomNorm)})"
+            supporting += "Цена удержана в узком диапазоне (${fmtPct(actualMovePct)} при норме ~${fmtPct(denomNorm)}, эфф. ${fmtD(progressEfficiency)})"
         } else {
-            conflicting += "Цена эффективно продвигается вслед за потоком (${fmtPct(actualMovePct)})"
+            conflicting += if (progressEfficiency < -0.25) {
+                "Цена уже пошла против потока (${fmtPct(actualMovePct)}) — фаза поглощения завершена"
+            } else {
+                "Цена эффективно продвигается вслед за потоком (${fmtPct(actualMovePct)})"
+            }
         }
 
         if (dom.replenishmentEvents >= 2 || dom.replenishmentRate >= 0.25) {
@@ -156,9 +162,9 @@ object AbsorptionDetector {
 
         if (dom.levelPersistenceRatio >= 0.55) {
             factorHits++
-            supporting += "Ликвидность на уровне устойчива (${(dom.levelPersistenceRatio * 100).toInt()}% падений — реальное исполнение, а не снятие)"
+            supporting += "Ликвидность на уровне устойчива (${(dom.levelPersistenceRatio * 100).toInt()}% падений — реальное исполнение)"
         } else {
-            conflicting += "Низкая устойчивость стакана (${(dom.levelPersistenceRatio * 100).toInt()}%): много снятий без сделок"
+            conflicting += "Низкая устойчивость стакана (${(dom.levelPersistenceRatio * 100).toInt()}%): много отмен без сделок"
         }
 
         if (repeatedAttacks >= 2) {
@@ -173,17 +179,18 @@ object AbsorptionDetector {
             supporting += "Снижение эффективности последующих атак (${(attackExhaustion * 100).toInt()}%)"
         }
 
-        // Противоречащий сигнал от снятия крупных стен или смены OFI в сторону пробоя
         if (dom.liquidityPullDetected) {
             conflicting += "В стакане зафиксировано снятие заявок — стена может убираться перед пробоем"
         }
-        val ofiSupportsAttacker = (isBuyerAbsorptionCandidate && dom.normalizedOfi > 0.25) ||
-            (!isBuyerAbsorptionCandidate && dom.normalizedOfi < -0.25)
+        if (dom.churnInflationRatio >= 15.0 && dom.executedQty <= 0.0) {
+            conflicting += "Высокий HFT-шум (CTR ×${fmtD(dom.churnInflationRatio)}) без сматченных исполнений в стакане"
+        }
+        val ofiSupportsAttacker = (isSellerAbsorbing && dom.normalizedOfi > 0.25) ||
+            (!isSellerAbsorbing && dom.normalizedOfi < -0.25)
         if (ofiSupportsAttacker) {
             conflicting += "OFI направлен в сторону атакующих (${fmtD(dom.normalizedOfi)})"
         }
 
-        // Требуем минимум 3 независимых фактора + неэффективное продвижение цены!
         val detected = factorHits >= 3 && poorProgress
         val confirmed = factorHits >= 5 && poorProgress && (dom.replenishmentEvents >= 2) && !dom.liquidityPullDetected
 
@@ -195,7 +202,7 @@ object AbsorptionDetector {
         }
 
         val side = if (detected) {
-            if (isBuyerAbsorptionCandidate) AbsorptionSide.BUYER_ABSORPTION else AbsorptionSide.SELLER_ABSORPTION
+            if (isSellerAbsorbing) AbsorptionSide.SELLER_ABSORPTION else AbsorptionSide.BUYER_ABSORPTION
         } else {
             AbsorptionSide.NONE
         }

@@ -315,16 +315,22 @@ class NeuralEngine(
         }).also { it.connect() }
     }
 
+    private val klinesCacheTs = ConcurrentHashMap<String, Long>()
+
     // ---------------- тяжёлый канал: свечи ----------------
     private suspend fun klinesLoop() {
+        var cycle = 0
         while (scope.isActive) {
             delay(45_000)
             try {
                 pushKlines(symbol)
-                pushAltKlines()
+                if (cycle % 2 == 1 && !com.enamind.ai.core.NetworkHub.isAnyExchangeCooldown()) {
+                    pushAltKlines()
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "klines: ${e.message}")
             }
+            cycle++
         }
     }
 
@@ -335,6 +341,7 @@ class NeuralEngine(
             val r1 = state.rest.klinesUnifiedSync(sym, "1", 250)
             if (r1.rows.isNotEmpty()) {
                 klinesCache["$sym:1"] = r1.rows
+                klinesCacheTs["$sym:1"] = System.currentTimeMillis()
                 _klineSource.value = r1.source
             }
             val otherTfs = coroutineScope {
@@ -345,10 +352,12 @@ class NeuralEngine(
                 }.awaitAll()
             }
             var anyOk = r1.rows.isNotEmpty()
+            val nowTs = System.currentTimeMillis()
             for ((tf, res) in otherTfs) {
                 if (res.rows.isEmpty()) continue
                 anyOk = true
                 klinesCache["$sym:$tf"] = res.rows
+                klinesCacheTs["$sym:$tf"] = nowTs
                 if (_klineSource.value.isBlank()) _klineSource.value = res.source
             }
             if (PythonBridge.isReady()) {
@@ -416,11 +425,14 @@ class NeuralEngine(
     private suspend fun pushAltKlines() = withContext(Dispatchers.IO) {
         for (s in WATCHLIST) {
             if (s == symbol) continue
+            val lastTs = klinesCacheTs["$s:1"] ?: 0L
+            if (System.currentTimeMillis() - lastTs < 90_000L) continue
             val res = state.rest.klinesUnifiedSync(s, "1", 120)
             if (res.rows.isEmpty()) continue
             klinesCache["$s:1"] = res.rows
+            klinesCacheTs["$s:1"] = System.currentTimeMillis()
             synchronized(altKlines) { altKlines[s] = toJsonRows(res.rows) }
-            delay(120)
+            delay(350)
         }
     }
 
@@ -848,7 +860,7 @@ class NeuralEngine(
                 val intel = _intelligence.value?.takeIf { it.symbol == sym }
                 val weights = pulseVault.currentWeights()
                 val vaultSnap = pulseVault.snapshot()
-                val nowMs = System.currentTimeMillis()
+                val nowMs = clockSync.exchangeNowMs()
 
                 val pulse = withContext(Dispatchers.Default) {
                     RealTimeLeadEngine.evaluate(
@@ -880,7 +892,9 @@ class NeuralEngine(
                         tickSize = tickSize,
                         livePrice = livePx,
                         bars = chartBars,
-                        nowMs = clockSync.exchangeNowMs()
+                        nowMs = nowMs,
+                        quantAdx = intel?.quant?.adx,
+                        quantEr = intel?.quant?.efficiencyRatio
                     )
                 }
 
@@ -923,9 +937,9 @@ class NeuralEngine(
         }
     }
 
-    // ---------------- фоновый расчёт watchlist (10 активов) ----------------
+    // ---------------- фоновый расчёт watchlist (10 активов, с анти-спам троттлингом) ----------------
     private suspend fun watchlistLoop() {
-        delay(12_000)
+        delay(18_000)
         while (scope.isActive) {
             for (s in WATCHLIST) {
                 if (s == symbol) continue
@@ -933,12 +947,24 @@ class NeuralEngine(
                     withContext(Dispatchers.IO) {
                         if (!ensurePython()) return@withContext
                         var lastClose = 0.0
+                        val nowTs = System.currentTimeMillis()
                         for (tf in listOf("1", "15", "60")) {
-                            val res = state.rest.klinesUnifiedSync(s, tf, 200)
-                            if (res.rows.isEmpty()) continue
-                            klinesCache["$s:$tf"] = res.rows
-                            if (lastClose <= 0.0) lastClose = res.rows.lastOrNull()?.getOrNull(4) ?: 0.0
-                            PythonBridge.engineSetKlines(s, tf, toJsonRows(res.rows).toString())
+                            val key = "$s:$tf"
+                            val cached = klinesCache[key]
+                            val ageMs = nowTs - (klinesCacheTs[key] ?: 0L)
+                            val rows = if (cached != null && cached.isNotEmpty() && ageMs < 120_000L) {
+                                cached
+                            } else {
+                                val res = state.rest.klinesUnifiedSync(s, tf, 200)
+                                if (res.rows.isNotEmpty()) {
+                                    klinesCache[key] = res.rows
+                                    klinesCacheTs[key] = System.currentTimeMillis()
+                                }
+                                res.rows
+                            }
+                            if (rows.isEmpty()) continue
+                            if (lastClose <= 0.0) lastClose = rows.lastOrNull()?.getOrNull(4) ?: 0.0
+                            PythonBridge.engineSetKlines(s, tf, toJsonRows(rows).toString())
                         }
                         val vSnap = multiVenueBridge.fetchVenueSnapshotSync(s)
                         val fastObj = JSONObject().apply {
@@ -966,12 +992,12 @@ class NeuralEngine(
                             _watch.value = cur
                         }
                     }
-                    delay(1_200)
+                    delay(2_000)
                 } catch (e: Exception) {
                     Log.w(TAG, "watch $s: ${e.message}")
                 }
             }
-            delay(90_000)
+            delay(180_000)
         }
     }
 

@@ -85,7 +85,7 @@ private val LightScheme = lightColorScheme(
     onSecondary = Color.White,
     secondaryContainer = Color(0xFFF1F3F4),
     onSecondaryContainer = Color(0xFF1F1F1F),
-    tertiary = Color(0xFFD97706),
+    tertiary = Color(0xFFB45309), // Высокий контраст на белом фоне (>= 5.0:1)
     onTertiary = Color.White,
     background = Color(0xFFF8F9FA),
     onBackground = Color(0xFF1F1F1F),
@@ -186,3 +186,14 @@ val Color.Companion.EnaRed: Color get() = Red
 val Color.Companion.EnaYellow: Color get() = Yellow
 val Color.Companion.EnaIce: Color get() = IceBlue
 val Color.Companion.TgBlue: Color get() = AiStudioBlueLight
+
+@Composable
+fun enaAmberText(): Color = MaterialTheme.colorScheme.tertiary
+
+@Composable
+fun enaGreenText(): Color = if (MaterialTheme.colorScheme.background.red > 0.5f) {
+    Color(0xFF047857)
+} else {
+    Green
+}
+

@@ -2,19 +2,17 @@ package com.enamind.ai.orderflow
 
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 
 /**
- * D. Level Attack Failure Detector — отслеживает атаки на реальные структурные уровни S/R.
+ * D. Level Attack Failure Detector — отслеживает атаки строго на реальных касаниях уровней S/R.
  *
- * Различает строго 6 фаз:
- *  - ATTACK_START (начало атаки)
- *  - ACTIVE_PRESSURE (активное давление на уровень)
- *  - POSSIBLE_ABSORPTION (возможное поглощение)
- *  - ATTACKER_EXHAUSTION (ослабление атакующей стороны)
- *  - CONFIRMED_REJECTION (подтверждённый отказ от пробоя)
- *  - CONFIRMED_BREAKOUT (успешный пробой уровня)
- *
- * Никогда не путает кратковременную остановку цены с подтверждённым поглощением или отказом.
+ * Исправления:
+ *  - Proximity Gate: касание уровня проверяется с жёстким допуском
+ *    `touchTol = max(tickSize * 5, min(price * 0.0005, price * atrPct * 0.35 / 100))`
+ *    (без срабатывания за 1.2% от уровня).
+ *  - Запрет CONFIRMED_BREAKOUT без реального исполнения стакана, согласованного OFI и при
+ *    флетовом режиме ядра Радара (ADX < 18 && ER < 0.20).
  */
 object LevelAttackDetector {
 
@@ -30,7 +28,10 @@ object LevelAttackDetector {
         trades: List<OrderFlowStreamHub.RawTradeTick>,
         footprint: FootprintSummary,
         dom: DomSnapshotMetrics,
-        absorption: AbsorptionMetrics
+        absorption: AbsorptionMetrics,
+        tickSize: Double? = null,
+        quantAdx: Double? = null,
+        quantEfficiencyRatio: Double? = null
     ): LevelResult {
         if (currentPrice == null || !currentPrice.isFinite() || currentPrice <= 0.0 || bars.size < 12) {
             return LevelResult(
@@ -40,10 +41,8 @@ object LevelAttackDetector {
             )
         }
 
-        // Находим структурные свинг-уровни поддержки и сопротивления по реальным барам
         val (supports, resistances) = extractStructuralLevels(bars, currentPrice)
 
-        // Добавляем крупные стены стакана как кандидаты ближайших уровней, если они близко к цене
         val nearestSupport = supports.filter { it <= currentPrice * 1.003 }.maxOrNull()
             ?: dom.largeBids.maxByOrNull { it.price }?.price
         val nearestResistance = resistances.filter { it >= currentPrice * 0.997 }.minOrNull()
@@ -52,12 +51,20 @@ object LevelAttackDetector {
         val distResPct = nearestResistance?.let { abs(it - currentPrice) / currentPrice * 100.0 } ?: Double.MAX_VALUE
         val distSupPct = nearestSupport?.let { abs(currentPrice - it) / currentPrice * 100.0 } ?: Double.MAX_VALUE
 
-        // Выбираем ближайший релевантный уровень (в пределах 1.2% от цены)
         val attackingResistance = distResPct <= distSupPct
         val targetLevel = if (attackingResistance) nearestResistance else nearestSupport
         val distPct = if (attackingResistance) distResPct else distSupPct
 
-        if (targetLevel == null || distPct > 1.2) {
+        val atrPct = computeAtrPct(bars).coerceIn(0.06, 1.5)
+        val rawTouchTol = max(
+            (tickSize ?: 0.0) * 5.0,
+            min(currentPrice * 0.0005, currentPrice * (atrPct * 0.35 / 100.0))
+        ).coerceAtLeast(currentPrice * 0.0002)
+        val zoneTol = rawTouchTol
+        val zonePct = (zoneTol / currentPrice) * 100.0
+        val maxActiveDistPct = max(zonePct * 3.0, 0.22)
+
+        if (targetLevel == null || distPct > maxActiveDistPct) {
             return LevelResult(
                 supports = supports,
                 resistances = resistances,
@@ -70,18 +77,11 @@ object LevelAttackDetector {
             )
         }
 
-        // Порог «вплотную у уровня» зависит от волатильности баров
-        val atrPct = computeAtrPct(bars).coerceIn(0.08, 1.5)
-        val zonePct = max(0.08, atrPct * 0.35)
-        val zoneTol = targetLevel * (zonePct / 100.0)
-
+        val inTouchZone = abs(currentPrice - targetLevel) <= zoneTol
         val touchCount = countLevelTouches(bars, trades, targetLevel, zoneTol)
         val acceptedBeyond = checkAcceptanceBeyond(trades, bars, targetLevel, zoneTol, attackingResistance)
-
-        // Изменение ликвидности на целевой стороне стакана
         val nearLiquidityRatio = computeCounterLiquidityPct(dom, targetLevel, zoneTol, attackingResistance)
 
-        // Реакция цены после недавней атаки (по последним 6 сделкам/закрытию)
         val peakInTrades = if (attackingResistance) trades.maxOfOrNull { it.price } else trades.minOfOrNull { it.price }
         val postReactionPct = if (peakInTrades != null && peakInTrades > 0.0) {
             100.0 * (currentPrice - peakInTrades) / peakInTrades
@@ -93,23 +93,28 @@ object LevelAttackDetector {
 
         val repeatedZones = mutableListOf<Double>()
         val failedZones = mutableListOf<Double>()
-        if (touchCount >= 2) repeatedZones.add(targetLevel)
+        if (touchCount >= 2 && inTouchZone) repeatedZones.add(targetLevel)
 
-        // Чёткое разграничение 6 фаз (без путаницы паузы и подтверждённого события)
         val attackerMatchingDirection = if (attackingResistance) footprint.netDelta > 0 else footprint.netDelta < 0
         val strongAggression = abs(footprint.deltaPct) >= 12.0 && footprint.sufficientData
+        val ofiAlignedBreakout = if (attackingResistance) dom.normalizedOfi >= 0.12 else dom.normalizedOfi <= -0.12
+        val flatQuantRegime = quantAdx != null && quantEfficiencyRatio != null &&
+            quantAdx.isFinite() && quantEfficiencyRatio.isFinite() &&
+            quantAdx < 18.0 && quantEfficiencyRatio < 0.20
+
         val rejectedNow = if (attackingResistance) {
             (peakInTrades != null && peakInTrades >= targetLevel - zoneTol) &&
                 currentPrice < targetLevel - zoneTol * 0.9 &&
-                (postReactionPct != null && postReactionPct <= -zonePct * 0.55)
+                (postReactionPct != null && postReactionPct <= -zonePct * 0.65)
         } else {
             (peakInTrades != null && peakInTrades <= targetLevel + zoneTol) &&
                 currentPrice > targetLevel + zoneTol * 0.9 &&
-                (postReactionPct != null && postReactionPct >= zonePct * 0.55)
+                (postReactionPct != null && postReactionPct >= zonePct * 0.65)
         }
 
         val phase = when {
-            acceptedBeyond && !absorption.confirmed && ((attackingResistance && footprint.netDelta > 0) || (!attackingResistance && footprint.netDelta < 0)) ->
+            acceptedBeyond && !absorption.confirmed && !flatQuantRegime &&
+                attackerMatchingDirection && ofiAlignedBreakout && dom.executedQty > 0.0 ->
                 LevelAttackPhase.CONFIRMED_BREAKOUT
 
             rejectedNow && (absorption.detected || touchCount >= 2) -> {
@@ -117,16 +122,16 @@ object LevelAttackDetector {
                 LevelAttackPhase.CONFIRMED_REJECTION
             }
 
-            absorption.detected && absorption.attackExhaustion >= 0.55 ->
+            inTouchZone && absorption.detected && absorption.attackExhaustion >= 0.55 ->
                 LevelAttackPhase.ATTACKER_EXHAUSTION
 
-            absorption.detected ->
+            inTouchZone && absorption.detected ->
                 LevelAttackPhase.POSSIBLE_ABSORPTION
 
-            distPct <= zonePct * 1.4 && attackerMatchingDirection && strongAggression ->
+            inTouchZone && attackerMatchingDirection && strongAggression ->
                 LevelAttackPhase.ACTIVE_PRESSURE
 
-            distPct <= zonePct * 2.2 && touchCount >= 1 && attackerMatchingDirection ->
+            (inTouchZone || distPct <= zonePct * 1.5) && touchCount >= 1 && attackerMatchingDirection ->
                 LevelAttackPhase.ATTACK_START
 
             else -> LevelAttackPhase.NONE
@@ -174,7 +179,6 @@ object LevelAttackDetector {
             if (l <= prevL1 && l <= prevL2 && l <= nextL1 && l <= nextL2) swingLows.add(l)
         }
 
-        // Кластеризуем близкие уровни в 0.25%
         val resClusters = clusterLevels(swingHighs.filter { it >= currentPrice * 0.994 }, currentPrice * 0.0025)
             .sortedBy { abs(it - currentPrice) }
             .take(3)
@@ -182,7 +186,6 @@ object LevelAttackDetector {
             .sortedBy { abs(it - currentPrice) }
             .take(3)
 
-        // Если свинги не нашлись, берём явные экстремумы окна без выдумки чисел
         val finalRes = resClusters.ifEmpty {
             listOfNotNull(window.maxOfOrNull { it.getOrNull(2) ?: 0.0 }?.takeIf { it > 0 })
         }
@@ -204,7 +207,6 @@ object LevelAttackDetector {
                 groups.add(mutableListOf(px))
             }
         }
-        // Приоритет уровням с большим числом касаний
         return groups.sortedByDescending { it.size }.map { it.average() }
     }
 

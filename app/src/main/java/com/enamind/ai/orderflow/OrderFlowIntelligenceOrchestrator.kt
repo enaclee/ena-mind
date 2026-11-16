@@ -4,12 +4,15 @@ import android.content.Context
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.io.File
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Единый координатор ENA — ORDER FLOW & ABSORPTION INTELLIGENCE.
  * Собирает срез реального времени из OrderFlowStreamHub, оценивает свежесть и рассинхрон,
- * прогоняет FootprintEngine -> DomAnalyzer -> AbsorptionDetector -> LevelAttackDetector -> ScenarioAnalyzer,
- * ведёт честную пост-проверку (1с/5с/15с/30с) в OrderFlowEventVault и публикует OrderFlowReport.
+ * прогоняет FootprintEngine -> DomAnalyzer (с привязкой к атакуемому уровню) -> AbsorptionDetector
+ * -> LevelAttackDetector (с ADX/ER из ядра Радара) -> ScenarioAnalyzer (+ Glow Temporal Hysteresis),
+ * ведёт пост-проверку в OrderFlowEventVault и публикует OrderFlowReport.
  */
 class OrderFlowIntelligenceOrchestrator(
     ctx: Context
@@ -25,14 +28,30 @@ class OrderFlowIntelligenceOrchestrator(
 
     private val confirmedMarkersHistory = ArrayDeque<Pair<Long, String>>(12)
 
+    // Temporal hysteresis state for Glow anti-flicker
+    private var lastGlowSymbol: String = ""
+    private var pendingGlowColor: GlowColorState = GlowColorState.NEUTRAL
+    private var pendingGlowSinceMs: Long = 0L
+    private var stableGlowColor: GlowColorState = GlowColorState.NEUTRAL
+
     fun evaluate(
         symbol: String,
         interval: String,
         tickSize: Double?,
         livePrice: Double?,
         bars: List<List<Double>>,
-        nowMs: Long = System.currentTimeMillis()
+        nowMs: Long = System.currentTimeMillis(),
+        quantAdx: Double? = null,
+        quantEr: Double? = null,
+        signalConfirmMs: Long = DEFAULT_GLOW_CONFIRM_MS
     ): OrderFlowReport {
+        if (lastGlowSymbol != symbol) {
+            lastGlowSymbol = symbol
+            pendingGlowColor = GlowColorState.NEUTRAL
+            pendingGlowSinceMs = nowMs
+            stableGlowColor = GlowColorState.NEUTRAL
+        }
+
         val micro = streamHub.snapshot(symbol, nowMs)
         val effectivePrice = livePrice?.takeIf { it.isFinite() && it > 0.0 }
             ?: micro?.trades?.lastOrNull()?.price
@@ -57,17 +76,30 @@ class OrderFlowIntelligenceOrchestrator(
 
         val trades = micro?.trades.orEmpty()
         val footprint = FootprintEngine.analyze(trades, tickSize, bars)
-        val dom = DomAnalyzer.analyze(micro, nowMs)
+        val preDom = DomAnalyzer.analyze(micro, nowMs)
 
-        // Сначала структурные уровни без поглощения, чтобы передать целевые уровни в AbsorptionDetector
+        // Первый проход структурных уровней, чтобы определить активный уровень и зону допуска
         val preLevels = LevelAttackDetector.analyze(
             currentPrice = effectivePrice,
             bars = bars,
             trades = trades,
             footprint = footprint,
-            dom = dom,
-            absorption = AbsorptionMetrics()
+            dom = preDom,
+            absorption = AbsorptionMetrics(),
+            tickSize = tickSize,
+            quantAdx = quantAdx,
+            quantEfficiencyRatio = quantEr
         )
+        val focusLevel = preLevels.attackState.levelPrice
+        val focusTol = if (effectivePrice != null && effectivePrice > 0.0) {
+            max((tickSize ?: 0.0) * 5.0, min(effectivePrice * 0.0008, effectivePrice * 0.0018))
+        } else null
+        val dom = if (focusLevel != null) {
+            DomAnalyzer.analyze(micro, nowMs, activeLevelPrice = focusLevel, zoneTolerance = focusTol)
+        } else {
+            preDom
+        }
+
         val absorption = AbsorptionDetector.analyze(
             trades = trades,
             footprint = footprint,
@@ -82,14 +114,24 @@ class OrderFlowIntelligenceOrchestrator(
             trades = trades,
             footprint = footprint,
             dom = dom,
-            absorption = absorption
+            absorption = absorption,
+            tickSize = tickSize,
+            quantAdx = quantAdx,
+            quantEfficiencyRatio = quantEr
         )
 
-        // Post-only проверка исторических событий по реально поступившим тикам (без look-ahead!)
-        if (trades.isNotEmpty()) {
-            vault.verifyForwardOutcomes(symbol, trades, nowMs)
+        // Post-only проверка исторических событий по реально поступившим тикам и свечам (без look-ahead!)
+        if (trades.isNotEmpty() || bars.isNotEmpty()) {
+            vault.verifyForwardOutcomes(symbol, trades, nowMs, bars)
         }
         val vaultStats = vault.computeStats(symbol)
+
+        val lastBar = bars.lastOrNull()
+        val candleOpen = lastBar?.getOrNull(1)
+        val candleClose = lastBar?.getOrNull(4)
+        val candleChangePct = if (candleOpen != null && candleClose != null && candleOpen > 0.0) {
+            100.0 * (candleClose - candleOpen) / candleOpen
+        } else null
 
         val synthesis = ScenarioAnalyzer.synthesize(
             symbol = symbol,
@@ -99,8 +141,13 @@ class OrderFlowIntelligenceOrchestrator(
             dom = dom,
             absorption = absorption,
             attack = levelResult.attackState,
-            vaultStats = vaultStats
+            vaultStats = vaultStats,
+            quantAdx = quantAdx,
+            quantEfficiencyRatio = quantEr,
+            candleChangePct = candleChangePct
         )
+
+        val stabilizedGlow = applyGlowHysteresis(synthesis.glow, freshness, nowMs, signalConfirmMs)
 
         if (levelResult.attackState.phase == LevelAttackPhase.CONFIRMED_REJECTION ||
             levelResult.attackState.phase == LevelAttackPhase.CONFIRMED_BREAKOUT
@@ -146,7 +193,7 @@ class OrderFlowIntelligenceOrchestrator(
             scenarioB = synthesis.scenarioB,
             explanationText = synthesis.explanationText,
             confidence = synthesis.confidence,
-            glow = synthesis.glow,
+            glow = stabilizedGlow,
             overlay = overlay,
             councilPayload = synthesis.councilPayload
         )
@@ -158,9 +205,48 @@ class OrderFlowIntelligenceOrchestrator(
         return rep
     }
 
+    private fun applyGlowHysteresis(
+        rawGlow: GlowSignal,
+        freshness: DataFreshness,
+        nowMs: Long,
+        confirmMs: Long
+    ): GlowSignal {
+        // Сбой, рассинхрон, устаревание или конфликт сразу переводят свечение в NEUTRAL без задержки
+        if (freshness != DataFreshness.LIVE || rawGlow.conflictDetected || rawGlow.colorState == GlowColorState.NEUTRAL) {
+            pendingGlowColor = GlowColorState.NEUTRAL
+            pendingGlowSinceMs = nowMs
+            stableGlowColor = GlowColorState.NEUTRAL
+            return rawGlow.copy(colorState = GlowColorState.NEUTRAL)
+        }
+
+        if (rawGlow.colorState == stableGlowColor) {
+            pendingGlowColor = rawGlow.colorState
+            return rawGlow
+        }
+
+        if (pendingGlowColor != rawGlow.colorState) {
+            pendingGlowColor = rawGlow.colorState
+            pendingGlowSinceMs = nowMs
+        }
+
+        val elapsed = (nowMs - pendingGlowSinceMs).coerceAtLeast(0L)
+        return if (elapsed >= confirmMs) {
+            stableGlowColor = rawGlow.colorState
+            rawGlow
+        } else {
+            val leftSec = ((confirmMs - elapsed + 999L) / 1000L).coerceAtLeast(1L)
+            rawGlow.copy(
+                colorState = stableGlowColor,
+                strength = if (stableGlowColor == GlowColorState.NEUTRAL) 0.14f else rawGlow.strength * 0.7f,
+                reason = "${rawGlow.reason} · стабилизация ${leftSec}с"
+            )
+        }
+    }
+
     fun exportHistoryBundle(): OrderFlowEventVault.ExportBundle = vault.exportHistoryBundle()
 
     companion object {
         private const val STALE_THRESHOLD_MS = 18_000L
+        private const val DEFAULT_GLOW_CONFIRM_MS = 4_000L
     }
 }

@@ -17,6 +17,7 @@ enum class MarketDominance(val labelRu: String) {
     BUYERS_DOMINATE("Покупатели доминируют"),
     SELLERS_DOMINATE("Продавцы доминируют"),
     CONTESTED("Борьба сторон"),
+    CONFLICT("Конфликт свечи и потока (шум)"),
     POSSIBLE_ABSORPTION("Обнаружено возможное поглощение"),
     CONFIRMED_REJECTION("Подтверждён отказ от пробоя"),
     CONFIRMED_BREAKOUT("Подтверждён пробой"),
@@ -43,8 +44,8 @@ enum class LevelAttackPhase(val labelRu: String) {
 
 enum class AbsorptionSide(val labelRu: String) {
     NONE("Поглощение не выявлено"),
-    BUYER_ABSORPTION("Поглощение покупателей (продавцы удерживают сопротивление)"),
-    SELLER_ABSORPTION("Поглощение продавцов (покупатели удерживают поддержку)")
+    BUYER_ABSORPTION("Поглощение продавцов (покупатели удерживают поддержку)"),
+    SELLER_ABSORPTION("Поглощение покупателей (продавцы удерживают сопротивление)")
 }
 
 enum class GlowColorState { GREEN, RED, NEUTRAL }
@@ -111,7 +112,8 @@ data class DomSnapshotMetrics(
     val lagMs: Long = -1L,
     val deltaSequenceCount: Int = 0,
     val sufficientData: Boolean = false,
-    val note: String = "Ожидание синхронизированного стакана…"
+    val note: String = "Ожидание синхронизированного стакана…",
+    val churnInflationRatio: Double = 0.0
 )
 
 data class AbsorptionMetrics(
@@ -173,7 +175,8 @@ data class GlowSignal(
     val strength: Float = 0f,     // 0.0 .. 1.0 (яркость)
     val speedFactor: Float = 0.6f,// скорость ping-pong волны
     val independentFactors: Int = 0,
-    val reason: String = "Ожидание подтверждения потока"
+    val reason: String = "Ожидание подтверждения потока",
+    val conflictDetected: Boolean = false
 )
 
 data class ChartOverlayData(

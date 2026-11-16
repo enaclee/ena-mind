@@ -752,7 +752,7 @@ private fun TopicDotPlaceholder(label: String) {
 private fun TopicDot(kind: FeedStatus.Kind, t: FeedStatus.Topic) {
     val color = when (t.status) {
         FeedStatus.LIVE -> Color.EnaGreen
-        FeedStatus.STALE -> Color.EnaYellow
+        FeedStatus.STALE -> enaAmberText()
         FeedStatus.ERROR, FeedStatus.DISCONNECTED -> Color.EnaRed
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
@@ -784,7 +784,7 @@ private fun TopicDot(kind: FeedStatus.Kind, t: FeedStatus.Topic) {
             fontSize = 10.sp,
             color = when (t.status) {
                 FeedStatus.LIVE -> Color.EnaGreen
-                FeedStatus.STALE -> Color.EnaYellow
+                FeedStatus.STALE -> enaAmberText()
                 FeedStatus.ERROR, FeedStatus.DISCONNECTED -> Color.EnaRed
                 else -> MaterialTheme.colorScheme.onSurfaceVariant
             }

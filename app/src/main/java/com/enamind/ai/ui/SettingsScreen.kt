@@ -157,7 +157,7 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.labelLarge,
                             fontSize = 12.sp,
                             fontWeight = if (tab == i) FontWeight.SemiBold else FontWeight.Medium,
-                            color = if (i == 3 && summary.activeFaults > 0 && tab != i) Color.EnaYellow
+                            color = if (i == 3 && summary.activeFaults > 0 && tab != i) enaAmberText()
                             else Color.Unspecified,
                             maxLines = 1
                         )
@@ -469,7 +469,7 @@ private fun ApiTab(state: AppState) {
                 }
 
                 modelsError?.let { err ->
-                    Text(err, fontSize = 11.sp, color = Color.EnaYellow)
+                    Text(err, fontSize = 11.sp, color = enaAmberText())
                 }
 
                 if (fetchedModels.isNotEmpty()) {
@@ -727,6 +727,7 @@ private fun ApiTab(state: AppState) {
         results?.let { list ->
             val okCount = list.count { (_, st, _) -> st == "OK" || st == "FALLBACK" }
             val warnCount = list.count { (_, st, _) -> st == "RATE_LIMIT" || st == "SLOW" }
+            val amber = enaAmberText()
             SettingsCard {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -736,14 +737,14 @@ private fun ApiTab(state: AppState) {
                     SectionTitle("Состояние источников")
                     Surface(
                         shape = RoundedCornerShape(8.dp),
-                        color = (if (okCount >= list.size / 2) Color.EnaGreen else Color.EnaYellow).copy(alpha = 0.16f)
+                        color = (if (okCount >= list.size / 2) Color.EnaGreen else amber).copy(alpha = 0.16f)
                     ) {
                         Text(
                             "$okCount/${list.size} онлайн" + if (warnCount > 0) " · $warnCount огранич." else "",
                             fontSize = 11.sp,
                             fontFamily = JetBrainsMonoFontFamily,
                             fontWeight = FontWeight.SemiBold,
-                            color = if (okCount >= list.size / 2) Color.EnaGreen else Color.EnaYellow,
+                            color = if (okCount >= list.size / 2) Color.EnaGreen else amber,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                         )
                     }
@@ -755,8 +756,8 @@ private fun ApiTab(state: AppState) {
                     val (badgeText, badgeColor) = when (st) {
                         "OK" -> "OK" to Color.EnaGreen
                         "FALLBACK" -> "РЕЗЕРВ" to MaterialTheme.colorScheme.primary
-                        "RATE_LIMIT" -> "ЛИМИТ" to Color.EnaYellow
-                        "SLOW" -> "МЕДЛЕННО" to Color.EnaYellow
+                        "RATE_LIMIT" -> "ЛИМИТ" to amber
+                        "SLOW" -> "МЕДЛЕННО" to amber
                         "UNAVAILABLE" -> "НЕДОСТУПЕН" to MaterialTheme.colorScheme.onSurfaceVariant
                         else -> "СБОЙ" to Color.EnaRed
                     }
@@ -957,9 +958,10 @@ private fun FaultsTab(state: AppState) {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                val amber = enaAmberText()
                 val healthColor = when {
                     summary.criticalCount > 0 -> Color.EnaRed
-                    summary.activeFaults > 0 -> Color.EnaYellow
+                    summary.activeFaults > 0 -> amber
                     else -> Color.EnaGreen
                 }
                 Box(
@@ -995,7 +997,7 @@ private fun FaultsTab(state: AppState) {
                 Text(
                     "Деградация: ${summary.failingComponents.joinToString(", ")}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color.EnaYellow,
+                    color = enaAmberText(),
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -1099,7 +1101,7 @@ private fun FaultsTab(state: AppState) {
                     val sevColor = when (ev.severity) {
                         FaultMonitor.Severity.CRITICAL -> Color.EnaRed
                         FaultMonitor.Severity.ERROR -> Color.EnaRed
-                        FaultMonitor.Severity.WARNING -> Color.EnaYellow
+                        FaultMonitor.Severity.WARNING -> enaAmberText()
                         FaultMonitor.Severity.INFO -> MaterialTheme.colorScheme.primary
                     }
                     SettingsCard {

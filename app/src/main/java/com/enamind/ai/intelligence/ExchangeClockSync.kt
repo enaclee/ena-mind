@@ -43,7 +43,8 @@ class ExchangeClockSync {
         http: OkHttpClient,
         bybitCooldown: Boolean,
         force: Boolean = false,
-        minIntervalMs: Long = 5 * 60_000L
+        minIntervalMs: Long = 5 * 60_000L,
+        bybitBaseUrl: String = "https://api.bybit.com"
     ): ClockSyncStatus {
         val now = System.currentTimeMillis()
         if (!force && synced && (now - lastSyncMs.get()) < minIntervalMs) {
@@ -72,7 +73,7 @@ class ExchangeClockSync {
         if (!bybitCooldown) {
             fetchTimeSample(
                 http,
-                "https://api.bybit.com/v5/market/time",
+                "${bybitBaseUrl.trimEnd('/')}/v5/market/time",
                 "Bybit"
             ) { json ->
                 val res = json.optJSONObject("result")

@@ -1,12 +1,16 @@
 package com.enamind.ai.bybit
 
+import com.enamind.ai.core.NetworkHub
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * OKX public WebSocket (wss://ws.okx.com:8443/ws/v5/public, ЧАСТЬ 3C промпта 7.0).
@@ -28,19 +32,17 @@ class OkxWs(
         val cvd: Double, val deltaPct: Double, val ageSec: Double
     )
 
-    private var ws: WebSocket? = null
-    private var reconnectMs = 2000L
-    private var closed = false
+    @Volatile private var ws: WebSocket? = null
+    @Volatile private var reconnectMs = 2000L
+    @Volatile private var closed = false
+    private val generation = AtomicLong(0L)
+    @Volatile private var pendingReconnect: ScheduledFuture<*>? = null
     private val trades = ArrayDeque<Trade>()
-    private var lastTradeTs = 0L
+    @Volatile private var lastTradeTs = 0L
 
     private data class Trade(val ts: Long, val buy: Boolean, val qty: Double)
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient = NetworkHub.wsClient(pingIntervalSec = 20L, connectTimeoutSec = 12L)
 
     private fun instId(): String {
         val base = symbol.removeSuffix("USDT").removeSuffix("USDC")
@@ -48,10 +50,17 @@ class OkxWs(
     }
 
     fun connect() {
+        pendingReconnect?.cancel(false)
+        pendingReconnect = null
         closed = false
+        val gen = generation.incrementAndGet()
         val req = Request.Builder().url("wss://ws.okx.com:8443/ws/v5/public").build()
         ws = http.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (gen != generation.get() || closed) {
+                    webSocket.close(1000, "stale")
+                    return
+                }
                 // подписка: trades + tickers свопа
                 val args = org.json.JSONArray().put(
                     JSONObject().put("channel", "trades").put("instId", instId())
@@ -64,6 +73,7 @@ class OkxWs(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (gen != generation.get() || closed) return
                 try {
                     handle(text)
                 } catch (_: Exception) {
@@ -71,13 +81,15 @@ class OkxWs(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (gen != generation.get() || closed) return
                 listener.onStatus(false, "OKX WS: ${t.message ?: "обрыв"}")
-                scheduleReconnect()
+                scheduleReconnect(gen)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (gen != generation.get()) return
                 listener.onStatus(false, "OKX WS: закрыт")
-                scheduleReconnect()
+                if (!closed) scheduleReconnect(gen)
             }
         })
     }
@@ -123,22 +135,28 @@ class OkxWs(
         )
     }
 
-    private fun scheduleReconnect() {
-        if (closed) return
+    private fun scheduleReconnect(gen: Long) {
+        if (closed || gen != generation.get()) return
         val delay = reconnectMs
         reconnectMs = (reconnectMs * 2).coerceAtMost(60_000)
-        Thread {
-            try {
-                Thread.sleep(delay)
-                if (!closed) connect()
-            } catch (_: InterruptedException) {
-            }
-        }.apply { isDaemon = true }.start()
+        pendingReconnect?.cancel(false)
+        pendingReconnect = reconnectExec.schedule({
+            if (!closed && gen == generation.get()) connect()
+        }, delay, TimeUnit.MILLISECONDS)
     }
 
     fun close() {
         closed = true
+        generation.incrementAndGet()
+        pendingReconnect?.cancel(false)
+        pendingReconnect = null
         ws?.close(1000, "bye")
         ws = null
+    }
+
+    companion object {
+        private val reconnectExec = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "OkxWs-Reconnect").apply { isDaemon = true }
+        }
     }
 }

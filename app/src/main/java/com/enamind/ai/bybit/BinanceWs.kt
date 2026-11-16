@@ -1,5 +1,6 @@
 package com.enamind.ai.bybit
 
+import com.enamind.ai.core.NetworkHub
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -7,6 +8,8 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -47,11 +50,13 @@ class BinanceWs(
         val divergence: Boolean = false
     )
 
-    private var ws: WebSocket? = null
-    private var reconnectMs = 2000L
-    private var closed = false
+    @Volatile private var ws: WebSocket? = null
+    @Volatile private var reconnectMs = 2000L
+    @Volatile private var closed = false
+    private val generation = AtomicLong(0L)
+    @Volatile private var pendingReconnect: ScheduledFuture<*>? = null
     private val trades = ArrayDeque<Trade>()
-    private var lastTradeTs = 0L
+    @Volatile private var lastTradeTs = 0L
 
     val diffBook = BinanceDiffBookSync(maxLevels = 120)
     private val snapshotFetching = AtomicBoolean(false)
@@ -59,16 +64,8 @@ class BinanceWs(
 
     private data class Trade(val ts: Long, val buy: Boolean, val qty: Double, val price: Double)
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
-        .build()
-
-    private val restHttp = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient = NetworkHub.wsClient(pingIntervalSec = 20L, connectTimeoutSec = 12L)
+    private val restHttp: OkHttpClient = NetworkHub.restClient(connectTimeoutSec = 6L, readTimeoutSec = 8L, writeTimeoutSec = 8L)
 
     private val bnSym = BybitRest.toBinanceSymbol(symbol)
     private val lower = bnSym.lowercase()
@@ -76,19 +73,27 @@ class BinanceWs(
     private val streams = "$lower@aggTrade/$lower@kline_$bnIv/$lower@depth@100ms/$lower@ticker"
 
     fun connect() {
+        pendingReconnect?.cancel(false)
+        pendingReconnect = null
         closed = false
+        val gen = generation.incrementAndGet()
         diffBook.reset()
         val req = Request.Builder()
             .url("wss://data-stream.binance.vision/stream?streams=$streams")
             .build()
         ws = http.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (gen != generation.get() || closed) {
+                    webSocket.close(1000, "stale")
+                    return
+                }
                 reconnectMs = 2000L
                 listener.onStatus(true, "Binance WS: поток подключён")
                 triggerRestSnapshotAsync()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (gen != generation.get() || closed) return
                 try {
                     handle(text)
                 } catch (_: Exception) {
@@ -96,15 +101,17 @@ class BinanceWs(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (gen != generation.get() || closed) return
                 listener.onStatus(false, "Binance WS: ${t.message ?: "обрыв"}")
                 diffBook.reset()
-                scheduleReconnect()
+                scheduleReconnect(gen)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (gen != generation.get()) return
                 listener.onStatus(false, "Binance WS: закрыт")
                 diffBook.reset()
-                if (!closed) scheduleReconnect()
+                if (!closed) scheduleReconnect(gen)
             }
         })
     }
@@ -197,7 +204,8 @@ class BinanceWs(
         if (now - lastSnapshotAttemptMs.get() < 2500L) return
         if (!snapshotFetching.compareAndSet(false, true)) return
         lastSnapshotAttemptMs.set(now)
-        Thread {
+        val gen = generation.get()
+        ioExec.execute {
             try {
                 val urls = listOf(
                     "https://data-api.binance.vision/api/v3/depth?symbol=$bnSym&limit=500",
@@ -205,7 +213,7 @@ class BinanceWs(
                     "https://api3.binance.com/api/v3/depth?symbol=$bnSym&limit=500"
                 )
                 for (url in urls) {
-                    if (closed) break
+                    if (closed || gen != generation.get()) break
                     val req = Request.Builder().url(url).header("Accept", "application/json").build()
                     val body = try {
                         restHttp.newCall(req).execute().use { r ->
@@ -238,7 +246,7 @@ class BinanceWs(
             } finally {
                 snapshotFetching.set(false)
             }
-        }.apply { isDaemon = true }.start()
+        }
     }
 
     private fun parsePairs(arr: JSONArray?): List<Pair<Double, Double>> {
@@ -278,24 +286,30 @@ class BinanceWs(
         )
     }
 
-    private fun scheduleReconnect() {
-        if (closed) return
+    private fun scheduleReconnect(gen: Long) {
+        if (closed || gen != generation.get()) return
         val delay = reconnectMs
         reconnectMs = (reconnectMs * 2).coerceAtMost(60_000)
-        Thread {
-            try {
-                Thread.sleep(delay)
-                if (!closed) connect()
-            } catch (_: InterruptedException) {
-            }
-        }.apply { isDaemon = true }.start()
+        pendingReconnect?.cancel(false)
+        pendingReconnect = ioExec.schedule({
+            if (!closed && gen == generation.get()) connect()
+        }, delay, TimeUnit.MILLISECONDS)
     }
 
     fun close() {
         closed = true
+        generation.incrementAndGet()
+        pendingReconnect?.cancel(false)
+        pendingReconnect = null
         diffBook.reset()
         ws?.close(1000, "bye")
         ws = null
+    }
+
+    companion object {
+        private val ioExec = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "BinanceWs-Worker").apply { isDaemon = true }
+        }
     }
 }
 

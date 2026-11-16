@@ -53,15 +53,16 @@ fun DynamicMarketGlowPanel(
 ) {
     val report by state.orderFlow.report.collectAsState()
     val glow = report.glow
+    val isLight = MaterialTheme.colorScheme.background.red > 0.5f
 
     val targetColor = when (glow.colorState) {
-        GlowColorState.GREEN -> Color(0xFF10B981)
-        GlowColorState.RED -> Color(0xFFEF4444)
+        GlowColorState.GREEN -> if (isLight) Color(0xFF059669) else Color(0xFF10B981)
+        GlowColorState.RED -> if (isLight) Color(0xFFDC2626) else Color(0xFFEF4444)
         GlowColorState.NEUTRAL -> Color(0xFF64748B)
     }
     val secondaryColor = when (glow.colorState) {
-        GlowColorState.GREEN -> Color(0xFF34D399)
-        GlowColorState.RED -> Color(0xFFFB7185)
+        GlowColorState.GREEN -> if (isLight) Color(0xFF10B981) else Color(0xFF34D399)
+        GlowColorState.RED -> if (isLight) Color(0xFFEF4444) else Color(0xFFFB7185)
         GlowColorState.NEUTRAL -> Color(0xFF94A3B8)
     }
 
@@ -117,13 +118,14 @@ fun DynamicMarketGlowPanel(
             val corner = 22.dp.toPx()
 
             // Мягкое внешнее ореольное свечение внизу и вокруг панели
+            val auraScale = if (isLight) 0.68f else 1.0f
             val auraCenter = Offset(cx, h * 0.68f)
             val auraRadius = (w * 0.48f).coerceAtLeast(120f)
             drawRoundRect(
                 brush = Brush.radialGradient(
                     colors = listOf(
-                        animatedBaseColor.copy(alpha = 0.36f * intensity),
-                        animatedEdgeColor.copy(alpha = 0.16f * intensity),
+                        animatedBaseColor.copy(alpha = 0.36f * intensity * auraScale),
+                        animatedEdgeColor.copy(alpha = 0.16f * intensity * auraScale),
                         Color.Transparent
                     ),
                     center = auraCenter,
@@ -218,10 +220,11 @@ fun DynamicMarketGlowStrip(
 ) {
     val report by state.orderFlow.report.collectAsState()
     val glow = report.glow
+    val isLight = MaterialTheme.colorScheme.background.red > 0.5f
     val baseColor by animateColorAsState(
         targetValue = when (glow.colorState) {
-            GlowColorState.GREEN -> Color(0xFF10B981)
-            GlowColorState.RED -> Color(0xFFEF4444)
+            GlowColorState.GREEN -> if (isLight) Color(0xFF059669) else Color(0xFF10B981)
+            GlowColorState.RED -> if (isLight) Color(0xFFDC2626) else Color(0xFFEF4444)
             GlowColorState.NEUTRAL -> Color(0xFF64748B)
         },
         animationSpec = tween(750),

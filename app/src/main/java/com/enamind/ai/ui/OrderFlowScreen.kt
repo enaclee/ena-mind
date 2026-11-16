@@ -53,6 +53,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.enamind.ai.bot.BotUiState
 import com.enamind.ai.core.AppState
 import com.enamind.ai.core.Settings
 import com.enamind.ai.orderflow.AbsorptionSide
@@ -67,10 +68,9 @@ import java.util.Locale
 
 /**
  * ENA — ORDER FLOW & ABSORPTION INTELLIGENCE.
- * Полностью заменяет старый экран «ЧАТ».
  * Содержит 5 областей:
  *  1. Текущее состояние рынка (+ выбор любого контракта и ТФ);
- *  2. График с Order Flow overlay (уровни S/R, зоны поглощения, ликвидность, атаки, неудачные пробои, события);
+ *  2. График с Order Flow & Bot overlay (уровни S/R, зоны поглощения, ликвидность, уровни бота);
  *  3. Footprint (кластеры Bid/Ask по ценам, Delta/%, CVD, POC, Stacked Imbalance);
  *  4. Анализ стакана (DOM: исполнение vs снятие, OFI, пополнение, удержание стен);
  *  5. Объяснение ENA человеческим языком + Сценарии A и B + Оценка достоверности и калибровки.
@@ -81,6 +81,7 @@ fun OrderFlowScreen(state: AppState) {
     val klines by state.klines.collectAsState()
     val lastBar by state.lastBar.collectAsState()
     val report by state.orderFlow.report.collectAsState()
+    val botState by state.botEngine.uiState.collectAsState()
     val favorites by state.favoriteSymbols.collectAsState()
     var showContractPicker by remember { mutableStateOf(false) }
 
@@ -177,8 +178,10 @@ fun OrderFlowScreen(state: AppState) {
             MarketStateAreaCard(state = state, report = report, priceFallback = market.price)
         }
 
-        // Область 2: График с Order Flow overlay
+        // Область 2: График с Order Flow & Bot overlay
         item(key = "of_chart_overlay") {
+            val hasBotOnSymbol = botState.chartOverlay.symbol.equals(market.symbol, ignoreCase = true) &&
+                (botState.chartOverlay.entryPrice != null || botState.chartOverlay.markers.isNotEmpty())
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 KlineChart(
                     bars = klines,
@@ -187,9 +190,11 @@ fun OrderFlowScreen(state: AppState) {
                     symbol = market.symbol,
                     intervalLabel = ivLabel,
                     sourceLabel = report.exchangeSource,
-                    orderFlowOverlay = report.overlay
+                    orderFlowOverlay = report.overlay,
+                    botOverlay = botState.chartOverlay
                 )
-                OverlayLegendRow()
+                OverlayLegendRow(hasBotOnSymbol)
+                BotSymbolOverlayStrip(symbol = market.symbol, botState = botState)
             }
         }
 
@@ -283,13 +288,16 @@ private fun MarketStateAreaCard(
     report: OrderFlowReport,
     priceFallback: Double?
 ) {
+    val amber = enaAmberText()
     val (domColor, domBadge) = when (report.dominance) {
         MarketDominance.BUYERS_DOMINATE, MarketDominance.CONFIRMED_BREAKOUT ->
             Color.EnaGreen to "ПОКУПАТЕЛИ"
         MarketDominance.SELLERS_DOMINATE, MarketDominance.CONFIRMED_REJECTION ->
             Color.EnaRed to "ПРОДАВЦЫ"
         MarketDominance.POSSIBLE_ABSORPTION ->
-            Color.EnaYellow to "ПОГЛОЩЕНИЕ"
+            amber to "ПОГЛОЩЕНИЕ"
+        MarketDominance.CONFLICT ->
+            amber to "КОНФЛИКТ"
         MarketDominance.CONTESTED ->
             MaterialTheme.colorScheme.primary to "БОРЬБА"
         MarketDominance.INSUFFICIENT_DATA ->
@@ -298,7 +306,7 @@ private fun MarketStateAreaCard(
 
     val (freshColor, freshLabel) = when (report.freshness) {
         DataFreshness.LIVE -> Color.EnaGreen to report.freshness.labelRu
-        DataFreshness.STALE -> Color.EnaYellow to report.freshness.labelRu
+        DataFreshness.STALE -> amber to report.freshness.labelRu
         DataFreshness.DESYNC -> Color.EnaRed to report.freshness.labelRu
         DataFreshness.INSUFFICIENT -> MaterialTheme.colorScheme.onSurfaceVariant to report.freshness.labelRu
     }
@@ -370,7 +378,7 @@ private fun MarketStateAreaCard(
 }
 
 @Composable
-private fun OverlayLegendRow() {
+private fun OverlayLegendRow(showBotChip: Boolean = false) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -383,6 +391,56 @@ private fun OverlayLegendRow() {
         LegendChip("Ликвидность DOM", Color(0xFF60A5FA))
         LegendChip("Неудавш. пробой", Color(0xFFFF6D00))
         LegendChip("Событие", Color(0xFFA855F7))
+        if (showBotChip) {
+            LegendChip("Уровни/сделки бота", Color(0xFF3B82F6))
+        }
+    }
+}
+
+@Composable
+private fun BotSymbolOverlayStrip(symbol: String, botState: BotUiState) {
+    val active = botState.activePosition?.takeIf { it.symbol.equals(symbol, ignoreCase = true) }
+    val symbolTrades = botState.recentTrades.filter { it.symbol.equals(symbol, ignoreCase = true) }.takeLast(3).reversed()
+    if (active == null && symbolTrades.isEmpty()) return
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(0.75.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (active != null) {
+                val pnlColor = if (active.netPnlUsdt >= 0) enaGreenText() else Color.EnaRed
+                Text(
+                    "БОТ (${active.mode.shortLabel}) · ${active.side.labelRu} @ ${ofFmtPrice(active.entryPrice)} · " +
+                        "Net ${ofFmt("%+.2f%%", active.netPnlPct)} (${ofFmt("%+.2f", active.netPnlUsdt)}$)" +
+                        (active.trailFloorPrice?.let { " · Трал ${ofFmtPrice(it)}" } ?: ""),
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    fontFamily = FontFamily.Monospace,
+                    color = pnlColor
+                )
+            }
+            if (symbolTrades.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    symbolTrades.forEach { tr ->
+                        val c = if (tr.won) enaGreenText() else Color.EnaRed
+                        Text(
+                            "${tr.side.labelRu} ${ofFmt("%+.2f%%", tr.netPnlPct)} (${tr.mode.shortLabel})",
+                            fontSize = 9.5.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = c
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -517,7 +575,7 @@ private fun FootprintLevelRow(lvl: FootprintLevel, maxTotal: Double) {
                         fontSize = 8.5.sp,
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace,
-                        color = Color.EnaYellow,
+                        color = enaAmberText(),
                         modifier = Modifier.padding(end = 6.dp)
                     )
                 }
@@ -545,10 +603,11 @@ private fun DomAndLevelAttackAreaCard(report: OrderFlowReport) {
     val dom = report.dom
     val abs = report.absorption
     val atk = report.levelAttack
+    val amber = enaAmberText()
 
     val badgeColor = when {
         !dom.sufficientData -> MaterialTheme.colorScheme.onSurfaceVariant
-        abs.confirmed -> Color.EnaYellow
+        abs.confirmed -> amber
         dom.normalizedOfi > 0.15 -> Color.EnaGreen
         dom.normalizedOfi < -0.15 -> Color.EnaRed
         else -> MaterialTheme.colorScheme.primary
@@ -596,7 +655,7 @@ private fun DomAndLevelAttackAreaCard(report: OrderFlowReport) {
                     "⚠ ${dom.liquidityPullNote}",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = Color.EnaYellow
+                    color = amber
                 )
             }
             if (dom.migrationNote.isNotBlank()) {
@@ -663,8 +722,8 @@ private fun DomAndLevelAttackAreaCard(report: OrderFlowReport) {
             fontSize = 11.5.sp,
             fontWeight = FontWeight.SemiBold,
             color = when (abs.side) {
-                AbsorptionSide.BUYER_ABSORPTION -> Color.EnaRed
-                AbsorptionSide.SELLER_ABSORPTION -> Color.EnaGreen
+                AbsorptionSide.BUYER_ABSORPTION -> Color.EnaGreen
+                AbsorptionSide.SELLER_ABSORPTION -> Color.EnaRed
                 AbsorptionSide.NONE -> MaterialTheme.colorScheme.onSurfaceVariant
             }
         )
@@ -690,11 +749,12 @@ private fun DomAndLevelAttackAreaCard(report: OrderFlowReport) {
 @Composable
 private fun ExplanationAndScenariosAreaCard(report: OrderFlowReport) {
     val conf = report.confidence
+    val amber = enaAmberText()
     val confColor = when (conf.grade) {
         ReliabilityGrade.CONFIRMED -> Color.EnaGreen
         ReliabilityGrade.STRONG -> MaterialTheme.colorScheme.primary
-        ReliabilityGrade.MODERATE -> Color.EnaYellow
-        ReliabilityGrade.WEAK -> Color.EnaYellow
+        ReliabilityGrade.MODERATE -> amber
+        ReliabilityGrade.WEAK -> amber
         ReliabilityGrade.INSUFFICIENT -> MaterialTheme.colorScheme.onSurfaceVariant
     }
 
@@ -730,7 +790,7 @@ private fun ExplanationAndScenariosAreaCard(report: OrderFlowReport) {
 
         // Оба сценария одновременно (A — разворот, B — пробой)
         report.scenarioA?.let { scA ->
-            ScenarioCaseCard(scenario = scA, accent = Color.EnaYellow)
+            ScenarioCaseCard(scenario = scA, accent = amber)
         }
         report.scenarioB?.let { scB ->
             ScenarioCaseCard(scenario = scB, accent = MaterialTheme.colorScheme.primary)
@@ -839,7 +899,7 @@ private fun ScenarioCaseCard(scenario: ScenarioCase, accent: Color) {
                 scenario.needsConfirmation.forEach { Text("• $it", fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
             if (scenario.invalidationConditions.isNotEmpty()) {
-                Text("Когда теряет актуальность:", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.EnaYellow)
+                Text("Когда теряет актуальность:", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = enaAmberText())
                 scenario.invalidationConditions.forEach { Text("• $it", fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
         }

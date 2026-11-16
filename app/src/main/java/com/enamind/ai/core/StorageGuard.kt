@@ -38,6 +38,12 @@ object StorageGuard {
         if (enamindDir.isDirectory) {
             deletedTmp += deleteTmpRecursive(enamindDir)
         }
+        val botCache = botCacheDir(ctx)
+        if (botCache.isDirectory) {
+            val (bDel, bFreed) = pruneStaleInDir(botCache, nowMs - STALE_BOT_CACHE_MS)
+            deletedCache += bDel
+            freed += bFreed
+        }
         ctx.getExternalFilesDir("ENA-MIND-Memory")?.takeIf { it.isDirectory }?.let {
             deletedTmp += deleteTmpRecursive(it)
         }
@@ -70,6 +76,22 @@ object StorageGuard {
 
         return HygieneReport(deletedTmp, deletedCache, freed, remaining)
     }
+
+    /** Выделенная папка изолированного торгового движка и его кэша (разгрузка основного контура). */
+    fun botEngineDir(ctx: Context): File =
+        File(File(ctx.filesDir, "enamind"), "bot_engine").apply { mkdirs() }
+
+    fun botCacheDir(ctx: Context): File =
+        File(botEngineDir(ctx), "cache").apply { mkdirs() }
+
+    fun pruneBotCaches(ctx: Context, nowMs: Long = System.currentTimeMillis()) {
+        val dir = botCacheDir(ctx)
+        if (dir.isDirectory) {
+            pruneStaleInDir(dir, nowMs - STALE_BOT_CACHE_MS)
+        }
+    }
+
+    private const val STALE_BOT_CACHE_MS = 6L * 3600_000L
 
     /** Безопасная ручная очистка временного кэша (не затрагивает память и прогнозы). */
     fun clearTemporaryCache(ctx: Context): HygieneReport {
