@@ -95,6 +95,7 @@ class OrderFlowEventVault(
     fun recordEvent(report: OrderFlowReport) {
         val px = report.price ?: return
         if (!px.isFinite() || px <= 0.0) return
+        if (report.wsStale || report.freshness != DataFreshness.LIVE) return
         val significant = report.absorption.detected ||
             report.levelAttack.phase == LevelAttackPhase.CONFIRMED_REJECTION ||
             report.levelAttack.phase == LevelAttackPhase.CONFIRMED_BREAKOUT
@@ -102,15 +103,25 @@ class OrderFlowEventVault(
 
         val evType = when {
             report.levelAttack.phase == LevelAttackPhase.CONFIRMED_BREAKOUT -> "CONFIRMED_BREAKOUT"
-            report.levelAttack.phase == LevelAttackPhase.CONFIRMED_REJECTION -> "CONFIRMED_REJECTION"
+            report.levelAttack.phase == LevelAttackPhase.CONFIRMED_REJECTION -> {
+                if (report.absorption.supportingFactors.isEmpty()) return
+                "CONFIRMED_REJECTION"
+            }
             report.absorption.side != AbsorptionSide.NONE -> report.absorption.side.name
             else -> return
+        }
+
+        val resolvedIsResistance = when (evType) {
+            "SELLER_ABSORPTION" -> true
+            "BUYER_ABSORPTION" -> false
+            else -> report.levelAttack.isResistance
         }
 
         val now = report.computedAtMs
         synchronized(lock) {
             val last = events.lastOrNull()
             if (last != null && last.symbol == report.symbol && last.eventType == evType &&
+                last.interval == report.interval &&
                 (now - last.detectedAtMs) < 20_000L
             ) {
                 return
@@ -125,7 +136,7 @@ class OrderFlowEventVault(
                 entryPrice = px,
                 levelPrice = report.levelAttack.levelPrice ?: report.absorption.targetLevelPrice,
                 eventType = evType,
-                isResistance = report.levelAttack.isResistance,
+                isResistance = resolvedIsResistance,
                 grade = report.confidence.grade.name,
                 deltaPct = report.footprint.deltaPct,
                 normalizedOfi = report.dom.normalizedOfi,
@@ -152,14 +163,18 @@ class OrderFlowEventVault(
      *  - На 30s-горизонте (и для ТФ "1") используется порог 0.045%.
      *  - На расширенном ТФ-горизонте (3m/5m/15m+ -> horizonMs >= 180_000L), как только наступает horizonMs,
      *    итог пересчитывается по reactionTfPct с fee-aware порогом FLAT = 0.22%.
+     *  - Запрещено подставлять устаревшую закрытую свечу из кэша bars.lastOrNull() с ts < targetTs.
      */
     fun verifyForwardOutcomes(
         symbol: String,
         futureTicks: List<OrderFlowStreamHub.RawTradeTick>,
         nowMs: Long,
-        bars: List<List<Double>> = emptyList()
+        bars: List<List<Double>> = emptyList(),
+        barsInterval: String = "",
+        livePrice: Double? = null
     ) {
-        if (futureTicks.isEmpty() && bars.isEmpty()) return
+        val validLivePrice = livePrice?.takeIf { it.isFinite() && it > 0.0 }
+        if (futureTicks.isEmpty() && bars.isEmpty() && validLivePrice == null) return
         synchronized(lock) {
             var changed = false
             for (idx in events.indices) {
@@ -172,7 +187,7 @@ class OrderFlowEventVault(
                 if (ev.verifiedOutcome != "PENDING" && (!isExtendedTf || tfComplete)) continue
 
                 val after = futureTicks.filter { it.exchangeTsMs > ev.detectedAtMs }
-                if (after.isEmpty() && bars.isEmpty() && (nowMs - ev.detectedAtMs) < 35_000L) continue
+                if (after.isEmpty() && bars.isEmpty() && validLivePrice == null && (nowMs - ev.detectedAtMs) < 35_000L) continue
 
                 fun tickAtOffset(offsetMs: Long): Double? {
                     val targetTs = ev.detectedAtMs + offsetMs
@@ -183,15 +198,27 @@ class OrderFlowEventVault(
 
                 fun priceAtTfHorizon(): Double? {
                     val targetTs = ev.detectedAtMs + horizonMs
+                    if (nowMs < targetTs) return null
+
+                    // 1. Свежий тик из ленты строго на/после targetTs
                     val fromTicks = after.firstOrNull { it.exchangeTsMs >= targetTs }?.price
                     if (fromTicks != null) return fromTicks
-                    if (bars.isNotEmpty() && nowMs >= targetTs) {
-                        val bar = bars.firstOrNull { (it.getOrNull(0)?.toLong() ?: 0L) >= targetTs }
-                        val close = bar?.getOrNull(4)?.takeIf { it.isFinite() && it > 0.0 }
-                        if (close != null) return close
-                        if (nowMs >= targetTs + 15_000L) {
-                            return after.lastOrNull()?.price ?: bars.lastOrNull()?.getOrNull(4)?.takeIf { it.isFinite() && it > 0.0 }
+
+                    // 2. Свежая живая рыночная цена при условии, что событие проверяется в реальном времени около targetTs
+                    // (исключает ретроспективное склеивание 41 старого события на одну цену после переподключения)
+                    if (validLivePrice != null && (nowMs - targetTs) in 0L..90_000L) {
+                        return validLivePrice
+                    }
+
+                    // 3. Строго свеча совпадающего таймфрейма, timestamp которой действительно достиг targetTs
+                    val intervalMatches = barsInterval.isBlank() || barsInterval == ev.interval
+                    if (bars.isNotEmpty() && intervalMatches) {
+                        val matchingBar = bars.firstOrNull { bar ->
+                            val barOpenTs = bar.getOrNull(0)?.toLong() ?: 0L
+                            barOpenTs >= targetTs && barOpenTs <= targetTs + horizonMs
                         }
+                        val close = matchingBar?.getOrNull(4)?.takeIf { it.isFinite() && it > 0.0 }
+                        if (close != null) return close
                     }
                     return null
                 }

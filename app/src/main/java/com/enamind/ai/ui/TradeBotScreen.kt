@@ -140,7 +140,11 @@ fun TradeBotScreen(state: AppState) {
 
         uiState.activePosition?.let { pos ->
             item(key = "bot_active_pos") {
-                BotActivePositionCard(pos = pos, slEnabled = uiState.config.stopLossEnabled)
+                BotActivePositionCard(
+                    pos = pos,
+                    slEnabled = uiState.config.stopLossEnabled,
+                    maxTranches = uiState.config.maxTranches
+                )
             }
         }
 
@@ -149,7 +153,7 @@ fun TradeBotScreen(state: AppState) {
         }
 
         item(key = "bot_strategy") {
-            BotStrategyRiskCard(state = state, cfg = uiState.config)
+            BotStrategyRiskCard(state = state, cfg = uiState.config, uiState = uiState)
         }
 
         item(key = "bot_hud_bg") {
@@ -240,12 +244,44 @@ private fun BotHeaderControlCard(
             false -> "Classic"
             null -> "—"
         }
+        val feeLabel = buildString {
+            append("Maker ${botFmt("%.3f%%", uiState.makerFeePct)} / Taker ${botFmt("%.4f%%", uiState.takerFeePct)}")
+            if (uiState.isTradFiFeeProfile) append(" (TradFi)")
+        }
         Text(
-            "Счёт: $utaTxt · Комиссия ~${botFmt("%.3f%%", uiState.feeRateSidePct)} · ${uiState.statusText}",
-            fontSize = 11.sp,
+            "Счёт: $utaTxt · $feeLabel · Эфф. маржа ${botFmt("%.2f", uiState.effectiveCapitalUsdt)}/${botFmt("%.0f", cfg.capitalUsdt)} $",
+            fontSize = 10.5.sp,
             fontFamily = FontFamily.Monospace,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+        Text(
+            "Стратегия: ${cfg.strategyModel.labelRu} · Статус: ${uiState.statusText}",
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(10.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    "Сигнал / Ожидание: ${uiState.waitReasonBadge}",
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                if (uiState.anchorsSummary.isNotBlank()) {
+                    Text(
+                        "Якори: ${uiState.anchorsSummary}",
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
 
         if (uiState.isNetworkRateLimited) {
             Text(
@@ -253,6 +289,21 @@ private fun BotHeaderControlCard(
                 fontSize = 10.5.sp,
                 color = amber
             )
+        }
+
+        listOfNotNull(
+            uiState.venueSyncMismatchWarning,
+            uiState.minNotionalWarning,
+            uiState.trailingNoiseWarning
+        ).forEach { warn ->
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp),
+                color = amber.copy(alpha = 0.12f),
+                border = BorderStroke(0.8.dp, amber.copy(alpha = 0.45f))
+            ) {
+                Text("⚠ $warn", fontSize = 10.5.sp, color = amber, modifier = Modifier.padding(9.dp))
+            }
         }
 
         uiState.lastError?.let { err ->
@@ -325,21 +376,27 @@ private fun BotHeaderControlCard(
 }
 
 @Composable
-private fun BotActivePositionCard(pos: ActivePosition, slEnabled: Boolean) {
+private fun BotActivePositionCard(pos: ActivePosition, slEnabled: Boolean, maxTranches: Int) {
     val green = enaGreenText()
     val amber = enaAmberText()
     val pnlColor = if (pos.netPnlUsdt >= 0) green else Color.EnaRed
 
     BotSectionCard(
         title = "ОТКРЫТАЯ ПОЗИЦИЯ · ${pos.symbol}",
-        subtitle = "${pos.side.labelRu} · ${pos.leverage}x ${pos.marginMode.labelRu}",
+        subtitle = "${pos.side.labelRu} · ${pos.leverage}x ${pos.marginMode.labelRu} · Транш ${pos.trancheCount}/$maxTranches",
         icon = Icons.Outlined.CandlestickChart,
         badgeText = "${botFmt("%+.2f%%", pos.netPnlPct)} (${botFmt("%+.2f", pos.netPnlUsdt)} $)",
         badgeColor = pnlColor
     ) {
-        BotRow("Вход / Марк", "${botFmtPrice(pos.entryPrice)} → ${botFmtPrice(pos.markPrice)}")
+        BotRow("Средняя (Blended) → Марк", "${botFmtPrice(pos.entryPrice)} → ${botFmtPrice(pos.markPrice)}")
         BotRow("Объём / Маржа", "${pos.qty} · ${botFmt("%.2f", pos.usedMarginUsdt)} USDT")
-        BotRow("Пик Net PnL / Комиссии", "${botFmt("%+.2f%%", pos.peakNetPnlPct)} · fee ${botFmt("%.2f", pos.estFeeUsdt)}$")
+        BotRow(
+            "Пик Net PnL / Комиссии",
+            "${botFmt("%+.2f%%", pos.peakNetPnlPct)} · вход ${botFmt("%.3f", pos.paidEntryFeesUsdt)}$ / все ${botFmt("%.3f", pos.estFeeUsdt)}$"
+        )
+        if (pos.peelDone) {
+            BotRow("Скальп-фиксация 50%", "Выполнена (остаток в сопровождении)", green)
+        }
         BotRow("Цель мин / макс", "${botFmtPrice(pos.tpMinPrice)} / ${botFmtPrice(pos.tpMaxPrice)}", green)
         pos.trailFloorPrice?.let { tf ->
             BotRow("Трал-фиксация (≥${botFmt("%.2f%%", pos.trailingFloorPct ?: 0.0)})", botFmtPrice(tf), amber)

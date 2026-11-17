@@ -72,17 +72,24 @@ object LevelAttackDetector {
                     levelPrice = targetLevel,
                     isResistance = attackingResistance,
                     distancePct = if (distPct < 100.0) distPct else null,
-                    phase = LevelAttackPhase.NONE
+                    phase = LevelAttackPhase.NONE,
+                    atr1mPct = atrPct
                 )
             )
         }
 
+        val effectiveIsResistance = when (absorption.side) {
+            AbsorptionSide.SELLER_ABSORPTION -> true
+            AbsorptionSide.BUYER_ABSORPTION -> false
+            AbsorptionSide.NONE -> attackingResistance
+        }
+
         val inTouchZone = abs(currentPrice - targetLevel) <= zoneTol
         val touchCount = countLevelTouches(bars, trades, targetLevel, zoneTol)
-        val acceptedBeyond = checkAcceptanceBeyond(trades, bars, targetLevel, zoneTol, attackingResistance)
-        val nearLiquidityRatio = computeCounterLiquidityPct(dom, targetLevel, zoneTol, attackingResistance)
+        val acceptedBeyond = checkAcceptanceBeyond(trades, bars, targetLevel, zoneTol, effectiveIsResistance)
+        val nearLiquidityRatio = computeCounterLiquidityPct(dom, targetLevel, zoneTol, effectiveIsResistance)
 
-        val peakInTrades = if (attackingResistance) trades.maxOfOrNull { it.price } else trades.minOfOrNull { it.price }
+        val peakInTrades = if (effectiveIsResistance) trades.maxOfOrNull { it.price } else trades.minOfOrNull { it.price }
         val postReactionPct = if (peakInTrades != null && peakInTrades > 0.0) {
             100.0 * (currentPrice - peakInTrades) / peakInTrades
         } else null
@@ -95,14 +102,14 @@ object LevelAttackDetector {
         val failedZones = mutableListOf<Double>()
         if (touchCount >= 2 && inTouchZone) repeatedZones.add(targetLevel)
 
-        val attackerMatchingDirection = if (attackingResistance) footprint.netDelta > 0 else footprint.netDelta < 0
+        val attackerMatchingDirection = if (effectiveIsResistance) footprint.netDelta > 0 else footprint.netDelta < 0
         val strongAggression = abs(footprint.deltaPct) >= 12.0 && footprint.sufficientData
-        val ofiAlignedBreakout = if (attackingResistance) dom.normalizedOfi >= 0.12 else dom.normalizedOfi <= -0.12
+        val ofiAlignedBreakout = if (effectiveIsResistance) dom.normalizedOfi >= 0.12 else dom.normalizedOfi <= -0.12
         val flatQuantRegime = quantAdx != null && quantEfficiencyRatio != null &&
             quantAdx.isFinite() && quantEfficiencyRatio.isFinite() &&
             quantAdx < 18.0 && quantEfficiencyRatio < 0.20
 
-        val rejectedNow = if (attackingResistance) {
+        val rejectedNow = if (effectiveIsResistance) {
             (peakInTrades != null && peakInTrades >= targetLevel - zoneTol) &&
                 currentPrice < targetLevel - zoneTol * 0.9 &&
                 (postReactionPct != null && postReactionPct <= -zonePct * 0.65)
@@ -112,12 +119,15 @@ object LevelAttackDetector {
                 (postReactionPct != null && postReactionPct >= zonePct * 0.65)
         }
 
+        val hasSupportingEvidence = absorption.supportingFactors.isNotEmpty() &&
+            (absorption.detected || (absorption.absorptionRatio > 0.0 && abs(footprint.deltaPct) >= 12.0))
+
         val phase = when {
             acceptedBeyond && !absorption.confirmed && !flatQuantRegime &&
                 attackerMatchingDirection && ofiAlignedBreakout && dom.executedQty > 0.0 ->
                 LevelAttackPhase.CONFIRMED_BREAKOUT
 
-            rejectedNow && (absorption.detected || touchCount >= 2) -> {
+            rejectedNow && hasSupportingEvidence && (absorption.detected || touchCount >= 2) -> {
                 failedZones.add(targetLevel)
                 LevelAttackPhase.CONFIRMED_REJECTION
             }
@@ -142,7 +152,7 @@ object LevelAttackDetector {
             resistances = resistances,
             attackState = LevelAttackState(
                 levelPrice = targetLevel,
-                isResistance = attackingResistance,
+                isResistance = effectiveIsResistance,
                 distancePct = distPct,
                 touchCount = touchCount,
                 phase = phase,
@@ -153,7 +163,8 @@ object LevelAttackDetector {
                 acceptedBeyondLevel = acceptedBeyond,
                 postAttackReactionPct = postReactionPct,
                 repeatedAttackZones = repeatedZones,
-                failedBreakoutZones = failedZones
+                failedBreakoutZones = failedZones,
+                atr1mPct = atrPct
             )
         )
     }

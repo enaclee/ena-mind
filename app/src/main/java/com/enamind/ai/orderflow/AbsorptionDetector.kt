@@ -52,6 +52,7 @@ object AbsorptionDetector {
         val spanSec = ((trades.last().exchangeTsMs - trades.first().exchangeTsMs).coerceAtLeast(1000L)) / 1000.0
 
         val typicalBarRangePct = computeTypicalBarRangePct(bars)
+        val atr1mPct = computeAtr1mPct(bars, typicalBarRangePct)
         val actualMovePct = 100.0 * (lastPrice - firstPrice) / max(1e-9, firstPrice)
         val rangePct = 100.0 * priceRange / max(1e-9, firstPrice)
 
@@ -94,12 +95,30 @@ object AbsorptionDetector {
             candidateSupport ?: footprint.pocPrice
         }
 
+        // 0. Proximity Gate: |entryPrice - levelPrice| / entryPrice <= max(0.0008, atr1mFraction * 0.45)
+        // И жёсткое соблюдение полярности стороны уровня:
+        //  - SELLER_ABSORPTION (delta > 0): цена тестирует сопротивление (lastPrice <= level * (1 + tol))
+        //  - BUYER_ABSORPTION (delta < 0): цена тестирует поддержку (lastPrice >= level * (1 - tol))
+        val proximityTolRatio = max(0.0008, (atr1mPct / 100.0) * 0.45)
+        val distRatio = if (targetLevel != null && targetLevel > 0.0) {
+            abs(lastPrice - targetLevel) / max(1e-9, lastPrice)
+        } else Double.MAX_VALUE
+        val polarityMatchesLevel = if (targetLevel != null && targetLevel > 0.0) {
+            if (isSellerAbsorbing) {
+                lastPrice <= targetLevel * (1.0 + proximityTolRatio)
+            } else {
+                lastPrice >= targetLevel * (1.0 - proximityTolRatio)
+            }
+        } else false
+        val inProximityGate = targetLevel != null && distRatio <= proximityTolRatio && polarityMatchesLevel
+
         // 1. Signed Price Progress Efficiency: движение цены в сторону агрессивного потока / типичная норма
         val favorableMovePct = if (isSellerAbsorbing) actualMovePct else -actualMovePct
         val denomNorm = max(0.05, typicalBarRangePct ?: rangePct.coerceAtLeast(0.08))
         val progressEfficiency = (favorableMovePct / denomNorm).coerceIn(-1.5, 3.0)
-        // Истинное поглощение: цена почти не продвинулась и не ушла сильно против потока
-        val poorProgress = progressEfficiency in -0.25..0.30
+        val passiveTrap = progressEfficiency < -0.15
+        // Истинное поглощение: цена удержана у уровня и не улетела ни в пробой, ни в ловушку (< -0.15)
+        val poorProgress = progressEfficiency in -0.15..0.30
 
         // 2. Absorption Ratio
         val rawAr = (abs(footprint.deltaPct) / 100.0) * (1.0 - progressEfficiency.coerceIn(0.0, 1.0))
@@ -142,12 +161,22 @@ object AbsorptionDetector {
             conflicting += "Умеренная Delta (${fmtPct(footprint.deltaPct)}) без явного экстремума"
         }
 
+        if (!inProximityGate) {
+            conflicting += if (targetLevel == null) {
+                "Нет активного уровня S/R в Proximity Gate"
+            } else if (!polarityMatchesLevel) {
+                "Полярность не совпадает с типом уровня (${if (isSellerAbsorbing) "покупки против" else "продажи против"} уровня ${fmtD(targetLevel)})"
+            } else {
+                "Вне Proximity Gate до уровня (${fmtPct(distRatio * 100.0)} > ${fmtPct(proximityTolRatio * 100.0)})"
+            }
+        }
+
         if (poorProgress) {
             factorHits++
             supporting += "Цена удержана в узком диапазоне (${fmtPct(actualMovePct)} при норме ~${fmtPct(denomNorm)}, эфф. ${fmtD(progressEfficiency)})"
         } else {
-            conflicting += if (progressEfficiency < -0.25) {
-                "Цена уже пошла против потока (${fmtPct(actualMovePct)}) — фаза поглощения завершена"
+            conflicting += if (passiveTrap) {
+                "PASSIVE_TRAP / IMPULSE_REVERSAL: цена резко пошла против потока (${fmtPct(actualMovePct)}, эфф. ${fmtD(progressEfficiency)})"
             } else {
                 "Цена эффективно продвигается вслед за потоком (${fmtPct(actualMovePct)})"
             }
@@ -162,7 +191,7 @@ object AbsorptionDetector {
 
         if (dom.levelPersistenceRatio >= 0.55) {
             factorHits++
-            supporting += "Ликвидность на уровне устойчива (${(dom.levelPersistenceRatio * 100).toInt()}% падений — реальное исполнение)"
+            supporting += "Ликвидность на уровне устойчива (${(dom.levelPersistenceRatio * 100).toInt()}% удержания)"
         } else {
             conflicting += "Низкая устойчивость стакана (${(dom.levelPersistenceRatio * 100).toInt()}%): много отмен без сделок"
         }
@@ -191,8 +220,8 @@ object AbsorptionDetector {
             conflicting += "OFI направлен в сторону атакующих (${fmtD(dom.normalizedOfi)})"
         }
 
-        val detected = factorHits >= 3 && poorProgress
-        val confirmed = factorHits >= 5 && poorProgress && (dom.replenishmentEvents >= 2) && !dom.liquidityPullDetected
+        val detected = factorHits >= 3 && poorProgress && inProximityGate && !passiveTrap
+        val confirmed = factorHits >= 5 && detected && (dom.replenishmentEvents >= 2) && !dom.liquidityPullDetected
 
         val grade = when {
             confirmed -> ReliabilityGrade.CONFIRMED
@@ -207,7 +236,16 @@ object AbsorptionDetector {
             AbsorptionSide.NONE
         }
 
+        val classificationTag = when {
+            passiveTrap -> "PASSIVE_TRAP / IMPULSE_REVERSAL"
+            confirmed -> "CONFIRMED_${side.name}"
+            detected -> side.name
+            else -> ""
+        }
+
         val note = when {
+            passiveTrap -> "PASSIVE_TRAP / IMPULSE_REVERSAL: цена уже резко развернулась против агрессивного потока (${fmtD(progressEfficiency)})"
+            !inProximityGate -> "Вне зоны Proximity Gate уровня — импульс в середине поля не является поглощением"
             confirmed -> "${side.labelRu} · подтверждено ${supporting.size} признаками"
             detected -> "${side.labelRu} · признаки умеренные/сильные (${supporting.size}), ожидает подтверждения"
             else -> "Признаков поглощения недостаточно (${supporting.size} за, ${conflicting.size} против)"
@@ -227,6 +265,9 @@ object AbsorptionDetector {
             repeatedAttacks = repeatedAttacks,
             holdDurationSec = spanSec,
             targetLevelPrice = targetLevel,
+            targetIsResistance = if (detected) isSellerAbsorbing else null,
+            passiveTrapDetected = passiveTrap,
+            classificationTag = classificationTag,
             supportingFactors = supporting,
             conflictingFactors = conflicting,
             note = note
@@ -261,6 +302,21 @@ object AbsorptionDetector {
             if (h != null && l != null && c != null && c > 0.0 && h >= l) 100.0 * (h - l) / c else null
         }
         return if (list.isNotEmpty()) list.average() else null
+    }
+
+    private fun computeAtr1mPct(bars: List<List<Double>>, typicalBarRangePct: Double?): Double {
+        if (bars.size < 5) return (typicalBarRangePct ?: 0.18).coerceIn(0.05, 1.5)
+        val slice = bars.takeLast(15)
+        val trVals = ArrayList<Double>(slice.size)
+        for (i in 1 until slice.size) {
+            val h = slice[i].getOrNull(2) ?: continue
+            val l = slice[i].getOrNull(3) ?: continue
+            val prevC = slice[i - 1].getOrNull(4) ?: continue
+            if (prevC <= 0.0 || h < l) continue
+            val tr = max(h - l, max(abs(h - prevC), abs(l - prevC)))
+            trVals += 100.0 * tr / prevC
+        }
+        return if (trVals.isNotEmpty()) trVals.average().coerceIn(0.05, 2.0) else (typicalBarRangePct ?: 0.18)
     }
 
     private fun fmtPct(v: Double): String = String.format(Locale.US, "%+.2f%%", v)

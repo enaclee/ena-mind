@@ -1,5 +1,7 @@
 package com.enamind.ai.bot
 
+import com.enamind.ai.bot.strategy.OrderExecutionPreference
+import com.enamind.ai.bot.strategy.StrategyModelId
 import com.enamind.ai.core.NetworkHub
 import java.util.Locale
 
@@ -86,6 +88,26 @@ enum class DirectionPolicy(val labelRu: String) {
     }
 }
 
+enum class MakerFallbackPolicy(val labelRu: String) {
+    FALLBACK_MARKET("Фоллбэк в Market"),
+    CANCEL_SKIP("Отмена и ожидание");
+
+    companion object {
+        fun fromName(name: String?): MakerFallbackPolicy =
+            entries.firstOrNull { it.name == name } ?: FALLBACK_MARKET
+    }
+}
+
+enum class StopLossBasis(val labelRu: String) {
+    ROE_PCT("% Net / ROE"),
+    ATR_MULT("× ATR(1m)");
+
+    companion object {
+        fun fromName(name: String?): StopLossBasis =
+            entries.firstOrNull { it.name == name } ?: ROE_PCT
+    }
+}
+
 enum class HudDisplayMode(val labelRu: String) {
     OUTSIDE_APP_ONLY("Только поверх других окон"),
     ALWAYS("Всегда");
@@ -149,6 +171,16 @@ data class BybitCredentialSlot(
     }
 }
 
+data class TradeTranche(
+    val index: Int,
+    val entryPrice: Double,
+    val qty: Double,
+    val entryFeeUsdt: Double,
+    val enteredAtMs: Long,
+    val isMaker: Boolean = true,
+    val note: String = ""
+)
+
 data class BotConfig(
     val mode: BotMode = BotMode.PAPER,
     val symbol: String = "BTCUSDT",
@@ -159,7 +191,7 @@ data class BotConfig(
     val directionPolicy: DirectionPolicy = DirectionPolicy.BOTH,
     val minNetProfitPct: Double = 0.5,
     val maxProfitPct: Double = 3.5,
-    val trailingGivebackPct: Double = 0.35,
+    val trailingGivebackPct: Double = 0.90,
     val maxHoldWaitMin: Int = 30,
     // По решению пользователя: разрешение отключать Stop-Loss во всех режимах (Paper/Demo/Testnet/Mainnet)
     val stopLossEnabled: Boolean = false,
@@ -167,16 +199,51 @@ data class BotConfig(
     // Дублировать защитный безубыточный/трейлинг-стоп на сервере Bybit после выхода >= minNetProfitPct
     val serverTrailingGuardEnabled: Boolean = true,
     val dailyMaxLossPct: Double = 3.0,
-    val confirmSignalSec: Int = 6,
-    val requireGlowConsensus: Boolean = true,
-    val requireRadarNotFlat: Boolean = true,
+    val confirmSignalSec: Int = 4,
+    val requireGlowConsensus: Boolean = false,
+    val requireRadarNotFlat: Boolean = false,
     val allowCounterAbsorption: Boolean = false,
     // Плавающий HUD поверх окон можно включить заранее до запуска бота
     val hudEnabled: Boolean = false,
     val hudDisplayMode: HudDisplayMode = HudDisplayMode.OUTSIDE_APP_ONLY,
     val timeoutBehavior: TimeoutBehavior = TimeoutBehavior.KEEP_EXCHANGE_PROTECTION,
-    val paperStartBalanceUsdt: Double = 1000.0
-)
+    val paperStartBalanceUsdt: Double = 1000.0,
+    // Слой 4 & 5: изолированная стратегия, PostOnly Maker и траншевый движок продолжения
+    val strategyModel: StrategyModelId = StrategyModelId.FLOW_PULSE_CONTINUATION,
+    val executionPreference: OrderExecutionPreference = OrderExecutionPreference.MAKER_POST_ONLY,
+    val makerFallbackPolicy: MakerFallbackPolicy = MakerFallbackPolicy.FALLBACK_MARKET,
+    val maxTranches: Int = 3,
+    val trancheWeightsPct: List<Int> = listOf(30, 35, 35),
+    val scaleStepPct: Double = 0.28,
+    val useAtrScaleStep: Boolean = true,
+    val peelPartialEnabled: Boolean = true,
+    val allowUnlimitedHold: Boolean = false,
+    val stopLossBasis: StopLossBasis = StopLossBasis.ROE_PCT,
+    val stopLossAtrMult: Double = 2.0
+) {
+    fun normalizedTrancheWeights(): List<Int> {
+        val count = maxTranches.coerceIn(1, 4)
+        val raw = if (trancheWeightsPct.size == count && trancheWeightsPct.all { it > 0 }) {
+            trancheWeightsPct
+        } else {
+            defaultWeightsFor(count)
+        }
+        val sum = raw.sum().coerceAtLeast(1)
+        val scaled = raw.map { (it * 100) / sum }.toMutableList()
+        val diff = 100 - scaled.sum()
+        if (diff != 0 && scaled.isNotEmpty()) scaled[scaled.lastIndex] += diff
+        return scaled
+    }
+
+    companion object {
+        fun defaultWeightsFor(count: Int): List<Int> = when (count.coerceIn(1, 4)) {
+            1 -> listOf(100)
+            2 -> listOf(45, 55)
+            3 -> listOf(30, 35, 35)
+            else -> listOf(25, 25, 25, 25)
+        }
+    }
+}
 
 data class ActivePosition(
     val id: String,
@@ -190,7 +257,7 @@ data class ActivePosition(
     val marginMode: MarginMode,
     val usedMarginUsdt: Double,
     val openedAtMs: Long,
-    val feeRatePct: Double, // суммарная комиссия вход+выход в % от объёма (напр. 0.11%)
+    val feeRatePct: Double, // эффективная суммарная ставка вход+выход в % от объёма
     val estFeeUsdt: Double,
     val grossPnlUsdt: Double,
     val netPnlUsdt: Double,
@@ -203,8 +270,17 @@ data class ActivePosition(
     val stopLossPrice: Double? = null,
     val estLiquidationPrice: Double? = null,
     val serverTrailingStopPrice: Double? = null,
-    val entryReason: String = ""
-)
+    val entryReason: String = "",
+    val tranches: List<TradeTranche> = emptyList(),
+    val paidEntryFeesUsdt: Double = 0.0,
+    val makerFeePct: Double = 0.036,
+    val takerFeePct: Double = 0.10,
+    val exitFeeRatePct: Double = 0.036,
+    val peelDone: Boolean = false
+) {
+    val trancheCount: Int get() = tranches.size.coerceAtLeast(1)
+    val lastTranchePrice: Double get() = tranches.lastOrNull()?.entryPrice ?: entryPrice
+}
 
 data class BotTradeRecord(
     val id: String,
@@ -270,7 +346,7 @@ data class BotUiState(
     val config: BotConfig = BotConfig(),
     val statusText: String = "Остановлен · готов к запуску",
     val walletBalanceUsdt: Double? = null,
-    val feeRateSidePct: Double = 0.055,
+    val feeRateSidePct: Double = 0.036,
     val exchangeConnected: Boolean = false,
     val isUtaAccount: Boolean? = null,
     val activePosition: ActivePosition? = null,
@@ -280,7 +356,16 @@ data class BotUiState(
     val lastError: String? = null,
     val lastCheckNote: String = "",
     val mainnetConfirmedSession: Boolean = false,
-    val networkHealthOk: Boolean = true
+    val networkHealthOk: Boolean = true,
+    val makerFeePct: Double = 0.036,
+    val takerFeePct: Double = 0.10,
+    val isTradFiFeeProfile: Boolean = false,
+    val effectiveCapitalUsdt: Double = 50.0,
+    val minNotionalWarning: String? = null,
+    val waitReasonBadge: String = "Готов к запуску",
+    val venueSyncMismatchWarning: String? = null,
+    val trailingNoiseWarning: String? = null,
+    val anchorsSummary: String = ""
 ) {
     val activeModeStats: ModeWinrateStats
         get() = statsByMode[config.mode] ?: ModeWinrateStats(config.mode)

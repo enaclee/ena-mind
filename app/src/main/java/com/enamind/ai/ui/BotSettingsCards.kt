@@ -67,9 +67,13 @@ import com.enamind.ai.bot.BybitCredentialSlot
 import com.enamind.ai.bot.DirectionPolicy
 import com.enamind.ai.bot.HudDisplayMode
 import com.enamind.ai.bot.HudGlowZone
+import com.enamind.ai.bot.MakerFallbackPolicy
 import com.enamind.ai.bot.MarginMode
+import com.enamind.ai.bot.StopLossBasis
 import com.enamind.ai.bot.TargetBasis
 import com.enamind.ai.bot.TimeoutBehavior
+import com.enamind.ai.bot.strategy.OrderExecutionPreference
+import com.enamind.ai.bot.strategy.StrategyModelId
 import com.enamind.ai.core.AppState
 import kotlin.math.roundToInt
 
@@ -256,7 +260,8 @@ internal fun BotModeAndKeysCard(
 @Composable
 internal fun BotStrategyRiskCard(
     state: AppState,
-    cfg: BotConfig
+    cfg: BotConfig,
+    uiState: BotUiState = BotUiState(config = cfg)
 ) {
     val bot = state.botEngine
     val amber = enaAmberText()
@@ -269,14 +274,127 @@ internal fun BotStrategyRiskCard(
     var trailText by remember(cfg.trailingGivebackPct) { mutableStateOf(cfg.trailingGivebackPct.toString()) }
     var holdMinText by remember(cfg.maxHoldWaitMin) { mutableStateOf(cfg.maxHoldWaitMin.toString()) }
     var slText by remember(cfg.stopLossPct) { mutableStateOf(cfg.stopLossPct.toString()) }
+    var slAtrText by remember(cfg.stopLossAtrMult) { mutableStateOf(cfg.stopLossAtrMult.toString()) }
+    var scaleStepText by remember(cfg.scaleStepPct) { mutableStateOf(cfg.scaleStepPct.toString()) }
     var dailyLossText by remember(cfg.dailyMaxLossPct) { mutableStateOf(cfg.dailyMaxLossPct.toString()) }
     var levSlider by remember(cfg.leverage) { mutableFloatStateOf(cfg.leverage.toFloat().coerceIn(1f, maxLev.toFloat())) }
 
     BotSectionCard(
-        title = "СТРАТЕГИЯ, КАПИТАЛ И РИСК",
-        subtitle = "Net PnL 0.5%–3.5% (после комиссий) · SL отключаем во всех режимах",
+        title = "СТРАТЕГИЯ, ТРАНШИ И РИСК",
+        subtitle = "Горячее переключение StrategyBridge · PostOnly Maker · SL опционален",
         icon = Icons.Outlined.Tune
     ) {
+        Text(
+            "Модель стратегии (без сброса потоков):",
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            StrategyModelId.entries.forEach { model ->
+                FilterChip(
+                    selected = cfg.strategyModel == model,
+                    onClick = { bot.updateConfig { it.copy(strategyModel = model) } },
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("bot_strategy_${model.id}"),
+                    label = { Text(model.shortLabel, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) },
+                    colors = botChipColors()
+                )
+            }
+        }
+        Text(
+            cfg.strategyModel.descriptionRu,
+            fontSize = 10.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            OrderExecutionPreference.entries.forEach { pref ->
+                FilterChip(
+                    selected = cfg.executionPreference == pref,
+                    onClick = { bot.updateConfig { it.copy(executionPreference = pref) } },
+                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                    label = { Text(pref.labelRu, fontSize = 10.sp) },
+                    colors = botChipColors()
+                )
+            }
+        }
+        if (cfg.executionPreference == OrderExecutionPreference.MAKER_POST_ONLY) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                MakerFallbackPolicy.entries.forEach { fb ->
+                    FilterChip(
+                        selected = cfg.makerFallbackPolicy == fb,
+                        onClick = { bot.updateConfig { it.copy(makerFallbackPolicy = fb) } },
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                        label = { Text(fb.labelRu, fontSize = 10.sp) },
+                        colors = botChipColors()
+                    )
+                }
+            }
+        }
+
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Text(
+            "Движок незакрытой сделки (сетка траншей ${cfg.normalizedTrancheWeights().joinToString("/")}%, без встречного хеджа):",
+            fontSize = 10.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            (1..4).forEach { count ->
+                FilterChip(
+                    selected = cfg.maxTranches == count,
+                    onClick = {
+                        bot.updateConfig {
+                            it.copy(
+                                maxTranches = count,
+                                trancheWeightsPct = BotConfig.defaultWeightsFor(count)
+                            )
+                        }
+                    },
+                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                    label = { Text("$count транш.", fontSize = 10.5.sp) },
+                    colors = botChipColors()
+                )
+            }
+        }
+        if (cfg.maxTranches > 1) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = scaleStepText,
+                    onValueChange = { t ->
+                        scaleStepText = t
+                        t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(scaleStepPct = v) } }
+                    },
+                    label = { Text("Шаг добора %", fontSize = 10.5.sp) },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+                Box(modifier = Modifier.weight(1.2f)) {
+                    BotSwitchRow(
+                        title = "ATR шаг",
+                        subtitle = "max(шаг, ATR×1.3)",
+                        checked = cfg.useAtrScaleStep,
+                        onCheckedChange = { on -> bot.updateConfig { it.copy(useAtrScaleStep = on) } }
+                    )
+                }
+            }
+            BotSwitchRow(
+                title = "Снятие 50% скальп-слоя (PeelPartial)",
+                subtitle = "Фиксирует половину объёма в плюс при 2+ траншах",
+                checked = cfg.peelPartialEnabled,
+                onCheckedChange = { on -> bot.updateConfig { it.copy(peelPartialEnabled = on) } }
+            )
+        }
+
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
                 value = capitalText,
@@ -405,21 +523,43 @@ internal fun BotStrategyRiskCard(
                     holdMinText = t
                     t.toIntOrNull()?.let { v -> bot.updateConfig { it.copy(maxHoldWaitMin = v) } }
                 },
-                label = { Text("Ожидание (мин)", fontSize = 10.5.sp) },
+                enabled = !cfg.allowUnlimitedHold,
+                label = { Text(if (cfg.allowUnlimitedHold) "Без тайм-стопа" else "Ожидание (мин)", fontSize = 10.5.sp) },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 singleLine = true,
                 modifier = Modifier.weight(1f)
             )
         }
 
+        if (uiState.trailingNoiseWarning != null ||
+            (cfg.leverage >= 10 && cfg.targetBasis == TargetBasis.NET_ROE_PCT && cfg.trailingGivebackPct < 0.80)
+        ) {
+            Text(
+                "⚠ Трал < 0.80% ROE при плече ${cfg.leverage}x может выбиваться рыночным шумом (адаптивный пол = max(трал, спред×2.5))",
+                fontSize = 10.5.sp,
+                color = amber
+            )
+        }
+
+        BotSwitchRow(
+            title = "Hold до цели (без тайм-стопа)",
+            subtitle = "Удерживает позицию до тейка/трала/SL без закрытия по таймауту",
+            checked = cfg.allowUnlimitedHold,
+            onCheckedChange = { on -> bot.updateConfig { it.copy(allowUnlimitedHold = on) } }
+        )
+
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
         BotSwitchRow(
             title = "Биржевой Stop-Loss (можно отключить)",
             subtitle = if (cfg.stopLossEnabled) {
-                "Активен SL -${cfg.stopLossPct}% Net"
+                if (cfg.stopLossBasis == StopLossBasis.ATR_MULT) {
+                    "Активен SL -${cfg.stopLossAtrMult}×ATR(1m)"
+                } else {
+                    "Активен SL -${cfg.stopLossPct}% Net"
+                }
             } else {
-                "Stop-Loss выключен во всех режимах — контроль до ликвидации/ожидания"
+                "Stop-Loss выключен во всех режимах — контроль до ликвидации/цели"
             },
             checked = cfg.stopLossEnabled,
             testTag = "bot_sl_switch",
@@ -433,17 +573,42 @@ internal fun BotStrategyRiskCard(
                 color = amber
             )
         } else {
-            OutlinedTextField(
-                value = slText,
-                onValueChange = { t ->
-                    slText = t
-                    t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(stopLossPct = v) } }
-                },
-                label = { Text("Уровень Stop-Loss (Net %)", fontSize = 11.sp) },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                StopLossBasis.entries.forEach { sb ->
+                    FilterChip(
+                        selected = cfg.stopLossBasis == sb,
+                        onClick = { bot.updateConfig { it.copy(stopLossBasis = sb) } },
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                        label = { Text(sb.labelRu, fontSize = 10.5.sp) },
+                        colors = botChipColors()
+                    )
+                }
+            }
+            if (cfg.stopLossBasis == StopLossBasis.ATR_MULT) {
+                OutlinedTextField(
+                    value = slAtrText,
+                    onValueChange = { t ->
+                        slAtrText = t
+                        t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(stopLossAtrMult = v) } }
+                    },
+                    label = { Text("Множитель Stop-Loss (× ATR 1m)", fontSize = 11.sp) },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            } else {
+                OutlinedTextField(
+                    value = slText,
+                    onValueChange = { t ->
+                        slText = t
+                        t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(stopLossPct = v) } }
+                    },
+                    label = { Text("Уровень Stop-Loss (Net %)", fontSize = 11.sp) },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
 
         BotSwitchRow(

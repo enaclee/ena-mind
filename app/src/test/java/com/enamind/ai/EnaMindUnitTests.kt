@@ -999,4 +999,199 @@ class EnaMindUnitTests {
         assertTrue(msgContent.getJSONObject(0).getString("text").contains("Sample log line"))
         assertEquals("image_url", msgContent.getJSONObject(1).getString("type"))
     }
+
+    @Test
+    fun `orderFlowEventVault prevents stale priceTf cache freeze, enforces interval isolation and non-empty rejection factors`() {
+        val dir = createTempDirectory("of_vault_layer1_test").toFile()
+        try {
+            val vault = OrderFlowEventVault(primaryDir = dir)
+            vault.ensureInitialized()
+            val t0 = 1_700_000_000_000L
+            val t1 = t0 + 120_000L
+
+            val fp1 = FootprintEngine.analyze(
+                trades = (0 until 10).map {
+                    OrderFlowStreamHub.RawTradeTick("BTCUSDT", 1000.0, 1.0, false, t0 - 500L + it * 20L, 2L, "Bybit")
+                },
+                tickSize = 0.5,
+                bars = emptyList()
+            )
+
+            // 1) CONFIRMED_REJECTION without supportingFactors MUST NOT be recorded
+            vault.recordEvent(
+                OrderFlowReport(
+                    symbol = "BTCUSDT",
+                    exchangeSource = "Bybit",
+                    interval = "15",
+                    price = 1000.0,
+                    computedAtMs = t0,
+                    freshness = DataFreshness.LIVE,
+                    dominance = MarketDominance.CONFIRMED_REJECTION,
+                    footprint = fp1,
+                    levelAttack = LevelAttackState(levelPrice = 1000.0, isResistance = true, phase = LevelAttackPhase.CONFIRMED_REJECTION),
+                    absorption = com.enamind.ai.orderflow.AbsorptionMetrics(supportingFactors = emptyList())
+                )
+            )
+            assertEquals(0, vault.computeStats("BTCUSDT").totalRecorded)
+
+            // 2) BUYER_ABSORPTION forces isResistance=false even if levelAttack.isResistance was true
+            vault.recordEvent(
+                OrderFlowReport(
+                    symbol = "BTCUSDT",
+                    exchangeSource = "Bybit",
+                    interval = "15",
+                    price = 1000.0,
+                    computedAtMs = t0,
+                    freshness = DataFreshness.LIVE,
+                    dominance = MarketDominance.POSSIBLE_ABSORPTION,
+                    footprint = fp1,
+                    levelAttack = LevelAttackState(levelPrice = 1000.0, isResistance = true, phase = LevelAttackPhase.POSSIBLE_ABSORPTION),
+                    absorption = com.enamind.ai.orderflow.AbsorptionMetrics(
+                        side = AbsorptionSide.BUYER_ABSORPTION,
+                        detected = true,
+                        supportingFactors = listOf("Фактор 1")
+                    )
+                )
+            )
+            vault.recordEvent(
+                OrderFlowReport(
+                    symbol = "BTCUSDT",
+                    exchangeSource = "Bybit",
+                    interval = "15",
+                    price = 1005.0,
+                    computedAtMs = t1,
+                    freshness = DataFreshness.LIVE,
+                    dominance = MarketDominance.POSSIBLE_ABSORPTION,
+                    footprint = fp1,
+                    levelAttack = LevelAttackState(levelPrice = 1005.0, isResistance = false, phase = LevelAttackPhase.POSSIBLE_ABSORPTION),
+                    absorption = com.enamind.ai.orderflow.AbsorptionMetrics(
+                        side = AbsorptionSide.BUYER_ABSORPTION,
+                        detected = true,
+                        supportingFactors = listOf("Фактор 2")
+                    )
+                )
+            )
+
+            // Calling with wrong interval ("1") or stale bars (ts < targetTs) MUST leave priceTf = null
+            vault.verifyForwardOutcomes(
+                symbol = "BTCUSDT",
+                futureTicks = emptyList(),
+                nowMs = t1 + 960_000L,
+                bars = listOf(listOf((t0 + 60_000L).toDouble(), 1000.0, 1002.0, 999.0, 999.5, 50.0)),
+                barsInterval = "1"
+            )
+            val beforeExport = org.json.JSONObject(vault.exportHistoryBundle().jsonText).getJSONArray("events")
+            assertEquals(2, beforeExport.length())
+            assertFalse(beforeExport.getJSONObject(0).getBoolean("isResistance"))
+            assertTrue(beforeExport.getJSONObject(0).isNull("priceTf"))
+            assertTrue(beforeExport.getJSONObject(1).isNull("priceTf"))
+
+            // Calling with matching interval "15" and distinct bars >= t0+900s and >= t1+900s assigns distinct priceTf values
+            vault.verifyForwardOutcomes(
+                symbol = "BTCUSDT",
+                futureTicks = emptyList(),
+                nowMs = t1 + 960_000L,
+                bars = listOf(
+                    listOf((t0 + 900_000L).toDouble(), 1000.0, 1011.0, 999.0, 1010.0, 100.0),
+                    listOf((t1 + 900_000L).toDouble(), 1010.0, 1022.0, 1009.0, 1020.0, 100.0)
+                ),
+                barsInterval = "15"
+            )
+            val afterExport = org.json.JSONObject(vault.exportHistoryBundle().jsonText).getJSONArray("events")
+            assertEquals(1010.0, afterExport.getJSONObject(0).getDouble("priceTf"), 1e-6)
+            assertEquals(1020.0, afterExport.getJSONObject(1).getDouble("priceTf"), 1e-6)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `absorptionDetector enforces proximity gate and flags PASSIVE_TRAP on sharp adverse move`() {
+        val baseTs = 1_700_000_000_000L
+        val tightBars = (0 until 20).map { i ->
+            val ts = (baseTs - (20 - i) * 60_000L).toDouble()
+            listOf(ts, 100.0, 100.05, 99.95, 100.0, 50.0)
+        }
+        val domOk = com.enamind.ai.orderflow.DomSnapshotMetrics(
+            normalizedOfi = -0.15,
+            executedQty = 20.0,
+            cancelledQty = 2.0,
+            replenishmentRate = 0.65,
+            replenishmentEvents = 3,
+            levelPersistenceRatio = 0.85,
+            synchronized = true,
+            lagMs = 2L,
+            deltaSequenceCount = 12,
+            sufficientData = true
+        )
+
+        // 1) 0.35% distance from candidateResistance (100.35 vs 100.0) with tight 1m ATR (~0.10%) -> outside Proximity Gate!
+        val tradesAt100 = (0 until 20).map { i ->
+            OrderFlowStreamHub.RawTradeTick("BTCUSDT", 100.0, 2.0, i != 18, baseTs + i * 200L, 2L, "Bybit")
+        }
+        val fpAt100 = FootprintEngine.analyze(tradesAt100, tickSize = 0.05, bars = tightBars)
+        val outOfGate = AbsorptionDetector.analyze(
+            trades = tradesAt100,
+            footprint = fpAt100,
+            dom = domOk,
+            bars = tightBars,
+            candidateResistance = 100.35,
+            candidateSupport = 99.40
+        )
+        assertFalse(outOfGate.detected)
+
+        // 2) Sharp adverse reversal (progressEfficiency < -0.15) at resistance -> PASSIVE_TRAP / IMPULSE_REVERSAL
+        val trapTrades = (0 until 20).map { i ->
+            val px = 100.0 - i * 0.05
+            OrderFlowStreamHub.RawTradeTick("BTCUSDT", px, 2.0, i < 18, baseTs + i * 200L, 2L, "Bybit")
+        }
+        val fpTrap = FootprintEngine.analyze(trapTrades, tickSize = 0.05, bars = tightBars)
+        val trapAbs = AbsorptionDetector.analyze(
+            trades = trapTrades,
+            footprint = fpTrap,
+            dom = domOk,
+            bars = tightBars,
+            candidateResistance = 100.0,
+            candidateSupport = 98.0
+        )
+        assertFalse(trapAbs.detected)
+        assertTrue(trapAbs.passiveTrapDetected)
+        assertTrue(trapAbs.classificationTag.contains("PASSIVE_TRAP"))
+    }
+
+    @Test
+    fun `domAnalyzer unclamps replenishmentRate above 3 and computes healthy levelPersistenceRatio`() {
+        val baseTs = 1_700_000_000_000L
+        // 1.0 qty executed on ASK @ 100.0, then replenished 4.5 qty (> 3.0x) in valid 50..500ms windows + gentle partial adjust
+        val deltas = listOf(
+            OrderFlowStreamHub.RawDomDeltaEvent("BTCUSDT", BookState.LevelDelta(100.0, 10.0, 9.0, -1.0, "ASK", baseTs, 1L), 2L, "Bybit"),
+            OrderFlowStreamHub.RawDomDeltaEvent("BTCUSDT", BookState.LevelDelta(100.0, 9.0, 10.5, +1.5, "ASK", baseTs + 120L, 2L), 2L, "Bybit"),
+            OrderFlowStreamHub.RawDomDeltaEvent("BTCUSDT", BookState.LevelDelta(100.0, 10.5, 12.0, +1.5, "ASK", baseTs + 260L, 3L), 2L, "Bybit"),
+            OrderFlowStreamHub.RawDomDeltaEvent("BTCUSDT", BookState.LevelDelta(100.0, 12.0, 13.5, +1.5, "ASK", baseTs + 420L, 4L), 2L, "Bybit"),
+            OrderFlowStreamHub.RawDomDeltaEvent("BTCUSDT", BookState.LevelDelta(99.9, 10.0, 9.8, -0.2, "BID", baseTs + 600L, 5L), 2L, "Bybit")
+        )
+        val trades = listOf(
+            OrderFlowStreamHub.RawTradeTick("BTCUSDT", 100.0, 1.0, true, baseTs + 20L, 2L, "Bybit")
+        )
+        val micro = OrderFlowStreamHub.VenueMicroSnapshot(
+            symbol = "BTCUSDT",
+            primaryVenue = "Bybit",
+            trades = trades,
+            domDeltas = deltas,
+            bids = listOf(99.9 to 12.0, 99.8 to 10.0),
+            asks = listOf(100.0 to 13.5, 100.1 to 10.0),
+            bookSynced = true,
+            desyncReason = null,
+            lastTradeTsMs = baseTs + 20L,
+            lastBookTsMs = baseTs + 600L,
+            avgLagMs = 2L,
+            rollingTop5MedianMass = 30.0
+        )
+        val dom = DomAnalyzer.analyze(micro, baseTs + 800L, activeLevelPrice = 100.0, zoneTolerance = 0.25)
+        assertTrue(dom.sufficientData)
+        assertEquals(3, dom.replenishmentEvents)
+        assertTrue("Expected unclamped replenishmentRate > 3.0, got ${dom.replenishmentRate}", dom.replenishmentRate > 3.0)
+        assertTrue("Expected healthy persistence > 0.70, got ${dom.levelPersistenceRatio}", dom.levelPersistenceRatio > 0.70)
+        assertTrue(dom.normalizedOfi in -1.0..1.0)
+    }
 }

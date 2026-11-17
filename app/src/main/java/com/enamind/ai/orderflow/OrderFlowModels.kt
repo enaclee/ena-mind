@@ -130,6 +130,9 @@ data class AbsorptionMetrics(
     val repeatedAttacks: Int = 0,
     val holdDurationSec: Double = 0.0,
     val targetLevelPrice: Double? = null,
+    val targetIsResistance: Boolean? = null,
+    val passiveTrapDetected: Boolean = false,
+    val classificationTag: String = "",
     val supportingFactors: List<String> = emptyList(),
     val conflictingFactors: List<String> = emptyList(),
     val note: String = "Недостаточно совпавших признаков поглощения"
@@ -148,7 +151,8 @@ data class LevelAttackState(
     val acceptedBeyondLevel: Boolean = false,
     val postAttackReactionPct: Double? = null,
     val repeatedAttackZones: List<Double> = emptyList(),
-    val failedBreakoutZones: List<Double> = emptyList()
+    val failedBreakoutZones: List<Double> = emptyList(),
+    val atr1mPct: Double = 0.0
 )
 
 data class ScenarioCase(
@@ -211,6 +215,8 @@ data class OrderFlowReport(
     val computedAtMs: Long = 0L,
     val freshness: DataFreshness = DataFreshness.INSUFFICIENT,
     val freshnessWarning: String? = "Ожидание подключения биржевых потоков…",
+    val wsStale: Boolean = false,
+    val venueSyncWarning: String? = null,
     val dominance: MarketDominance = MarketDominance.INSUFFICIENT_DATA,
     val footprint: FootprintSummary = FootprintSummary(),
     val dom: DomSnapshotMetrics = DomSnapshotMetrics(),

@@ -29,7 +29,8 @@ class ContractCatalogRepo(
         val minOrderQty: Double?,
         val maxLeverage: Double?,
         val source: String,
-        val qtyStep: Double? = null
+        val qtyStep: Double? = null,
+        val minNotionalValue: Double? = null
     )
 
     data class CatalogState(
@@ -70,7 +71,8 @@ class ContractCatalogRepo(
                         minOrderQty = o.optDouble("minOrderQty", Double.NaN).takeIf { it.isFinite() && it > 0 },
                         maxLeverage = o.optDouble("maxLeverage", Double.NaN).takeIf { it.isFinite() && it > 0 },
                         source = o.optString("source", "cache"),
-                        qtyStep = o.optDouble("qtyStep", Double.NaN).takeIf { it.isFinite() && it > 0 }
+                        qtyStep = o.optDouble("qtyStep", Double.NaN).takeIf { it.isFinite() && it > 0 },
+                        minNotionalValue = o.optDouble("minNotionalValue", Double.NaN).takeIf { it.isFinite() && it > 0 }
                     )
                 )
             }
@@ -199,6 +201,7 @@ class ContractCatalogRepo(
                         .put("maxLeverage", c.maxLeverage ?: JSONObject.NULL)
                         .put("source", c.source)
                         .put("qtyStep", c.qtyStep ?: JSONObject.NULL)
+                        .put("minNotionalValue", c.minNotionalValue ?: JSONObject.NULL)
                 )
             }
             cacheFile.writeText(
@@ -243,8 +246,9 @@ class ContractCatalogRepo(
                     val lotObj = o.optJSONObject("lotSizeFilter")
                     val minQty = lotObj?.optString("minOrderQty")?.toDoubleOrNull()?.takeIf { it > 0 }
                     val qStep = lotObj?.optString("qtyStep")?.toDoubleOrNull()?.takeIf { it > 0 } ?: minQty
+                    val minNotional = lotObj?.optString("minNotionalValue")?.toDoubleOrNull()?.takeIf { it > 0 }
                     val maxLev = o.optJSONObject("leverageFilter")?.optString("maxLeverage")?.toDoubleOrNull()?.takeIf { it > 0 }
-                    out.add(ContractInfo(sym, base, quote, tick, minQty, maxLev, "Bybit", qStep))
+                    out.add(ContractInfo(sym, base, quote, tick, minQty, maxLev, "Bybit", qStep, minNotional))
                 }
                 out to cursor
             } catch (_: Exception) {
@@ -268,6 +272,7 @@ class ContractCatalogRepo(
                     var tick: Double? = null
                     var minQty: Double? = null
                     var qStep: Double? = null
+                    var minNotional: Double? = null
                     val filters = o.optJSONArray("filters")
                     if (filters != null) {
                         for (j in 0 until filters.length()) {
@@ -278,10 +283,14 @@ class ContractCatalogRepo(
                                     minQty = f.optString("minQty").toDoubleOrNull()?.takeIf { it > 0 }
                                     qStep = f.optString("stepSize").toDoubleOrNull()?.takeIf { it > 0 } ?: minQty
                                 }
+                                "MIN_NOTIONAL", "NOTIONAL" -> {
+                                    minNotional = f.optString("notional").toDoubleOrNull()?.takeIf { it > 0 }
+                                        ?: f.optString("minNotional").toDoubleOrNull()?.takeIf { it > 0 }
+                                }
                             }
                         }
                     }
-                    out.add(ContractInfo(sym, base, quote, tick, minQty, null, source, qStep))
+                    out.add(ContractInfo(sym, base, quote, tick, minQty, null, source, qStep, minNotional))
                 }
                 out
             } catch (_: Exception) {

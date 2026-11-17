@@ -359,7 +359,7 @@ private fun MarketStateAreaCard(
         ) {
             Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
-                    "Поток: $freshLabel · задержка DOM ${if (report.dom.lagMs >= 0) "${report.dom.lagMs}мс" else "—"}",
+                    "Поток: $freshLabel${if (report.wsStale) " (WS_STALE)" else ""} · задержка DOM ${if (report.dom.lagMs >= 0) "${report.dom.lagMs}мс" else "—"}",
                     fontSize = 10.5.sp,
                     fontWeight = FontWeight.SemiBold,
                     fontFamily = FontFamily.Monospace,
@@ -370,6 +370,14 @@ private fun MarketStateAreaCard(
                         warn,
                         fontSize = 10.5.sp,
                         color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+                report.venueSyncWarning?.let { vsWarn ->
+                    Text(
+                        "⚠ $vsWarn",
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = amber
                     )
                 }
             }

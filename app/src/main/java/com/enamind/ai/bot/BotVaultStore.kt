@@ -124,6 +124,13 @@ class BotVaultStore private constructor(
         if (!file.exists()) return@synchronized BotConfig()
         return@synchronized runCatching {
             val o = JSONObject(file.readText(Charsets.UTF_8))
+            val maxTr = o.optInt("maxTranches", 3).coerceIn(1, 4)
+            val weightsArr = o.optJSONArray("trancheWeightsPct")
+            val parsedWeights = if (weightsArr != null && weightsArr.length() == maxTr) {
+                (0 until weightsArr.length()).map { weightsArr.optInt(it, 100 / maxTr).coerceAtLeast(1) }
+            } else {
+                BotConfig.defaultWeightsFor(maxTr)
+            }
             BotConfig(
                 mode = BotMode.fromId(o.optString("mode")),
                 symbol = o.optString("symbol", "BTCUSDT").ifBlank { "BTCUSDT" },
@@ -134,20 +141,31 @@ class BotVaultStore private constructor(
                 directionPolicy = DirectionPolicy.fromName(o.optString("directionPolicy")),
                 minNetProfitPct = o.optDouble("minNetProfitPct", 0.5).coerceIn(0.15, 10.0),
                 maxProfitPct = o.optDouble("maxProfitPct", 3.5).coerceIn(0.3, 50.0),
-                trailingGivebackPct = o.optDouble("trailingGivebackPct", 0.35).coerceIn(0.05, 5.0),
+                trailingGivebackPct = o.optDouble("trailingGivebackPct", 0.90).coerceIn(0.05, 5.0),
                 maxHoldWaitMin = o.optInt("maxHoldWaitMin", 30).coerceIn(1, 720),
                 stopLossEnabled = o.optBoolean("stopLossEnabled", false),
                 stopLossPct = o.optDouble("stopLossPct", 1.5).coerceIn(0.2, 40.0),
                 serverTrailingGuardEnabled = o.optBoolean("serverTrailingGuardEnabled", true),
                 dailyMaxLossPct = o.optDouble("dailyMaxLossPct", 3.0).coerceIn(0.5, 50.0),
-                confirmSignalSec = o.optInt("confirmSignalSec", 6).coerceIn(2, 30),
-                requireGlowConsensus = o.optBoolean("requireGlowConsensus", true),
-                requireRadarNotFlat = o.optBoolean("requireRadarNotFlat", true),
+                confirmSignalSec = o.optInt("confirmSignalSec", 4).coerceIn(1, 30),
+                requireGlowConsensus = o.optBoolean("requireGlowConsensus", false),
+                requireRadarNotFlat = o.optBoolean("requireRadarNotFlat", false),
                 allowCounterAbsorption = o.optBoolean("allowCounterAbsorption", false),
                 hudEnabled = o.optBoolean("hudEnabled", false),
                 hudDisplayMode = HudDisplayMode.fromName(o.optString("hudDisplayMode")),
                 timeoutBehavior = TimeoutBehavior.fromName(o.optString("timeoutBehavior")),
-                paperStartBalanceUsdt = o.optDouble("paperStartBalanceUsdt", 1000.0).coerceIn(50.0, 1_000_000.0)
+                paperStartBalanceUsdt = o.optDouble("paperStartBalanceUsdt", 1000.0).coerceIn(50.0, 1_000_000.0),
+                strategyModel = com.enamind.ai.bot.strategy.StrategyModelId.fromId(o.optString("strategyModel")),
+                executionPreference = com.enamind.ai.bot.strategy.OrderExecutionPreference.fromName(o.optString("executionPreference")),
+                makerFallbackPolicy = MakerFallbackPolicy.fromName(o.optString("makerFallbackPolicy")),
+                maxTranches = maxTr,
+                trancheWeightsPct = parsedWeights,
+                scaleStepPct = o.optDouble("scaleStepPct", 0.28).coerceIn(0.08, 5.0),
+                useAtrScaleStep = o.optBoolean("useAtrScaleStep", true),
+                peelPartialEnabled = o.optBoolean("peelPartialEnabled", true),
+                allowUnlimitedHold = o.optBoolean("allowUnlimitedHold", false),
+                stopLossBasis = StopLossBasis.fromName(o.optString("stopLossBasis")),
+                stopLossAtrMult = o.optDouble("stopLossAtrMult", 2.0).coerceIn(0.5, 8.0)
             )
         }.getOrDefault(BotConfig())
     }
@@ -178,6 +196,17 @@ class BotVaultStore private constructor(
             .put("hudDisplayMode", cfg.hudDisplayMode.name)
             .put("timeoutBehavior", cfg.timeoutBehavior.name)
             .put("paperStartBalanceUsdt", cfg.paperStartBalanceUsdt)
+            .put("strategyModel", cfg.strategyModel.id)
+            .put("executionPreference", cfg.executionPreference.name)
+            .put("makerFallbackPolicy", cfg.makerFallbackPolicy.name)
+            .put("maxTranches", cfg.maxTranches)
+            .put("trancheWeightsPct", JSONArray(cfg.normalizedTrancheWeights()))
+            .put("scaleStepPct", cfg.scaleStepPct)
+            .put("useAtrScaleStep", cfg.useAtrScaleStep)
+            .put("peelPartialEnabled", cfg.peelPartialEnabled)
+            .put("allowUnlimitedHold", cfg.allowUnlimitedHold)
+            .put("stopLossBasis", cfg.stopLossBasis.name)
+            .put("stopLossAtrMult", cfg.stopLossAtrMult)
         atomicWrite(File(botDir, FILE_CONFIG), o.toString(2))
     }
 

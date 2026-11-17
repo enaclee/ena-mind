@@ -43,7 +43,8 @@ class OrderFlowIntelligenceOrchestrator(
         nowMs: Long = System.currentTimeMillis(),
         quantAdx: Double? = null,
         quantEr: Double? = null,
-        signalConfirmMs: Long = DEFAULT_GLOW_CONFIRM_MS
+        signalConfirmMs: Long = DEFAULT_GLOW_CONFIRM_MS,
+        venueSyncWarning: String? = null
     ): OrderFlowReport {
         if (lastGlowSymbol != symbol) {
             lastGlowSymbol = symbol
@@ -59,17 +60,22 @@ class OrderFlowIntelligenceOrchestrator(
 
         val tradeAgeMs = if (micro != null && micro.lastTradeTsMs > 0L) (nowMs - micro.lastTradeTsMs).coerceAtLeast(0L) else Long.MAX_VALUE
         val bookAgeMs = if (micro != null && micro.lastBookTsMs > 0L) (nowMs - micro.lastBookTsMs).coerceAtLeast(0L) else Long.MAX_VALUE
+        val isWsStale = (micro?.wsStale == true) || tradeAgeMs > STALE_THRESHOLD_MS || bookAgeMs > STALE_THRESHOLD_MS
 
         val freshness = when {
             micro == null || (micro.trades.isEmpty() && micro.bids.isEmpty()) -> DataFreshness.INSUFFICIENT
             !micro.bookSynced && micro.desyncReason != null -> DataFreshness.DESYNC
-            tradeAgeMs > STALE_THRESHOLD_MS || bookAgeMs > STALE_THRESHOLD_MS -> DataFreshness.STALE
+            isWsStale -> DataFreshness.STALE
             else -> DataFreshness.LIVE
         }
 
         val freshnessWarn = when (freshness) {
             DataFreshness.LIVE -> if ((micro?.avgLagMs ?: 0L) > 1200L) "Повышенная задержка сети: ${micro?.avgLagMs} мс" else null
-            DataFreshness.STALE -> "Поток сделок/стакана устарел (возр. тиков ${if (tradeAgeMs > 600_000) "—" else "${tradeAgeMs / 1000}с"}) — расчёты приглушены"
+            DataFreshness.STALE -> if (micro?.wsStale == true) {
+                "WS_STALE (${micro.desyncReason ?: "переподключение"}): выполняется ресинхронизация стакана"
+            } else {
+                "WS_STALE: поток сделок/стакана устарел (возр. тиков ${if (tradeAgeMs > 600_000) "—" else "${tradeAgeMs / 1000}с"})"
+            }
             DataFreshness.DESYNC -> "Рассинхрон стакана (${micro?.desyncReason ?: "потеря последовательности"}) — выполняется ресинхронизация"
             DataFreshness.INSUFFICIENT -> "Ожидание реальных сделок и обновлений стакана по $symbol…"
         }
@@ -120,9 +126,16 @@ class OrderFlowIntelligenceOrchestrator(
             quantEfficiencyRatio = quantEr
         )
 
-        // Post-only проверка исторических событий по реально поступившим тикам и свечам (без look-ahead!)
-        if (trades.isNotEmpty() || bars.isNotEmpty()) {
-            vault.verifyForwardOutcomes(symbol, trades, nowMs, bars)
+        // Post-only проверка исторических событий по реально поступившим тикам, свежему ТФ-бару или LIVE-цене (без заморозки!)
+        if (trades.isNotEmpty() || bars.isNotEmpty() || (freshness == DataFreshness.LIVE && effectivePrice != null)) {
+            vault.verifyForwardOutcomes(
+                symbol = symbol,
+                futureTicks = trades,
+                nowMs = nowMs,
+                bars = bars,
+                barsInterval = interval,
+                livePrice = if (freshness == DataFreshness.LIVE && !isWsStale) effectivePrice else null
+            )
         }
         val vaultStats = vault.computeStats(symbol)
 
@@ -184,6 +197,8 @@ class OrderFlowIntelligenceOrchestrator(
             computedAtMs = nowMs,
             freshness = freshness,
             freshnessWarning = freshnessWarn,
+            wsStale = isWsStale,
+            venueSyncWarning = venueSyncWarning,
             dominance = synthesis.dominance,
             footprint = footprint,
             dom = dom,
@@ -198,7 +213,7 @@ class OrderFlowIntelligenceOrchestrator(
             councilPayload = synthesis.councilPayload
         )
 
-        if (freshness == DataFreshness.LIVE && effectivePrice != null) {
+        if (freshness == DataFreshness.LIVE && !isWsStale && effectivePrice != null) {
             vault.recordEvent(rep)
         }
         _report.value = rep

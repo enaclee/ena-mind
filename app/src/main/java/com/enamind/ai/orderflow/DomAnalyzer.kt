@@ -50,18 +50,20 @@ object DomAnalyzer {
         val bestBid = bids.firstOrNull()?.first ?: 0.0
         val bestAsk = asks.firstOrNull()?.first ?: 0.0
         val mid = if (bestBid > 0 && bestAsk > 0) (bestBid + bestAsk) / 2.0 else max(bestBid, bestAsk)
-        val priceTol = (mid * 0.0005).coerceAtLeast(abs(bestAsk - bestBid) * 1.5).coerceAtLeast(1e-8)
+        val spreadAbs = if (bestBid > 0 && bestAsk > 0) abs(bestAsk - bestBid) else 0.0
+        val priceTol = (mid * 0.0005).coerceAtLeast(spreadAbs * 1.5).coerceAtLeast(1e-8)
+        // Точный микро-шаг бакета пополнения (~0.003% или 0.5 спреда), чтобы 50 уровней не слипались в 1 бакет!
+        val replenishBucketStep = max(mid * 0.00003, max(spreadAbs * 0.5, 1e-8))
 
         // Топ-5 границы для MLOFI и фокусной зоны анализа
         val topBids = bids.take(5)
         val topAsks = asks.take(5)
-        val top5MinBid = topBids.lastOrNull()?.first ?: bestBid
-        val top5MaxAsk = topAsks.lastOrNull()?.first ?: bestAsk
         val top5ActiveMass = (topBids.sumOf { it.second } + topAsks.sumOf { it.second }).coerceAtLeast(1e-9)
 
-        val focusCenter = activeLevelPrice?.takeIf { it.isFinite() && it > 0.0 } ?: mid
+        val hasExplicitLevel = activeLevelPrice != null && activeLevelPrice.isFinite() && activeLevelPrice > 0.0
+        val focusCenter = if (hasExplicitLevel) activeLevelPrice!! else mid
         val focusHalfWidth = zoneTolerance?.takeIf { it.isFinite() && it > 0.0 }
-            ?: max(abs(bestAsk - bestBid) * 3.0, mid * 0.0018).coerceAtLeast(1e-8)
+            ?: max(spreadAbs * 3.0, mid * 0.0012).coerceAtLeast(1e-8)
 
         val bidTotal = bids.sumOf { it.second }
         val askTotal = asks.sumOf { it.second }
@@ -83,25 +85,27 @@ object DomAnalyzer {
             )
         }
 
+        val latestDeltaTs = deltas.last().delta.tsMs
+        val ofiWindowCutoff = latestDeltaTs - 20_000L
         var spanSec = 1.0
         if (deltas.size >= 2) {
-            val dtMs = (deltas.last().delta.tsMs - deltas.first().delta.tsMs).coerceAtLeast(500L)
+            val dtMs = (latestDeltaTs - deltas.first().delta.tsMs).coerceAtLeast(500L)
             spanSec = dtMs / 1000.0
         }
 
         var addCount = 0
         var cancelCount = 0
         var weightedOfi = 0.0
-        var absWeightedOfiMass = 0.0
         var executedQty = 0.0
+        var zoneExecutedQty = 0.0
         var cancelledQty = 0.0
         var replenishCount = 0
         var replenishQty = 0.0
         var focusDrops = 0
-        var focusCancels = 0
+        var focusLossSum = 0.0
         val removedLargeWalls = mutableListOf<String>()
 
-        // Последнее реальное исполнение (tsMs + passiveSide) по ценовому бакету
+        // Последнее реальное исполнение (tsMs + passiveSide) по точному микро-уровню цены
         val recentExecutedAtBucket = HashMap<Long, ExecRecord>()
         val availableTradeQty = DoubleArray(trades.size) { trades[it].qty }
 
@@ -115,32 +119,35 @@ object DomAnalyzer {
         for (ev in deltas) {
             val d = ev.delta
             val dq = d.deltaQty
-            val inFocusZone = focusCenter <= 0.0 ||
-                abs(d.price - focusCenter) <= focusHalfWidth ||
-                (d.price in top5MinBid..top5MaxAsk)
+            // Строгое деление локальных изменений строго внутри focusZone
+            val inFocusZone = focusCenter <= 0.0 || abs(d.price - focusCenter) <= focusHalfWidth
 
-            // MLOFI по top-5 уровням с весовым затуханием
-            val levelWeight = mlofiWeight(d.price, d.side, topBids, topAsks, priceTol)
-            if (levelWeight > 0.0) {
-                val signedFlow = (if (d.side == "BID") dq else -dq) * levelWeight
-                weightedOfi += signedFlow
-                absWeightedOfiMass += abs(dq) * levelWeight
+            // MLOFI по top-5 уровням за свежее 20с-окно (не размывается за 90с HFT-шума)
+            if (d.tsMs >= ofiWindowCutoff) {
+                val levelWeight = mlofiWeight(d.price, d.side, topBids, topAsks, priceTol)
+                if (levelWeight > 0.0) {
+                    val signedFlow = (if (d.side == "BID") dq else -dq) * levelWeight
+                    weightedOfi += signedFlow
+                }
             }
 
-            val bucket = (d.price / priceTol).toLong()
+            val bucket = Math.round(d.price / replenishBucketStep)
             if (dq > 0.0) {
                 addCount++
                 val exec = recentExecutedAtBucket[bucket]
-                if (exec != null && exec.passiveSide == d.side && exec.qty > 0.0) {
+                if (inFocusZone && exec != null && exec.passiveSide == d.side && exec.qty > 0.0) {
                     val dt = d.tsMs - exec.tsMs
                     if (dt in MIN_REPLENISH_DELAY_MS..MAX_REPLENISH_DELAY_MS) {
                         replenishCount++
                         replenishQty += dq
+                        // Помечаем время, чтобы одно микро-исполнение не копилось бесконечно
+                        recentExecutedAtBucket[bucket] = exec.copy(tsMs = d.tsMs)
+                    } else if (dt > MAX_REPLENISH_DELAY_MS) {
+                        recentExecutedAtBucket.remove(bucket)
                     }
                 }
             } else if (dq < 0.0) {
                 val dropQty = -dq
-                if (inFocusZone) focusDrops++
 
                 // BID исполняется рыночными продажами (isAggressiveBuy == false), ASK — покупками
                 val expectAggBuy = (d.side == "ASK")
@@ -163,14 +170,22 @@ object DomAnalyzer {
                 val cancelPart = (dropQty - matchedQty).coerceAtLeast(0.0)
                 if (matchedQty > 0.0) {
                     executedQty += matchedQty
-                    recentExecutedAtBucket[bucket] = ExecRecord(d.tsMs, d.side, matchedQty)
+                    if (inFocusZone) {
+                        zoneExecutedQty += matchedQty
+                        recentExecutedAtBucket[bucket] = ExecRecord(d.tsMs, d.side, matchedQty)
+                    }
+                }
+                if (inFocusZone) {
+                    focusDrops++
+                    // Весовая потеря ликвидности: мелкая корректировка 10->9.5 даёт 0.05 (а не 1.0),
+                    // реальное исполнение даёт 0.0, а полное снятие стены даёт ~1.0
+                    val baseQty = d.prevQty.coerceAtLeast(dropQty).coerceAtLeast(1e-9)
+                    val lossFrac = (cancelPart / baseQty).coerceIn(0.0, 1.0)
+                    focusLossSum += lossFrac
                 }
                 if (cancelPart > 1e-9) {
                     cancelledQty += cancelPart
                     cancelCount++
-                    if (inFocusZone && cancelPart >= dropQty * 0.5) {
-                        focusCancels++
-                    }
                     if (d.prevQty >= largeThreshold && cancelPart >= d.prevQty * 0.7 && d.newQty <= d.prevQty * 0.2) {
                         removedLargeWalls += "${d.side} ${formatPrice(d.price)}"
                     }
@@ -191,24 +206,26 @@ object DomAnalyzer {
             cancelledQty > 0.0 -> 99.0
             else -> 0.0
         }
-        // Если CTR слишком высок, подавляем вес стаканного OFI против шума
+        // При аномальном HFT-шуме мягко приглушаем вес стаканного OFI (без сжатия в +-0.03)
         val ctrDamping = when {
-            churnInflationRatio >= 12.0 -> 0.35
-            churnInflationRatio >= 6.0 -> 0.65
+            churnInflationRatio >= 18.0 -> 0.55
+            churnInflationRatio >= 10.0 -> 0.78
             else -> 1.0
         }
-        val ofiDenom = max(absWeightedOfiMass, top5ActiveMass * 0.10).coerceAtLeast(1e-9)
+        val medianMass60s = micro.rollingTop5MedianMass?.takeIf { it.isFinite() && it > 0.0 } ?: top5ActiveMass
+        val ofiDenom = medianMass60s.coerceAtLeast(1e-9)
         val normOfi = ((weightedOfi / ofiDenom) * ctrDamping).coerceIn(-1.0, 1.0)
 
         val addRate = addCount / spanSec
         val cancelRate = cancelCount / spanSec
-        val replenishRate = if (executedQty > 1e-9) {
-            (replenishQty / executedQty).coerceIn(0.0, 3.0)
+        // Честный расчёт пополнения строго по сделкам в фокусе (без искусственного клампа на 3.0)
+        val replenishRate = if (zoneExecutedQty > 1e-9 && replenishQty > 0.0) {
+            (replenishQty / zoneExecutedQty).coerceAtLeast(0.0)
         } else 0.0
 
         val persistenceRatio = if (focusDrops > 0) {
-            (1.0 - (focusCancels.toDouble() / max(1, focusDrops))).coerceIn(0.0, 1.0)
-        } else 0.5
+            (1.0 - (focusLossSum / focusDrops)).coerceIn(0.0, 1.0)
+        } else 0.6
 
         val pullDetected = removedLargeWalls.isNotEmpty() || (cancelledQty > executedQty * 3.0 && cancelledQty > bidTotal * 0.25)
         val pullNote = if (removedLargeWalls.isNotEmpty()) {

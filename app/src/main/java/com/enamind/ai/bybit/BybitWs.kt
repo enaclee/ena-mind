@@ -37,6 +37,7 @@ class BybitWs(
         fun onBookDesync(reason: String) {}
         fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {}
         fun onLatency(lagMs: Long) {}
+        fun onReconnected() {}
     }
 
     data class Ticker(
@@ -67,6 +68,7 @@ class BybitWs(
     @Volatile private var ws: WebSocket? = null
     @Volatile private var closedByUser = false
     @Volatile private var reconnectDelayMs = 1000L
+    private val wasDisconnected = java.util.concurrent.atomic.AtomicBoolean(false)
     private val generation = AtomicLong(0L)
     @Volatile private var pendingReconnect: ScheduledFuture<*>? = null
 
@@ -100,8 +102,13 @@ class BybitWs(
                     return
                 }
                 reconnectDelayMs = 1000L
-                Log.i(TAG, "WS open $symbol")
+                val reconnected = wasDisconnected.compareAndSet(true, false)
+                Log.i(TAG, "WS open $symbol (reconnected=$reconnected)")
                 feedTracker.onOpen()
+                if (reconnected) {
+                    bookState.desync()
+                    listener.onReconnected()
+                }
                 val args = JSONArray().apply {
                     put("tickers.$symbol")
                     put("publicTrade.$symbol")
@@ -110,7 +117,7 @@ class BybitWs(
                     put("kline.$klineInterval.$symbol")
                 }
                 webSocket.send(JSONObject().put("op", "subscribe").put("args", args).toString())
-                listener.onStatus(true, "подключено (ждём данные)")
+                listener.onStatus(true, if (reconnected) "переподключено (ресинхрон стакана…)" else "подключено (ждём данные)")
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -120,14 +127,17 @@ class BybitWs(
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (gen != generation.get() || closedByUser) return
                 Log.w(TAG, "WS fail: ${t.message}")
+                wasDisconnected.set(true)
+                bookState.desync()
                 feedTracker.onFailure(t.message)
                 FaultMonitor.recordFault(
                     component = "Bybit WebSocket",
                     kind = FaultMonitor.Kind.WEBSOCKET,
                     severity = FaultMonitor.Severity.WARNING,
                     message = t.message ?: "Разрыв WebSocket соединения",
-                    recovery = "Авто-переподключение и резервный поток Binance/OKX"
+                    recovery = "Авто-переподключение и ресинхрон стакана orderbook.50"
                 )
+                listener.onBookDesync("WS_STALE: обрыв соединения (${t.message ?: "reconnect"})")
                 listener.onStatus(false, t.message ?: "ошибка сети")
                 scheduleReconnect(gen)
             }
@@ -135,6 +145,11 @@ class BybitWs(
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 if (gen != generation.get()) return
                 feedTracker.onClosed(reason)
+                if (!closedByUser) {
+                    wasDisconnected.set(true)
+                    bookState.desync()
+                    listener.onBookDesync("WS_STALE: соединение закрыто ($reason)")
+                }
                 listener.onStatus(false, "закрыто: $reason")
                 if (!closedByUser) scheduleReconnect(gen)
             }

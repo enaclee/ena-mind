@@ -8,6 +8,7 @@ import com.enamind.ai.ai.AiStudioClient
 import com.enamind.ai.bot.BotFloatingOverlayManager
 import com.enamind.ai.bot.BotForegroundService
 import com.enamind.ai.bot.BotVaultStore
+import com.enamind.ai.bot.MarketAnchorsCollector
 import com.enamind.ai.bot.TradeBotEngine
 import com.enamind.ai.bybit.BinanceWs
 import com.enamind.ai.bybit.BookState
@@ -62,6 +63,7 @@ class AppState(
     val majorCalendar = MajorCalendarRepo(ctx, settings)
     val orderFlow = OrderFlowIntelligenceOrchestrator(ctx)
     val botVault = BotVaultStore(ctx)
+    val anchorsCollector = MarketAnchorsCollector { settings.bybitBaseUrl }
 
     private val _favoriteSymbols = MutableStateFlow(settings.favoriteSymbols)
     val favoriteSymbols: StateFlow<Set<String>> = _favoriteSymbols
@@ -182,6 +184,9 @@ class AppState(
             quantAdxErProvider = {
                 val q = engine.intelligence.value?.quant
                 q?.adx to q?.efficiencyRatio
+            },
+            anchorsProvider = { sym ->
+                anchorsCollector.snapshot(sym, _klines.value, _market.value.price)
             },
             clockSync = engine.clockSync,
             onServiceStateChanged = { shouldRun ->
@@ -551,6 +556,7 @@ class AppState(
         ws = BybitWs(sym, object : BybitWs.Listener {
             override fun onTicker(t: BybitWs.Ticker) {
                 if (t.last.isFinite() && t.last > 0) lastBybitTickerMs.set(System.currentTimeMillis())
+                anchorsCollector.recordTicker(sym, t.last, t.openInterest, t.fundingRate)
                 _market.value = _market.value.copy(
                     price = t.last.takeIf { it.isFinite() && it > 0 } ?: _market.value.price,
                     change24hPct = t.price24hPcnt.takeIf { it.isFinite() && it != 0.0 } ?: _market.value.change24hPct,
@@ -565,6 +571,13 @@ class AppState(
             override fun onTrade(tr: BybitWs.Trade) {
                 lastBybitTradeMs.set(System.currentTimeMillis())
                 tape.add(tr)
+                anchorsCollector.recordPerpTrade(
+                    symbol = sym,
+                    price = tr.price,
+                    qty = tr.size,
+                    isBuy = tr.side.equals("Buy", ignoreCase = true),
+                    tsMs = tr.tsMs
+                )
                 orderFlow.streamHub.recordTrade(
                     symbol = sym,
                     price = tr.price,
@@ -596,6 +609,7 @@ class AppState(
 
             override fun onLiquidation(l: BybitWs.Liquidation) {
                 liq.add(l)
+                anchorsCollector.recordLiquidation(l.symbol, l.side, l.price, l.size, l.tsMs)
                 val s = liq.stats(_market.value.symbol, System.currentTimeMillis())
                 _market.value = _market.value.copy(
                     liq1hUsd = s.optDouble("sum_usd_1h").takeIf { it.isFinite() },
@@ -622,11 +636,28 @@ class AppState(
 
             override fun onBookDesync(reason: String) {
                 if (!engine.binanceConnected) {
-                    orderFlow.streamHub.recordDesync(sym, reason, "Bybit")
+                    if (reason.startsWith("WS_STALE", ignoreCase = true)) {
+                        orderFlow.streamHub.markWsStale(sym, reason, "Bybit")
+                    } else {
+                        orderFlow.streamHub.recordDesync(sym, reason, "Bybit")
+                    }
                     _market.value = _market.value.copy(
                         bids = emptyList(), asks = emptyList(),
                         wsNote = "стакан: $reason"
                     )
+                }
+            }
+
+            override fun onReconnected() {
+                appScope.launch(Dispatchers.IO) {
+                    runCatching {
+                        engine.clockSync.syncIfNeeded(
+                            http = NetworkHub.restClient(),
+                            bybitCooldown = rest.isBybitInCooldown(),
+                            force = true,
+                            bybitBaseUrl = settings.bybitBaseUrl
+                        )
+                    }
                 }
             }
         }, klineInterval = iv, clockOffsetMsProvider = { engine.clockSync.status().offsetMs }).also { it.connect() }

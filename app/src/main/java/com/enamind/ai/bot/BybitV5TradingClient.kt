@@ -45,13 +45,34 @@ class BybitV5TradingClient(
         val message: String = ""
     )
 
+    data class FeeProfile(
+        val makerFeePct: Double,
+        val takerFeePct: Double,
+        val isTradFiMetal: Boolean = false
+    ) {
+        fun effectiveSidePct(isMaker: Boolean): Double = if (isMaker) makerFeePct else takerFeePct
+    }
+
+    data class OrderExecutionResult(
+        val orderId: String = "",
+        val filled: Boolean = false,
+        val executedQty: Double = 0.0,
+        val avgPrice: Double = 0.0,
+        val executedAsMaker: Boolean = false,
+        val fallbackUsed: Boolean = false,
+        val note: String = ""
+    )
+
     data class AccountProbe(
         val connected: Boolean,
         val isUta: Boolean,
         val unifiedMarginStatus: Int,
         val walletUsdt: Double?,
         val feeRateSidePct: Double,
-        val note: String
+        val note: String,
+        val makerFeePct: Double = 0.036,
+        val takerFeePct: Double = 0.10,
+        val isTradFiMetal: Boolean = false
     )
 
     data class ExchangePositionInfo(
@@ -74,11 +95,22 @@ class BybitV5TradingClient(
         slot: BybitCredentialSlot,
         symbol: String
     ): ApiResult<AccountProbe> {
+        val defaultFees = defaultFeeProfile(symbol)
         if (!mode.isLiveExchange) {
             return ApiResult(
                 ok = true,
                 retCode = 0,
-                data = AccountProbe(true, isUta = false, unifiedMarginStatus = 0, walletUsdt = null, feeRateSidePct = 0.055, note = "Paper")
+                data = AccountProbe(
+                    connected = true,
+                    isUta = false,
+                    unifiedMarginStatus = 0,
+                    walletUsdt = null,
+                    feeRateSidePct = defaultFees.takerFeePct,
+                    note = "Paper (${defaultFees.makerFeePct}% / ${defaultFees.takerFeePct}%)",
+                    makerFeePct = defaultFees.makerFeePct,
+                    takerFeePct = defaultFees.takerFeePct,
+                    isTradFiMetal = defaultFees.isTradFiMetal
+                )
             )
         }
         if (!slot.hasKeys) {
@@ -95,8 +127,7 @@ class BybitV5TradingClient(
             return ApiResult(ok = false, retCode = balRes.retCode, message = balRes.message)
         }
 
-        val feeRes = fetchTakerFeeRatePct(mode, slot, symbol)
-        val feePct = feeRes.data ?: 0.055
+        val feeProfile = fetchFeeProfile(mode, slot, symbol).data ?: defaultFees
 
         val note = buildString {
             append(mode.shortLabel)
@@ -111,8 +142,11 @@ class BybitV5TradingClient(
                 isUta = isUta,
                 unifiedMarginStatus = umiStatus,
                 walletUsdt = balRes.data,
-                feeRateSidePct = feePct,
-                note = note
+                feeRateSidePct = feeProfile.takerFeePct,
+                note = note,
+                makerFeePct = feeProfile.makerFeePct,
+                takerFeePct = feeProfile.takerFeePct,
+                isTradFiMetal = feeProfile.isTradFiMetal
             ),
             message = note
         )
@@ -175,17 +209,27 @@ class BybitV5TradingClient(
         }
     }
 
+    fun fetchFeeProfile(
+        mode: BotMode,
+        slot: BybitCredentialSlot,
+        symbol: String
+    ): ApiResult<FeeProfile> {
+        val fallback = defaultFeeProfile(symbol)
+        val resp = signedGet(mode, slot, "/v5/account/fee-rate", "category=linear&symbol=${symbol.uppercase()}")
+        if (!resp.ok || resp.data == null) {
+            return ApiResult(ok = false, data = fallback, retCode = resp.retCode, message = resp.message)
+        }
+        val parsed = parseFeeProfileJson(resp.data, symbol)
+        return ApiResult(ok = true, retCode = 0, data = parsed)
+    }
+
     fun fetchTakerFeeRatePct(
         mode: BotMode,
         slot: BybitCredentialSlot,
         symbol: String
     ): ApiResult<Double> {
-        val resp = signedGet(mode, slot, "/v5/account/fee-rate", "category=linear&symbol=${symbol.uppercase()}")
-        if (!resp.ok || resp.data == null) return ApiResult(ok = false, data = 0.055, retCode = resp.retCode, message = resp.message)
-        val first = resp.data.optJSONObject("result")?.optJSONArray("list")?.optJSONObject(0)
-        val takerFrac = first?.optString("takerFeeRate")?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0.0 }
-            ?: return ApiResult(ok = true, data = 0.055)
-        return ApiResult(ok = true, data = takerFrac * 100.0)
+        val res = fetchFeeProfile(mode, slot, symbol)
+        return ApiResult(ok = res.ok, data = res.data?.takerFeePct ?: defaultFeeProfile(symbol).takerFeePct, retCode = res.retCode, message = res.message)
     }
 
     /**
@@ -327,6 +371,186 @@ class BybitV5TradingClient(
         val resp = signedPost(mode, slot, "/v5/position/trading-stop", body)
         val ok = resp.ok || isAlreadyMatchedRet(resp.retCode, resp.message)
         return ApiResult(ok = ok, retCode = resp.retCode, data = ok, message = if (ok) "OK" else resp.message)
+    }
+
+    fun fetchL1BestPrices(mode: BotMode, symbol: String): Pair<Double, Double>? {
+        val base = mode.restBaseUrl.ifBlank { BotMode.BYBIT_MAINNET.restBaseUrl }
+        val url = "$base/v5/market/orderbook?category=linear&symbol=${symbol.uppercase()}&limit=1"
+        return runCatching {
+            http.newCall(Request.Builder().url(url).build()).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val json = JSONObject(resp.body?.string().orEmpty())
+                if (json.optInt("retCode", -1) != 0) return@use null
+                val res = json.optJSONObject("result") ?: return@use null
+                val bid = res.optJSONArray("b")?.optJSONArray(0)?.optString(0)?.toDoubleOrNull()
+                val ask = res.optJSONArray("a")?.optJSONArray(0)?.optString(0)?.toDoubleOrNull()
+                if (bid != null && ask != null && bid > 0.0 && ask > 0.0 && ask >= bid) {
+                    bid to ask
+                } else null
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * Слой 5: Умный Maker (PostOnly Limit по L1) с перестановкой на новый L1 (до 2 попыток по ~1.5с)
+     * и управляемым фоллбэком (Market или Cancel/Skip).
+     */
+    fun placePostOnlyLimitOrderWithRepeg(
+        mode: BotMode,
+        slot: BybitCredentialSlot,
+        symbol: String,
+        side: TradeSide,
+        qtyFormatted: String,
+        tickSize: Double?,
+        reduceOnly: Boolean,
+        stopLossFormatted: String? = null,
+        fallbackToMarket: Boolean = true,
+        fallbackPrice: Double? = null
+    ): ApiResult<OrderExecutionResult> {
+        val upperSym = symbol.uppercase()
+        for (attempt in 0..2) {
+            val l1 = fetchL1BestPrices(mode, upperSym)
+            val rawPrice = when {
+                l1 != null -> if (side == TradeSide.BUY) l1.first else l1.second
+                fallbackPrice != null && fallbackPrice > 0.0 -> fallbackPrice
+                else -> return ApiResult(ok = false, message = "Нет L1 котировок для PostOnly")
+            }
+            val priceStr = formatPriceToTick(rawPrice, tickSize)
+                ?: return ApiResult(ok = false, message = "Некорректная цена PostOnly")
+
+            val body = JSONObject()
+                .put("category", "linear")
+                .put("symbol", upperSym)
+                .put("side", side.bybitSide)
+                .put("orderType", "Limit")
+                .put("qty", qtyFormatted)
+                .put("price", priceStr)
+                .put("timeInForce", "PostOnly")
+                .put("reduceOnly", reduceOnly)
+            if (!reduceOnly && !stopLossFormatted.isNullOrBlank()) {
+                body.put("stopLoss", stopLossFormatted)
+                body.put("slTriggerBy", "MarkPrice")
+            }
+
+            val createRes = signedPost(mode, slot, "/v5/order/create", body)
+            if (!createRes.ok || createRes.data == null) {
+                // Повтор при отклонении пересечения спреда PostOnly
+                if (attempt < 2) {
+                    Thread.sleep(300L)
+                    continue
+                }
+                break
+            }
+            val orderId = createRes.data.optJSONObject("result")?.optString("orderId").orEmpty()
+            if (orderId.isBlank()) continue
+
+            // Поллинг исполнения в течение ~1.5с (3 × 500мс)
+            var filledQty = 0.0
+            var avgPx = rawPrice
+            var status = ""
+            repeat(3) {
+                Thread.sleep(500L)
+                val rt = queryRealtimeOrder(mode, slot, upperSym, orderId)
+                status = rt?.first.orEmpty()
+                filledQty = rt?.second ?: filledQty
+                avgPx = rt?.third?.takeIf { it > 0.0 } ?: avgPx
+                if (status.equals("Filled", ignoreCase = true)) {
+                    return ApiResult(
+                        ok = true,
+                        retCode = 0,
+                        data = OrderExecutionResult(
+                            orderId = orderId,
+                            filled = true,
+                            executedQty = filledQty.takeIf { it > 0.0 } ?: (qtyFormatted.toDoubleOrNull() ?: 0.0),
+                            avgPrice = avgPx,
+                            executedAsMaker = true,
+                            note = "PostOnly Maker L1 (попытка ${attempt + 1})"
+                        ),
+                        message = "Filled Maker"
+                    )
+                }
+                if (status.equals("Cancelled", ignoreCase = true) ||
+                    status.equals("Rejected", ignoreCase = true) ||
+                    status.equals("Deactivated", ignoreCase = true)
+                ) {
+                    return@repeat
+                }
+            }
+
+            // Отменяем неисполненный остаток перед следующей попыткой L1 re-peg
+            cancelOrder(mode, slot, upperSym, orderId)
+            val postCancel = queryRealtimeOrder(mode, slot, upperSym, orderId)
+            val totalFilled = postCancel?.second ?: filledQty
+            val targetQty = qtyFormatted.toDoubleOrNull() ?: 0.0
+            if (totalFilled > 0.0 && totalFilled >= targetQty * 0.99) {
+                return ApiResult(
+                    ok = true,
+                    retCode = 0,
+                    data = OrderExecutionResult(
+                        orderId = orderId,
+                        filled = true,
+                        executedQty = totalFilled,
+                        avgPrice = postCancel?.third?.takeIf { it > 0.0 } ?: avgPx,
+                        executedAsMaker = true,
+                        note = "PostOnly Maker L1"
+                    ),
+                    message = "Filled Maker"
+                )
+            }
+        }
+
+        if (!fallbackToMarket) {
+            return ApiResult(
+                ok = false,
+                retCode = 0,
+                data = OrderExecutionResult(filled = false, note = "PostOnly отменён без фоллбэка в Market"),
+                message = "PostOnly не исполнен за 2 попытки — отменён"
+            )
+        }
+
+        val mktRes = placeMarketOrder(mode, slot, upperSym, side, qtyFormatted, reduceOnly, stopLossFormatted)
+        return if (mktRes.ok) {
+            ApiResult(
+                ok = true,
+                retCode = 0,
+                data = OrderExecutionResult(
+                    orderId = mktRes.data.orEmpty(),
+                    filled = true,
+                    executedQty = qtyFormatted.toDoubleOrNull() ?: 0.0,
+                    avgPrice = fallbackPrice ?: 0.0,
+                    executedAsMaker = false,
+                    fallbackUsed = true,
+                    note = "Market фоллбэк после 2 PostOnly попыток"
+                ),
+                message = "Market Fallback"
+            )
+        } else {
+            ApiResult(ok = false, retCode = mktRes.retCode, message = mktRes.message)
+        }
+    }
+
+    private fun queryRealtimeOrder(
+        mode: BotMode,
+        slot: BybitCredentialSlot,
+        symbol: String,
+        orderId: String
+    ): Triple<String, Double, Double>? {
+        val resp = signedGet(mode, slot, "/v5/order/realtime", "category=linear&symbol=${symbol.uppercase()}&orderId=$orderId")
+        if (!resp.ok || resp.data == null) return null
+        val item = resp.data.optJSONObject("result")?.optJSONArray("list")?.optJSONObject(0) ?: return null
+        val st = item.optString("orderStatus")
+        val qty = item.optString("cumExecQty").toDoubleOrNull() ?: 0.0
+        val avg = item.optString("avgPrice").toDoubleOrNull() ?: 0.0
+        return Triple(st, qty, avg)
+    }
+
+    fun cancelOrder(mode: BotMode, slot: BybitCredentialSlot, symbol: String, orderId: String): ApiResult<Boolean> {
+        val body = JSONObject()
+            .put("category", "linear")
+            .put("symbol", symbol.uppercase())
+            .put("orderId", orderId)
+        val resp = signedPost(mode, slot, "/v5/order/cancel", body)
+        return ApiResult(ok = resp.ok || isAlreadyMatchedRet(resp.retCode, resp.message), retCode = resp.retCode, data = resp.ok, message = resp.message)
     }
 
     fun cancelAllOrders(mode: BotMode, slot: BybitCredentialSlot, symbol: String): ApiResult<Boolean> {
@@ -545,6 +769,29 @@ class BybitV5TradingClient(
         private const val TAG = "BybitV5Client"
         private const val RECV_WINDOW = "5000"
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
+
+        fun isTradFiMetalSymbol(symbol: String): Boolean {
+            val s = symbol.trim().uppercase()
+            return s.startsWith("XAU") || s.startsWith("XAG")
+        }
+
+        fun defaultFeeProfile(symbol: String): FeeProfile = if (isTradFiMetalSymbol(symbol)) {
+            FeeProfile(makerFeePct = 0.0, takerFeePct = 0.0275, isTradFiMetal = true)
+        } else {
+            FeeProfile(makerFeePct = 0.036, takerFeePct = 0.10, isTradFiMetal = false)
+        }
+
+        fun parseFeeProfileJson(json: JSONObject, symbol: String): FeeProfile {
+            val def = defaultFeeProfile(symbol)
+            val first = json.optJSONObject("result")?.optJSONArray("list")?.optJSONObject(0) ?: return def
+            val makerFrac = first.optString("makerFeeRate").toDoubleOrNull()?.takeIf { it.isFinite() && it >= 0.0 }
+            val takerFrac = first.optString("takerFeeRate").toDoubleOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+            return FeeProfile(
+                makerFeePct = if (makerFrac != null) makerFrac * 100.0 else def.makerFeePct,
+                takerFeePct = if (takerFrac != null) takerFrac * 100.0 else def.takerFeePct,
+                isTradFiMetal = def.isTradFiMetal
+            )
+        }
 
         fun buildSignPayload(
             timestampMs: Long,

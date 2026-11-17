@@ -17,11 +17,19 @@ import com.enamind.ai.bot.ModeWinrateStats
 import com.enamind.ai.bot.TargetBasis
 import com.enamind.ai.bot.TradeBotEngine
 import com.enamind.ai.bot.TradeSide
+import com.enamind.ai.bot.TradeTranche
+import com.enamind.ai.bot.strategy.MarketContextSnapshot
+import com.enamind.ai.bot.strategy.OpenPositionContext
+import com.enamind.ai.bot.strategy.OrderExecutionPreference
+import com.enamind.ai.bot.strategy.StrategyDecision
+import com.enamind.ai.bot.strategy.StrategyModelId
+import com.enamind.ai.bot.strategy.StrategyRegistry
 import com.enamind.ai.bybit.ContractCatalogRepo
 import com.enamind.ai.core.AppState
 import com.enamind.ai.core.Settings
 import com.enamind.ai.core.StorageGuard
 import com.enamind.ai.orderflow.OrderFlowReport
+import org.json.JSONObject
 import com.google.crypto.tink.Aead
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -369,5 +377,175 @@ class TradeBotUnitTests {
             dsScope.cancel()
             dir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `bybitV5TradingClient fee profiles support crypto and zero-maker TradFi metals`() {
+        val btcFee = BybitV5TradingClient.defaultFeeProfile("BTCUSDT")
+        assertEquals(0.036, btcFee.makerFeePct, 1e-6)
+        assertEquals(0.10, btcFee.takerFeePct, 1e-6)
+        assertFalse(btcFee.isTradFiMetal)
+
+        val xauFee = BybitV5TradingClient.defaultFeeProfile("XAUUSDT")
+        assertEquals(0.0, xauFee.makerFeePct, 1e-6)
+        assertEquals(0.0275, xauFee.takerFeePct, 1e-6)
+        assertTrue(xauFee.isTradFiMetal)
+
+        val parsedJson = JSONObject(
+            """{"retCode":0,"result":{"list":[{"symbol":"XAGUSDT","makerFeeRate":"0","takerFeeRate":"0.000275"}]}}"""
+        )
+        val parsed = BybitV5TradingClient.parseFeeProfileJson(parsedJson, "XAGUSDT")
+        assertEquals(0.0, parsed.makerFeePct, 1e-6)
+        assertEquals(0.0275, parsed.takerFeePct, 1e-6)
+        assertTrue(parsed.isTradFiMetal)
+    }
+
+    @Test
+    fun `strategyRegistry hot-swaps 3 models and enforces Anti-Knife and Proximity gates`() {
+        val snapPulse = MarketContextSnapshot(
+            symbol = "BTCUSDT",
+            price = 65_000.0,
+            nowMs = 1_700_000_000_000L,
+            dataFreshnessLive = true,
+            conflictDetected = false,
+            deltaPct = 22.0,
+            normalizedOfi = 0.24,
+            emaDriftPct = 0.05
+        )
+        val enterPulse = StrategyRegistry.resolve(StrategyModelId.FLOW_PULSE_CONTINUATION)
+            .evaluate(snapPulse, OpenPositionContext(hasOpenPosition = false))
+        assertTrue(enterPulse is StrategyDecision.Enter)
+        assertTrue((enterPulse as StrategyDecision.Enter).sideIsBuy)
+
+        // Anti-Knife Gate: blocks ScaleIn when drawdown < step, and blocks during adverse liquidation waterfall
+        val blockedDrawdown = StrategyRegistry.resolve(StrategyModelId.FLOW_PULSE_CONTINUATION).evaluate(
+            snapPulse,
+            OpenPositionContext(
+                hasOpenPosition = true,
+                sideIsBuy = true,
+                tranchesCount = 1,
+                maxTranches = 3,
+                drawdownFromLastTranchePct = 0.12,
+                effectiveStepPct = 0.28
+            )
+        )
+        assertTrue(blockedDrawdown is StrategyDecision.Hold)
+
+        val blockedWaterfall = StrategyRegistry.resolve(StrategyModelId.FLOW_PULSE_CONTINUATION).evaluate(
+            snapPulse.copy(longLiqUsd15s = 25_000.0, deltaPct = -30.0),
+            OpenPositionContext(
+                hasOpenPosition = true,
+                sideIsBuy = true,
+                tranchesCount = 1,
+                maxTranches = 3,
+                drawdownFromLastTranchePct = 0.40,
+                effectiveStepPct = 0.28
+            )
+        )
+        assertTrue(blockedWaterfall is StrategyDecision.Hold)
+
+        val allowedScaleIn = StrategyRegistry.resolve(StrategyModelId.FLOW_PULSE_CONTINUATION).evaluate(
+            snapPulse,
+            OpenPositionContext(
+                hasOpenPosition = true,
+                sideIsBuy = true,
+                tranchesCount = 1,
+                maxTranches = 3,
+                drawdownFromLastTranchePct = 0.35,
+                effectiveStepPct = 0.28
+            )
+        )
+        assertTrue(allowedScaleIn is StrategyDecision.ScaleIn)
+
+        // Squeeze model catches short liquidation cascade
+        val snapSqueeze = snapPulse.copy(shortLiqUsd15s = 15_000.0, longLiqUsd15s = 500.0, deltaPct = 20.0)
+        val enterSqueeze = StrategyRegistry.resolve(StrategyModelId.SQUEEZE_LIQUIDATION_HUNTER)
+            .evaluate(snapSqueeze, OpenPositionContext(hasOpenPosition = false))
+        assertTrue(enterSqueeze is StrategyDecision.Enter)
+        assertTrue((enterSqueeze as StrategyDecision.Enter).sideIsBuy)
+
+        // Sniper rejects outside Proximity Gate and enters PostOnly Maker at resistance wall
+        val snapFar = snapPulse.copy(levelDistancePct = 0.65, absorptionDetected = false, replenishmentRate = 0.50, progressEfficiency = 0.10)
+        assertTrue(
+            StrategyRegistry.resolve(StrategyModelId.WALL_ABSORPTION_SNIPER)
+                .evaluate(snapFar, OpenPositionContext(hasOpenPosition = false)) is StrategyDecision.Hold
+        )
+        val snapWall = snapFar.copy(
+            levelDistancePct = 0.05,
+            absorptionSideName = "SELLER_ABSORPTION",
+            absorptionDetected = true
+        )
+        val sniperEnter = StrategyRegistry.resolve(StrategyModelId.WALL_ABSORPTION_SNIPER)
+            .evaluate(snapWall, OpenPositionContext(hasOpenPosition = false))
+        assertTrue(sniperEnter is StrategyDecision.Enter)
+        assertFalse((sniperEnter as StrategyDecision.Enter).sideIsBuy)
+        assertEquals(OrderExecutionPreference.MAKER_POST_ONLY, sniperEnter.orderPreference)
+    }
+
+    @Test
+    fun `blended tranche math, cumulative paid fees, effectiveCapital, adaptive trailing, and unlimitedHold work accurately`() {
+        val tranches = listOf(
+            TradeTranche(index = 1, entryPrice = 100.0, qty = 3.0, entryFeeUsdt = 0.108, enteredAtMs = 1L, isMaker = true),
+            TradeTranche(index = 2, entryPrice = 98.0, qty = 3.5, entryFeeUsdt = 0.12348, enteredAtMs = 2L, isMaker = true)
+        )
+        val avgEntry = TradeBotEngine.computeBlendedAvgEntry(tranches)
+        // (300 + 343) / 6.5 = 643 / 6.5 = 98.9230769
+        assertEquals(643.0 / 6.5, avgEntry, 1e-6)
+        val paidFees = tranches.sumOf { it.entryFeeUsdt }
+        val totalQty = 6.5
+        val margin = (avgEntry * totalQty) / 10.0
+
+        val tpMin = TradeBotEngine.blendedTargetPriceForNetPct(
+            side = TradeSide.BUY,
+            avgEntryPrice = avgEntry,
+            qty = totalQty,
+            leverage = 10,
+            usedMarginUsdt = margin,
+            paidEntryFeesUsdt = paidFees,
+            expectedExitFeeRatePct = 0.036,
+            targetNetPct = 0.5,
+            targetBasis = TargetBasis.NET_ROE_PCT
+        )
+        val pnlAtTp = TradeBotEngine.computeBlendedNetPnl(
+            side = TradeSide.BUY,
+            qty = totalQty,
+            avgEntryPrice = avgEntry,
+            markPrice = tpMin,
+            leverage = 10,
+            usedMarginUsdt = margin,
+            paidEntryFeesUsdt = paidFees,
+            expectedExitFeeRatePct = 0.036,
+            targetBasis = TargetBasis.NET_ROE_PCT
+        )
+        assertEquals(0.5, pnlAtTp.netPnlPct, 1e-4)
+
+        assertEquals(47.5, TradeBotEngine.computeEffectiveCapital(100.0, 50.0), 1e-6)
+        assertEquals(1.0, TradeBotEngine.adaptiveTrailingGivebackPct(0.35, 0.04, 10, TargetBasis.NET_ROE_PCT), 1e-6)
+
+        val unlimitedCfg = BotConfig(allowUnlimitedHold = true, maxHoldWaitMin = 1, stopLossEnabled = false)
+        val oldPos = com.enamind.ai.bot.ActivePosition(
+            id = "p_hold",
+            mode = BotMode.PAPER,
+            symbol = "BTCUSDT",
+            side = TradeSide.BUY,
+            qty = 1.0,
+            entryPrice = 100.0,
+            markPrice = 99.8,
+            leverage = 10,
+            marginMode = MarginMode.ISOLATED,
+            usedMarginUsdt = 10.0,
+            openedAtMs = 1_000_000L,
+            feeRatePct = 0.072,
+            estFeeUsdt = 0.07,
+            grossPnlUsdt = -0.2,
+            netPnlUsdt = -0.27,
+            netPnlPct = -2.7,
+            peakNetPnlPct = 0.0,
+            tpMinPrice = 100.2,
+            tpMaxPrice = 100.5
+        )
+        assertFalse(
+            TradeBotEngine.evaluateExitDecision(oldPos, unlimitedCfg, nowMs = 99_000_000L, signalStillAligned = false).shouldClose
+        )
     }
 }

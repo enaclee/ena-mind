@@ -879,12 +879,29 @@ class NeuralEngine(
                 }
                 _realTimePulse.value = pulse
 
+                // Слой 3: Периодический сбор рыночных якорей (Spot CVD / Open Interest)
+                if (tick % 2 == 0) {
+                    withContext(Dispatchers.IO) {
+                        state.anchorsCollector.pollRestAnchorsIfDue(sym, nowMs)
+                    }
+                }
+
                 // Обновление модуля ENA — ORDER FLOW & ABSORPTION INTELLIGENCE в реальном времени
                 val chartBars = klinesCache["$sym:$chartInterval"] ?: state.klines.value.ifEmpty { bars1m }
                 val livePx = m.price
                     ?: binancePrice.takeIf { it > 0.0 }
                     ?: okxPrice.takeIf { it > 0.0 }
                 val tickSize = state.contractCatalog.findTickSize(sym)
+                val botCfg = state.botEngine.uiState.value.config
+                val flowVenue = state.orderFlow.streamHub.snapshot(sym, nowMs)?.primaryVenue
+                val venueSyncWarn = if (botCfg.mode.isLiveExchange &&
+                    botCfg.symbol.equals(sym, ignoreCase = true) &&
+                    !flowVenue.isNullOrBlank() &&
+                    !flowVenue.equals("Bybit", ignoreCase = true) &&
+                    !flowVenue.equals("Поток", ignoreCase = true)
+                ) {
+                    "Рассинхрон площадок: бот на Bybit (${botCfg.mode.shortLabel}), OrderFlow идёт с $flowVenue"
+                } else null
                 withContext(Dispatchers.Default) {
                     state.orderFlow.evaluate(
                         symbol = sym,
@@ -894,7 +911,8 @@ class NeuralEngine(
                         bars = chartBars,
                         nowMs = nowMs,
                         quantAdx = intel?.quant?.adx,
-                        quantEr = intel?.quant?.efficiencyRatio
+                        quantEr = intel?.quant?.efficiencyRatio,
+                        venueSyncWarning = venueSyncWarn
                     )
                 }
 
