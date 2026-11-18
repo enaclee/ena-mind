@@ -2,6 +2,8 @@ package com.enamind.ai.core
 
 import android.content.Context
 import android.content.SharedPreferences
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Настройки ENA. Секреты (ключи API / универсальные AI-ключи) хранятся
@@ -21,9 +23,19 @@ class Settings(ctx: Context) {
         sp.edit().putString(key, if (value.isBlank()) "" else "enc:" + CryptoBox.encrypt(value)).apply()
     }
 
+    private val _appearanceRevision = MutableStateFlow(0)
+    val appearanceRevision: StateFlow<Int> = _appearanceRevision
     var theme: Theme
-        get() = if (sp.getString("theme", "black") == "white") Theme.WHITE else Theme.BLACK
-        set(v) = sp.edit().putString("theme", if (v == Theme.WHITE) "white" else "black").apply()
+        get() = when (sp.getString("theme", "black")) { "white" -> Theme.WHITE; "rgb" -> Theme.RGB; else -> Theme.BLACK }
+        set(v) { sp.edit().putString("theme", v.name.lowercase()).apply(); _appearanceRevision.value++ }
+    var accentColor: Int
+        get() = sp.getInt("accent_color", 0xFF8AB4F8.toInt())
+        set(v) { sp.edit().putInt("accent_color", v).apply(); _appearanceRevision.value++ }
+    var rgbDarkBase: Boolean
+        get() = sp.getBoolean("rgb_dark_base", true)
+        set(v) { sp.edit().putBoolean("rgb_dark_base", v).apply(); _appearanceRevision.value++ }
+    fun notificationEnabled(channel: String): Boolean = sp.getBoolean("notify_$channel", false)
+    fun setNotificationEnabled(channel: String, enabled: Boolean) { sp.edit().putBoolean("notify_$channel", enabled).apply() }
 
     var newsApiKey: String
         get() = getSecret("news_api_key")
@@ -83,6 +95,14 @@ class Settings(ctx: Context) {
         get() = sp.getString("ai_openai_model", DEFAULT_OPENAI_MODEL) ?: DEFAULT_OPENAI_MODEL
         set(v) = sp.edit().putString("ai_openai_model", v.trim().ifBlank { DEFAULT_OPENAI_MODEL }).apply()
 
+    var instrumentCategory: String
+        get() = sp.getString("instrument_category", "linear")?.takeIf { it in setOf("linear", "spot", "inverse") } ?: "linear"
+        set(v) { require(v in setOf("linear", "spot", "inverse")); sp.edit().putString("instrument_category", v).apply() }
+
+    var instrumentVenue: String
+        get() = sp.getString("instrument_venue", "Bybit") ?: "Bybit"
+        set(v) = sp.edit().putString("instrument_venue", v).apply()
+
     var symbol: String
         get() = sp.getString("symbol", "BTCUSDT") ?: "BTCUSDT"
         set(v) = sp.edit().putString("symbol", v.trim().uppercase()).apply()
@@ -93,9 +113,9 @@ class Settings(ctx: Context) {
 
     /** Избранные контракты пользователя. */
     var favoriteSymbols: Set<String>
-        get() = sp.getStringSet("favorite_symbols", null)?.map { it.uppercase() }?.toSet()
+        get() = sp.getStringSet("favorite_symbols", null)?.map { if (it.contains(":")) it else it.uppercase() }?.toSet()
             ?: setOf("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
-        set(v) = sp.edit().putStringSet("favorite_symbols", v.map { it.uppercase() }.toSet()).apply()
+        set(v) = sp.edit().putStringSet("favorite_symbols", v.map { if (it.contains(":")) it else it.uppercase() }.toSet()).apply()
 
     /** Время последней успешной синхронизации Календаря событий (15-дневная автоматизация). */
     var calendarLastSyncMs: Long
@@ -118,7 +138,7 @@ class Settings(ctx: Context) {
         get() = sp.getBoolean("onboarding_done", false)
         set(v) = sp.edit().putBoolean("onboarding_done", v).apply()
 
-    enum class Theme { BLACK, WHITE }
+    enum class Theme { BLACK, WHITE, RGB }
 
     companion object {
         const val DEFAULT_BYBIT_URL = "https://api.bybit.com"

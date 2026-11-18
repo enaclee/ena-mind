@@ -104,6 +104,8 @@ class NeuralEngine(
     // ---------------- WS бирж (независимое подтверждение + fallback для UI) ----------------
     private var binanceWs: BinanceWs? = null
     private var okxWs: OkxWs? = null
+    @Volatile var crossPriceAtMs = 0L
+    fun enacoreBars(): List<List<Double>> = klinesCache["$symbol:1"].orEmpty()
     @Volatile var binancePrice = 0.0
     @Volatile var okxPrice = 0.0
     @Volatile var binanceDepth: Pair<List<Pair<Double, Double>>, List<Pair<Double, Double>>>? = null
@@ -195,6 +197,12 @@ class NeuralEngine(
     }
 
     fun changeSymbol() {
+        crossPriceAtMs = 0L
+        klinesCache.clear()
+        lastSyncedKlineSig.clear()
+        _intelligence.value = null
+        _realTimePulse.value = RealTimeLeadEngine.RealTimeTrendPulse(symbol = symbol)
+        state.orderFlow.resetForInstrument(symbol)
         binancePrice = 0.0
         okxPrice = 0.0
         binanceDepth = null
@@ -221,21 +229,27 @@ class NeuralEngine(
     }
 
     private fun connectBinanceOnly() {
+        val instrument = state.activeInstrument.value
         val sym = symbol
         val iv = chartInterval
         binanceWs?.close()
+        if (instrument.category == "inverse" || instrument.baseCoin in setOf("XAU", "XAG", "GOLD", "SILVER")) { binanceConnected = false; return }
         binanceWs = BinanceWs(sym, object : BinanceWs.Listener {
             override fun onFlow(flow: BinanceWs.FlowStats) {
+                if (instrument != state.activeInstrument.value) return
                 binanceFlow = flow
                 state.onFallbackFlow(sym, flow)
             }
 
             override fun onPrice(price: Double) {
+                if (instrument != state.activeInstrument.value) return
+                crossPriceAtMs = System.currentTimeMillis()
                 binancePrice = price
                 state.onFallbackPrice(sym, price, "Binance")
             }
 
             override fun onDepth(bids: List<Pair<Double, Double>>, asks: List<Pair<Double, Double>>) {
+                if (instrument != state.activeInstrument.value) return
                 binanceDepth = bids to asks
                 state.onFallbackDepth(sym, bids, asks)
                 if (!state.hasFreshBybitBook()) {
@@ -251,6 +265,7 @@ class NeuralEngine(
             }
 
             override fun onTrade(price: Double, qty: Double, isAggressiveBuy: Boolean, exchangeTsMs: Long, lagMs: Long) {
+                if (instrument != state.activeInstrument.value) return
                 if (!state.hasFreshBybitTrades()) {
                     state.orderFlow.streamHub.recordTrade(
                         symbol = sym,
@@ -265,27 +280,32 @@ class NeuralEngine(
             }
 
             override fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {
+                if (instrument != state.activeInstrument.value) return
                 if (!state.hasFreshBybitBook()) {
                     state.orderFlow.streamHub.recordDomDeltas(sym, deltas, synced, lagMs, "Binance")
                 }
             }
 
             override fun onBookDesync(reason: String) {
+                if (instrument != state.activeInstrument.value) return
                 if (!state.hasFreshBybitBook()) {
                     state.orderFlow.streamHub.recordDesync(sym, reason, "Binance")
                 }
             }
 
             override fun onKline(bar: BybitWs.Kline) {
+                if (instrument != state.activeInstrument.value) return
                 state.onFallbackKline(sym, iv, bar)
             }
 
             override fun onTicker24h(price: Double, change24hPct: Double, volume24h: Double, quoteVolume24h: Double) {
+                if (instrument != state.activeInstrument.value) return
                 binancePrice = price
                 state.onFallbackTicker24h(sym, price, change24hPct, volume24h, quoteVolume24h, "Binance")
             }
 
             override fun onStatus(connected: Boolean, note: String) {
+                if (instrument != state.activeInstrument.value) return
                 binanceConnected = connected
                 binanceNote = note
                 state.onFallbackStatus()
@@ -294,20 +314,26 @@ class NeuralEngine(
     }
 
     private fun connectOkxOnly() {
+        val instrument = state.activeInstrument.value
         val sym = symbol
         okxWs?.close()
+        if (instrument.category == "inverse") { okxConnected = false; return }
         okxWs = OkxWs(sym, object : OkxWs.Listener {
             override fun onFlow(flow: OkxWs.FlowStats) {
+                if (instrument != state.activeInstrument.value) return
                 okxFlow = flow
                 state.onFallbackOkxFlow(sym, flow)
             }
 
             override fun onPrice(price: Double, vol24hCcy: Double) {
+                if (instrument != state.activeInstrument.value) return
+                crossPriceAtMs = System.currentTimeMillis()
                 okxPrice = price
                 state.onFallbackPrice(sym, price, "OKX", vol24hCcy)
             }
 
             override fun onStatus(connected: Boolean, note: String) {
+                if (instrument != state.activeInstrument.value) return
                 okxConnected = connected
                 okxNote = note
                 state.onFallbackStatus()
@@ -338,7 +364,7 @@ class NeuralEngine(
     private suspend fun pushKlines(sym: String): Boolean = warmupMutex.withLock {
         withContext(Dispatchers.IO) {
             // Сначала загружаем "1" (он быстрее переводит Bybit в cooldown при геоблоке)
-            val r1 = state.rest.klinesUnifiedSync(sym, "1", 250)
+            val r1 = state.rest.klinesUnifiedSync(sym, "1", 1000)
             if (r1.rows.isNotEmpty()) {
                 klinesCache["$sym:1"] = r1.rows
                 klinesCacheTs["$sym:1"] = System.currentTimeMillis()

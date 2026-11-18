@@ -60,6 +60,14 @@ class AppState(
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val settings = Settings(ctx)
     val contractCatalog = ContractCatalogRepo(ctx, settings)
+    private val instrumentGeneration = AtomicLong(0L)
+    private val _activeInstrument = MutableStateFlow(
+        contractCatalog.findContract(settings.symbol)?.let { ActiveInstrument.from(it) }
+            ?: ActiveInstrument(symbol = settings.symbol, category = settings.instrumentCategory, venue = settings.instrumentVenue))
+    val activeInstrument: StateFlow<ActiveInstrument> = _activeInstrument
+    val enacore by lazy { EnacoreEngine(ctx, this) }
+    val notifications by lazy { AppNotifications(ctx, this) }
+    fun coreStreamTimes(): Pair<Long, Long> = lastBybitBookMs.get() to lastBybitTradeMs.get()
     val majorCalendar = MajorCalendarRepo(ctx, settings)
     val orderFlow = OrderFlowIntelligenceOrchestrator(ctx)
     val botVault = BotVaultStore(ctx)
@@ -69,7 +77,7 @@ class AppState(
     val favoriteSymbols: StateFlow<Set<String>> = _favoriteSymbols
 
     fun toggleFavoriteSymbol(sym: String) {
-        val clean = sym.trim().uppercase()
+        val clean = if (sym.contains(":")) sym.trim() else sym.trim().uppercase()
         if (clean.isBlank()) return
         val next = _favoriteSymbols.value.toMutableSet()
         if (!next.add(clean)) next.remove(clean)
@@ -139,7 +147,8 @@ class AppState(
     private var ws: BybitWs? = null
     private val tape = TapeAggregator(500)
     private val liq = LiquidationAggregator()
-    val rest = BybitRest(settings.bybitBaseUrl)
+    @Volatile private var activeRest = BybitRest(settings.bybitBaseUrl, settings.instrumentCategory)
+    val rest: BybitRest get() = activeRest
 
     // Временные метки живых пакетов Bybit — если Bybit молчит >4с, UI бережно переключается на Binance/OKX
     private val lastBybitTickerMs = AtomicLong(0L)
@@ -188,12 +197,15 @@ class AppState(
             anchorsProvider = { sym ->
                 anchorsCollector.snapshot(sym, _klines.value, _market.value.price)
             },
+            coreProvider = { enacore.state.value },
+            instrumentProvider = { activeInstrument.value },
+            onCorePosition = { id, symbol, opened, pnl -> enacore.position(id, symbol, opened, pnl); notifications.post("bot_trade", symbol, if (opened) "Позиция открыта" else "Позиция закрыта · Net $pnl") },
             clockSync = engine.clockSync,
             onServiceStateChanged = { shouldRun ->
                 if (shouldRun) BotForegroundService.start(ctx) else BotForegroundService.stop(ctx)
             },
             onNotify = { notif ->
-                BotForegroundService.postHighPriorityAlert(ctx, notif.title, notif.body)
+                notifications.post(if (notif.title.contains("Сервис")) "bot_timeout" else "bot_stop", notif.title, notif.body)
             }
         )
     }
@@ -201,7 +213,6 @@ class AppState(
     fun selectBotSymbol(sym: String) {
         val clean = sym.trim().uppercase()
         if (clean.isBlank()) return
-        botEngine.updateConfig { it.copy(symbol = clean) }
         changeSymbol(clean)
     }
 
@@ -245,18 +256,7 @@ class AppState(
     private fun activeAiModelId(): String =
         if (settings.aiProvider == Settings.PROVIDER_OPENAI_COMPAT) settings.aiOpenAiModel else settings.aiStudioModel
 
-    private val _aiChatMessages = MutableStateFlow<List<AiChatMessage>>(
-        listOf(
-            AiChatMessage(
-                id = 1L,
-                fromUser = false,
-                modelId = activeAiModelId(),
-                text = "Это изолированный свободный ИИ-чат ENA (Google AI Studio + OpenAI-совместимые ключи).\n" +
-                    "Он НЕ вмешивается в расчёты рынка, Order Flow и ботов ENA.\n\n" +
-                    "Настройте ключ в Настройках → API и задавайте любые вопросы или прикрепляйте фото и файлы."
-            )
-        )
-    )
+    private val _aiChatMessages = MutableStateFlow<List<AiChatMessage>>(emptyList())
     val aiChatMessages: StateFlow<List<AiChatMessage>> = _aiChatMessages
 
     private val _aiChatBusy = MutableStateFlow(false)
@@ -411,16 +411,7 @@ class AppState(
         }
     }
 
-    fun clearAiChat() {
-        _aiChatMessages.value = listOf(
-            AiChatMessage(
-                id = nextChatMsgId(),
-                fromUser = false,
-                modelId = activeAiModelId(),
-                text = "Диалог ИИ очищен. Подключение полностью изолировано от движка ENA."
-            )
-        )
-    }
+    fun clearAiChat() { _aiChatMessages.value = emptyList() }
 
     // ---------------- UI-события ----------------
     private val _toast = MutableStateFlow<String?>(null)
@@ -433,6 +424,8 @@ class AppState(
     // ================================================================
     fun start() {
         if (!started.compareAndSet(false, true)) return
+        enacore.start()
+        notifications.start()
         connectWs()
         reloadKlines()
         refreshMarketStats()
@@ -504,8 +497,29 @@ class AppState(
     }
 
     fun changeSymbol(symbol: String) {
-        if (_market.value.symbol == symbol) return
+        val clean = symbol.trim().uppercase()
+        val info = contractCatalog.findContract(clean)
+        selectInstrument(info ?: ContractCatalogRepo.ContractInfo(clean, clean.removeSuffix("USDT"), "USDT", null, null, null, "Bybit"))
+    }
+
+    @Synchronized
+    fun selectInstrument(info: ContractCatalogRepo.ContractInfo): Boolean {
+        if (activeInstrument.value.key == info.key) return true
+        val bot = botEngine.uiState.value
+        if (bot.running || bot.activePosition != null) {
+            toast("Остановите бота и завершите позицию перед сменой инструмента")
+            return false
+        }
+        val selected = ActiveInstrument.from(info, instrumentGeneration.incrementAndGet())
+        _activeInstrument.value = selected
+        val symbol = selected.symbol
         settings.symbol = symbol
+        settings.instrumentCategory = selected.category
+        settings.instrumentVenue = selected.venue
+        activeRest = BybitRest(settings.bybitBaseUrl, selected.category)
+        ws?.close()
+        tape.clear()
+        enacore.reset(selected)
         _klines.value = emptyList()
         _lastBar.value = null
         lastBybitTickerMs.set(0L)
@@ -531,10 +545,13 @@ class AppState(
             tape = null,
             feedSource = "Подключение…"
         )
+        botEngine.updateConfig { it.copy(symbol = symbol, instrumentCategory = selected.category, instrumentVenue = selected.venue,
+            leverage = it.leverage.coerceAtMost(selected.maxLeverage.toInt().coerceAtLeast(1))) }
         connectWs()
         reloadKlines()
         refreshMarketStats()
         engine.changeSymbol()
+        return true
     }
 
     fun changeInterval(interval: String) {
@@ -553,8 +570,11 @@ class AppState(
         ws?.close()
         val sym = _market.value.symbol
         val iv = _market.value.interval
+        val instrument = activeInstrument.value
+        val generation = instrument.generation
         ws = BybitWs(sym, object : BybitWs.Listener {
             override fun onTicker(t: BybitWs.Ticker) {
+                if (activeInstrument.value.generation != generation) return
                 if (t.last.isFinite() && t.last > 0) lastBybitTickerMs.set(System.currentTimeMillis())
                 anchorsCollector.recordTicker(sym, t.last, t.openInterest, t.fundingRate)
                 _market.value = _market.value.copy(
@@ -569,8 +589,10 @@ class AppState(
             }
 
             override fun onTrade(tr: BybitWs.Trade) {
+                if (activeInstrument.value.generation != generation) return
                 lastBybitTradeMs.set(System.currentTimeMillis())
                 tape.add(tr)
+                enacore.onTrade(generation, tr)
                 anchorsCollector.recordPerpTrade(
                     symbol = sym,
                     price = tr.price,
@@ -591,6 +613,7 @@ class AppState(
             }
 
             override fun onBook(bids: List<BybitWs.BookLevel>, asks: List<BybitWs.BookLevel>) {
+                if (activeInstrument.value.generation != generation) return
                 lastBybitBookMs.set(System.currentTimeMillis())
                 orderFlow.streamHub.recordBookSnapshot(
                     symbol = sym,
@@ -604,10 +627,12 @@ class AppState(
             }
 
             override fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {
+                if (activeInstrument.value.generation != generation) return
                 orderFlow.streamHub.recordDomDeltas(sym, deltas, synced, lagMs, "Bybit")
             }
 
             override fun onLiquidation(l: BybitWs.Liquidation) {
+                if (activeInstrument.value.generation != generation) return
                 liq.add(l)
                 anchorsCollector.recordLiquidation(l.symbol, l.side, l.price, l.size, l.tsMs)
                 val s = liq.stats(_market.value.symbol, System.currentTimeMillis())
@@ -617,12 +642,18 @@ class AppState(
                 )
             }
 
+            override fun onMinuteKline(bar: BybitWs.Kline) {
+                enacore.onMinuteBar(generation, bar)
+            }
+
             override fun onKline(bar: BybitWs.Kline) {
+                if (activeInstrument.value.generation != generation) return
                 lastBybitKlineMs.set(System.currentTimeMillis())
                 applyLiveBar(bar)
             }
 
             override fun onStatus(connected: Boolean, note: String) {
+                if (activeInstrument.value.generation != generation) return
                 val cur = _market.value
                 val resolvedNote = if (connected && !isBybitFresh(lastBybitTickerMs.get(), 10_000L) &&
                     (engine.binanceConnected || engine.okxConnected)
@@ -635,6 +666,7 @@ class AppState(
             }
 
             override fun onBookDesync(reason: String) {
+                if (activeInstrument.value.generation != generation) return
                 if (!engine.binanceConnected) {
                     if (reason.startsWith("WS_STALE", ignoreCase = true)) {
                         orderFlow.streamHub.markWsStale(sym, reason, "Bybit")
@@ -649,6 +681,7 @@ class AppState(
             }
 
             override fun onReconnected() {
+                if (activeInstrument.value.generation != generation) return
                 appScope.launch(Dispatchers.IO) {
                     runCatching {
                         engine.clockSync.syncIfNeeded(
@@ -660,7 +693,7 @@ class AppState(
                     }
                 }
             }
-        }, klineInterval = iv, clockOffsetMsProvider = { engine.clockSync.status().offsetMs }).also { it.connect() }
+        }, category = instrument.category, klineInterval = iv, clockOffsetMsProvider = { engine.clockSync.status().offsetMs }).also { it.connect() }
     }
 
     private fun applyLiveBar(bar: BybitWs.Kline) {
@@ -791,8 +824,9 @@ class AppState(
     fun reloadKlines() {
         val sym = _market.value.symbol
         val iv = _market.value.interval
+        val instrument = activeInstrument.value
         rest.klinesWithFallback(sym, iv, 300) { res ->
-            if (sym != _market.value.symbol || iv != _market.value.interval) return@klinesWithFallback
+            if (activeInstrument.value != instrument || iv != _market.value.interval) return@klinesWithFallback
             if (res.rows.isEmpty()) {
                 appScope.launch { toast("свечи недоступны ($sym): ${res.error ?: "нет связи"}") }
                 return@klinesWithFallback
@@ -816,8 +850,10 @@ class AppState(
     /** Обновление метрик: LSR, OI, funding, 24h тикер + F&G с резервом на Binance/OKX. */
     fun refreshMarketStats() {
         val sym = _market.value.symbol
+        val instrument = activeInstrument.value
+        if (instrument.category == "spot") return
         rest.accountRatio(sym, 168) { arr ->
-            if (arr != null && arr.length() > 0 && sym == _market.value.symbol) {
+            if (arr != null && arr.length() > 0 && activeInstrument.value == instrument) {
                 try {
                     val ratios = (0 until arr.length()).mapNotNull {
                         val r = arr.getJSONObject(it)
@@ -835,7 +871,7 @@ class AppState(
             }
         }
         rest.openInterest(sym, 25) { arr ->
-            if (arr != null && arr.length() >= 2 && sym == _market.value.symbol) {
+            if (arr != null && arr.length() >= 2 && activeInstrument.value == instrument) {
                 try {
                     val first = arr.getJSONObject(arr.length() - 1).optDouble("openInterest")
                     val last = arr.getJSONObject(0).optDouble("openInterest")
@@ -850,7 +886,7 @@ class AppState(
         // Fallback stats (Binance 24h + OKX funding/OI/LSR), чтобы данные не пустовали при геоблоке Bybit
         appScope.launch(Dispatchers.IO) {
             val fb = rest.fetchFallbackStatsSync(sym)
-            if (sym == _market.value.symbol) {
+            if (activeInstrument.value == instrument) {
                 val cur = _market.value
                 _market.value = cur.copy(
                     price = cur.price ?: fb.price?.takeIf { it.isFinite() && it > 0 },

@@ -87,7 +87,7 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Настройки ENA: Тема / API (Google AI Studio + OpenAI-совместимые ключи) / Память (экспорт JSON + CSV) / Сбои.
+ * Настройки ENA: Тема / API (Gemini + OpenAI-совместимые ключи) / Память (экспорт JSON + CSV) / Сбои.
  */
 @Composable
 fun SettingsScreen(
@@ -96,14 +96,14 @@ fun SettingsScreen(
     onClose: () -> Unit,
     initialTab: Int = 0
 ) {
-    var tab by remember { mutableIntStateOf(initialTab.coerceIn(0, 3)) }
+    var tab by remember { mutableIntStateOf(initialTab.coerceIn(0, 5)) }
     LaunchedEffect(initialTab) {
-        tab = initialTab.coerceIn(0, 3)
+        tab = initialTab.coerceIn(0, 5)
     }
 
     val summary by FaultMonitor.summary.collectAsState()
 
-    Column(modifier = Modifier.fillMaxSize().imePadding()) {
+    Column(modifier = Modifier.fillMaxSize()) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -117,7 +117,7 @@ fun SettingsScreen(
                     color = MaterialTheme.colorScheme.onBackground
                 )
                 Text(
-                    "ENA · аналитический терминал",
+                    "ENΛVERSE · аналитический терминал",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -128,7 +128,7 @@ fun SettingsScreen(
                     .heightIn(min = 48.dp)
                     .testTag("settings_done_button")
             ) {
-                Text("Готово ✓", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Text("Готово", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
             }
         }
 
@@ -144,7 +144,8 @@ fun SettingsScreen(
                 "Тема",
                 "API",
                 "Память",
-                if (summary.activeFaults > 0) "Сбои (${summary.activeFaults})" else "Сбои"
+                if (summary.activeFaults > 0) "Сбои (${summary.activeFaults})" else "Сбои",
+                "Уведомления", "Справка"
             )
             tabNames.forEachIndexed { i, name ->
                 Tab(
@@ -170,7 +171,9 @@ fun SettingsScreen(
             0 -> ThemeTab(state, onThemeChange)
             1 -> ApiTab(state)
             2 -> MemoryTab(state)
-            else -> FaultsTab(state)
+            3 -> FaultsTab(state)
+            4 -> NotificationSettings(state)
+            else -> AppGuideScreen()
         }
     }
 }
@@ -214,6 +217,8 @@ private fun settingsFieldColors() = OutlinedTextFieldDefaults.colors(
 @Composable
 private fun ThemeTab(state: AppState, onThemeChange: (Settings.Theme) -> Unit) {
     var theme by remember { mutableStateOf(state.settings.theme) }
+    var colorPicker by remember { mutableStateOf(false) }
+    if (colorPicker) RgbThemeDialog(state.settings) { colorPicker = false }
     val ctx = LocalContext.current
     Column(
         modifier = Modifier
@@ -253,6 +258,9 @@ private fun ThemeTab(state: AppState, onThemeChange: (Settings.Theme) -> Unit) {
                     colors = settingsChipColors(),
                     label = { Text("Светлая", style = MaterialTheme.typography.labelLarge) }
                 )
+                FilterChip(selected = theme == Settings.Theme.RGB, onClick = {
+                    theme = Settings.Theme.RGB; state.settings.theme = theme; onThemeChange(theme); colorPicker = true
+                }, label = { Text("RGB") }, modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("theme_rgb_button"))
             }
         }
 
@@ -299,11 +307,12 @@ private fun ThemeTab(state: AppState, onThemeChange: (Settings.Theme) -> Unit) {
                 )
             }
         }
+        SettingsFooter()
     }
 }
 
 // ---------------------------------------------------------
-// API (+ универсальное подключение AI Studio & OpenAI-совместимых API)
+// API (+ универсальное подключение Gemini & OpenAI-совместимых API)
 // ---------------------------------------------------------
 @Composable
 private fun ApiTab(state: AppState) {
@@ -338,6 +347,9 @@ private fun ApiTab(state: AppState) {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        val botUi by state.botEngine.uiState.collectAsState()
+        BotModeAndKeysCard(state, botUi)
+
         // 1. Универсальный AI-клиент (изолирован от расчётов ENA)
         SettingsCard {
             Row(
@@ -353,7 +365,7 @@ private fun ApiTab(state: AppState) {
                 SectionTitle("Универсальный ИИ-чат (изолирован)")
             }
             Text(
-                "Собеседник во вкладке «ИИ ЧАТ» не имеет доступа к квантовому движку и Order Flow. Выберите Google AI Studio или любой OpenAI-совместимый API.",
+                "Собеседник во вкладке «ИИ ЧАТ» не имеет доступа к квантовому движку и Order Flow. Выберите Gemini или любой OpenAI-совместимый API.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -367,7 +379,7 @@ private fun ApiTab(state: AppState) {
                     },
                     modifier = Modifier.heightIn(min = 48.dp).testTag("ai_provider_gemini"),
                     colors = settingsChipColors(),
-                    label = { Text("Google AI Studio", fontSize = 11.5.sp) }
+                    label = { Text("Gemini", fontSize = 11.5.sp) }
                 )
                 FilterChip(
                     selected = provider == Settings.PROVIDER_OPENAI_COMPAT,
@@ -388,7 +400,7 @@ private fun ApiTab(state: AppState) {
                         aiKey = it
                         state.settings.aiStudioApiKey = it.trim()
                     },
-                    label = { Text("API-ключ Google AI Studio") },
+                    label = { Text("API-ключ Gemini") },
                     placeholder = { Text("AIza…", fontFamily = JetBrainsMonoFontFamily) },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -500,7 +512,7 @@ private fun ApiTab(state: AppState) {
                         aiModel = it
                         if (it.isNotBlank()) state.settings.aiStudioModel = it.trim()
                     },
-                    label = { Text("ID модели AI Studio") },
+                    label = { Text("ID модели Gemini") },
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("ai_studio_model_input"),
@@ -814,7 +826,7 @@ private fun ApiTab(state: AppState) {
         }
 
         Text(
-            "Проверка идёт параллельно и не дольше 15 секунд. Все ключи (включая AI Studio) зашифрованы Android Keystore и хранятся только на устройстве.",
+            "Проверка идёт параллельно и не дольше 15 секунд. Все ключи (включая Gemini) зашифрованы Android Keystore и хранятся только на устройстве.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp)

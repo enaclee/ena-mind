@@ -22,8 +22,7 @@ import com.enamind.ai.bot.strategy.MarketContextSnapshot
 import com.enamind.ai.bot.strategy.OpenPositionContext
 import com.enamind.ai.bot.strategy.OrderExecutionPreference
 import com.enamind.ai.bot.strategy.StrategyDecision
-import com.enamind.ai.bot.strategy.StrategyModelId
-import com.enamind.ai.bot.strategy.StrategyRegistry
+import com.enamind.ai.bot.BotDecisionEngine
 import com.enamind.ai.bybit.ContractCatalogRepo
 import com.enamind.ai.core.AppState
 import com.enamind.ai.core.Settings
@@ -401,85 +400,19 @@ class TradeBotUnitTests {
     }
 
     @Test
-    fun `strategyRegistry hot-swaps 3 models and enforces Anti-Knife and Proximity gates`() {
-        val snapPulse = MarketContextSnapshot(
-            symbol = "BTCUSDT",
-            price = 65_000.0,
-            nowMs = 1_700_000_000_000L,
-            dataFreshnessLive = true,
-            conflictDetected = false,
-            deltaPct = 22.0,
-            normalizedOfi = 0.24,
-            emaDriftPct = 0.05
-        )
-        val enterPulse = StrategyRegistry.resolve(StrategyModelId.FLOW_PULSE_CONTINUATION)
-            .evaluate(snapPulse, OpenPositionContext(hasOpenPosition = false))
-        assertTrue(enterPulse is StrategyDecision.Enter)
-        assertTrue((enterPulse as StrategyDecision.Enter).sideIsBuy)
-
-        // Anti-Knife Gate: blocks ScaleIn when drawdown < step, and blocks during adverse liquidation waterfall
-        val blockedDrawdown = StrategyRegistry.resolve(StrategyModelId.FLOW_PULSE_CONTINUATION).evaluate(
-            snapPulse,
-            OpenPositionContext(
-                hasOpenPosition = true,
-                sideIsBuy = true,
-                tranchesCount = 1,
-                maxTranches = 3,
-                drawdownFromLastTranchePct = 0.12,
-                effectiveStepPct = 0.28
-            )
-        )
-        assertTrue(blockedDrawdown is StrategyDecision.Hold)
-
-        val blockedWaterfall = StrategyRegistry.resolve(StrategyModelId.FLOW_PULSE_CONTINUATION).evaluate(
-            snapPulse.copy(longLiqUsd15s = 25_000.0, deltaPct = -30.0),
-            OpenPositionContext(
-                hasOpenPosition = true,
-                sideIsBuy = true,
-                tranchesCount = 1,
-                maxTranches = 3,
-                drawdownFromLastTranchePct = 0.40,
-                effectiveStepPct = 0.28
-            )
-        )
-        assertTrue(blockedWaterfall is StrategyDecision.Hold)
-
-        val allowedScaleIn = StrategyRegistry.resolve(StrategyModelId.FLOW_PULSE_CONTINUATION).evaluate(
-            snapPulse,
-            OpenPositionContext(
-                hasOpenPosition = true,
-                sideIsBuy = true,
-                tranchesCount = 1,
-                maxTranches = 3,
-                drawdownFromLastTranchePct = 0.35,
-                effectiveStepPct = 0.28
-            )
-        )
-        assertTrue(allowedScaleIn is StrategyDecision.ScaleIn)
-
-        // Squeeze model catches short liquidation cascade
-        val snapSqueeze = snapPulse.copy(shortLiqUsd15s = 15_000.0, longLiqUsd15s = 500.0, deltaPct = 20.0)
-        val enterSqueeze = StrategyRegistry.resolve(StrategyModelId.SQUEEZE_LIQUIDATION_HUNTER)
-            .evaluate(snapSqueeze, OpenPositionContext(hasOpenPosition = false))
-        assertTrue(enterSqueeze is StrategyDecision.Enter)
-        assertTrue((enterSqueeze as StrategyDecision.Enter).sideIsBuy)
-
-        // Sniper rejects outside Proximity Gate and enters PostOnly Maker at resistance wall
-        val snapFar = snapPulse.copy(levelDistancePct = 0.65, absorptionDetected = false, replenishmentRate = 0.50, progressEfficiency = 0.10)
-        assertTrue(
-            StrategyRegistry.resolve(StrategyModelId.WALL_ABSORPTION_SNIPER)
-                .evaluate(snapFar, OpenPositionContext(hasOpenPosition = false)) is StrategyDecision.Hold
-        )
-        val snapWall = snapFar.copy(
-            levelDistancePct = 0.05,
-            absorptionSideName = "SELLER_ABSORPTION",
-            absorptionDetected = true
-        )
-        val sniperEnter = StrategyRegistry.resolve(StrategyModelId.WALL_ABSORPTION_SNIPER)
-            .evaluate(snapWall, OpenPositionContext(hasOpenPosition = false))
-        assertTrue(sniperEnter is StrategyDecision.Enter)
-        assertFalse((sniperEnter as StrategyDecision.Enter).sideIsBuy)
-        assertEquals(OrderExecutionPreference.MAKER_POST_ONLY, sniperEnter.orderPreference)
+    fun `manual thresholds respect spread freshness and anti knife scale gates`() {
+        val snap = MarketContextSnapshot(symbol = "BTCUSDT", price = 65000.0, nowMs = 1700000000000L,
+            dataFreshnessLive = true, conflictDetected = false, deltaPct = 22.0, normalizedOfi = .24)
+        val cfg = BotConfig()
+        assertTrue(BotDecisionEngine.evaluate(snap, OpenPositionContext(), cfg) is StrategyDecision.Enter)
+        assertTrue(BotDecisionEngine.evaluate(snap.copy(dataFreshnessLive = false), OpenPositionContext(), cfg) is StrategyDecision.Hold)
+        assertTrue(BotDecisionEngine.evaluate(snap.copy(spreadPct = 2.0), OpenPositionContext(), cfg) is StrategyDecision.Hold)
+        val pos = OpenPositionContext(hasOpenPosition = true, sideIsBuy = true, tranchesCount = 1,
+            maxTranches = 3, drawdownFromLastTranchePct = .12, effectiveStepPct = .28)
+        assertTrue(BotDecisionEngine.evaluate(snap, pos, cfg) is StrategyDecision.Hold)
+        assertTrue(BotDecisionEngine.evaluate(snap, pos.copy(drawdownFromLastTranchePct = .35), cfg) is StrategyDecision.ScaleIn)
+        assertTrue(BotDecisionEngine.evaluate(snap.copy(longLiqUsd15s = 25000.0), pos.copy(drawdownFromLastTranchePct = .35), cfg) is StrategyDecision.Hold)
+        assertTrue(BotDecisionEngine.evaluate(snap, OpenPositionContext(), cfg.copy(enacoreBridge = true)) is StrategyDecision.Hold)
     }
 
     @Test

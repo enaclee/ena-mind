@@ -73,6 +73,9 @@ jobs:
           gradle-version: '9.3.1'
           cache-provider: 'basic'
 
+      - name: Run ENACORE deterministic regressions
+        run: python3 -m unittest discover -s app/src/test/python -v
+
       - name: Run Python skill tests
         run: python3 ena-mind/tests/run_tests.py
 

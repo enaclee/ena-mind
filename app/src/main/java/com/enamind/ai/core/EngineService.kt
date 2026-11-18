@@ -46,6 +46,8 @@ class EngineService : Service() {
         return START_STICKY
     }
 
+    override fun onTimeout(startId: Int, fgsType: Int) { stopSelf() }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createChannel() {

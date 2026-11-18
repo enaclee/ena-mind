@@ -474,7 +474,7 @@ object ScenarioAnalyzer {
         }
 
         val conflict = detectConflict(fp, dom, quantAdx, quantEfficiencyRatio, candleChangePct)
-        if (conflict.hardConflict) {
+        if (conflict.hardConflict && (abs(fp.deltaPct) >= 30.0 && abs(dom.normalizedOfi) >= 0.55 || dom.churnInflationRatio >= 30.0)) {
             return GlowSignal(
                 colorState = GlowColorState.NEUTRAL,
                 strength = 0.10f,
@@ -523,7 +523,7 @@ object ScenarioAnalyzer {
 
         val netVotes = bullVotes - bearVotes
         val dominantVotes = maxOf(bullVotes, bearVotes)
-        val hasVoteConflict = bullVotes >= 2 && bearVotes >= 2
+        val hasVoteConflict = bullVotes >= 2 && bearVotes >= 2 && abs(netVotes) < 2
 
         val color = when {
             hasVoteConflict -> GlowColorState.NEUTRAL
@@ -538,12 +538,13 @@ object ScenarioAnalyzer {
                 (color == GlowColorState.RED && absM.side == AbsorptionSide.BUYER_ABSORPTION)
             )
 
-        val finalColor = if (dampedByAbsorption) GlowColorState.NEUTRAL else color
+        val finalColor = color
         var rawStrength = if (finalColor == GlowColorState.NEUTRAL) {
             0.12f
         } else {
             ((abs(netVotes) / 4.5) * 0.55 + (intensitySum / maxOf(1, dominantVotes)) * 0.45).toFloat().coerceIn(0.22f, 1.0f)
         }
+        if (dampedByAbsorption) rawStrength *= 0.65f
         // При высоком HFT-раздувании снижаем интенсивность свечения
         if (dom.churnInflationRatio >= 15.0 && finalColor != GlowColorState.NEUTRAL) {
             rawStrength = (rawStrength * 0.72f).coerceAtLeast(0.22f)

@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicLong
  * Binance (data-api.binance.vision) и OKX (www.okx.com), когда Bybit недоступен
  * (региональная блокировка, таймаут, WAF). Все эндпоинты публичные, без ключей.
  */
-class BybitRest(private val baseUrl: String) {
+class BybitRest(private val baseUrl: String, private val category: String = "linear") {
 
     data class KlinesResult(
         val rows: List<List<Double>>,
@@ -69,16 +69,16 @@ class BybitRest(private val baseUrl: String) {
         }
     }
 
-    /** GET /v5/market/tickers?category=linear — цена/funding/OI/24ч одним вызовом. */
+    /** GET /v5/market/tickers?category=$category — цена/funding/OI/24ч одним вызовом. */
     fun tickers(symbol: String, onDone: (JSONObject?) -> Unit) {
-        get("/v5/market/tickers?category=linear&symbol=$symbol") { body ->
+        get("/v5/market/tickers?category=$category&symbol=$symbol") { body ->
             onDone(body?.optJSONObject("result")?.optJSONArray("list")?.optJSONObject(0))
         }
     }
 
     /** GET /v5/market/kline — свечи [[tsMs,o,h,l,c,v,turnover],...] новые сверху. */
     fun klines(symbol: String, interval: String, limit: Int, onDone: (JSONArray?) -> Unit) {
-        get("/v5/market/kline?category=linear&symbol=$symbol&interval=$interval&limit=$limit") { body ->
+        get("/v5/market/kline?category=$category&symbol=$symbol&interval=$interval&limit=$limit") { body ->
             onDone(body?.optJSONObject("result")?.optJSONArray("list"))
         }
     }
@@ -114,9 +114,9 @@ class BybitRest(private val baseUrl: String) {
         var lastErr: String? = null
         if (!isBybitInCooldown()) {
             val bybitUrls = buildList {
-                add(baseUrl.trimEnd('/') + "/v5/market/kline?category=linear&symbol=$symbol&interval=$interval&limit=$limit")
+                add(baseUrl.trimEnd('/') + "/v5/market/kline?category=$category&symbol=$symbol&interval=$interval&limit=$limit")
                 if (baseUrl.contains("api.bybit.com")) {
-                    add("https://api.bytick.com/v5/market/kline?category=linear&symbol=$symbol&interval=$interval&limit=$limit")
+                    add("https://api.bytick.com/v5/market/kline?category=$category&symbol=$symbol&interval=$interval&limit=$limit")
                 }
             }
             for ((idx, url) in bybitUrls.withIndex()) {
@@ -135,6 +135,8 @@ class BybitRest(private val baseUrl: String) {
             }
             markBybitDown()
         }
+
+        if (category == "inverse") return KlinesResult(emptyList(), "bybit", lastErr ?: "Inverse candles unavailable")
 
         // Fallback 1: Binance Vision + публичные зеркала api1/api3
         val bnIv = toBinanceInterval(interval)
@@ -400,49 +402,49 @@ class BybitRest(private val baseUrl: String) {
 
     /** GET /v5/market/orderbook — стакан: result.b / result.a = [[price, qty]...]. */
     fun orderbook(symbol: String, limit: Int, onDone: (JSONObject?) -> Unit) {
-        get("/v5/market/orderbook?category=linear&symbol=$symbol&limit=$limit") { body ->
+        get("/v5/market/orderbook?category=$category&symbol=$symbol&limit=$limit") { body ->
             onDone(body?.optJSONObject("result"))
         }
     }
 
     /** GET /v5/market/recent-trade — лента сделок (price/size/side/time). */
     fun recentTrades(symbol: String, limit: Int, onDone: (JSONArray?) -> Unit) {
-        get("/v5/market/recent-trade?category=linear&symbol=$symbol&limit=$limit") { body ->
+        get("/v5/market/recent-trade?category=$category&symbol=$symbol&limit=$limit") { body ->
             onDone(body?.optJSONObject("result")?.optJSONArray("list"))
         }
     }
 
     /** GET /v5/market/account-ratio — LSR: buyRatio/sellRatio, новые сверху. */
     fun accountRatio(symbol: String, limit: Int = 8, onDone: (JSONArray?) -> Unit) {
-        get("/v5/market/account-ratio?category=linear&symbol=$symbol&period=1h&limit=$limit") { body ->
+        get("/v5/market/account-ratio?category=$category&symbol=$symbol&period=1h&limit=$limit") { body ->
             onDone(body?.optJSONObject("result")?.optJSONArray("list"))
         }
     }
 
     /** GET /v5/market/open-interest — история OI. */
     fun openInterest(symbol: String, limit: Int, onDone: (JSONArray?) -> Unit) {
-        get("/v5/market/open-interest?category=linear&symbol=$symbol&intervalTime=1h&limit=$limit") { body ->
+        get("/v5/market/open-interest?category=$category&symbol=$symbol&intervalTime=1h&limit=$limit") { body ->
             onDone(body?.optJSONObject("result")?.optJSONArray("list"))
         }
     }
 
     /** GET /v5/market/funding/history — история funding. */
     fun fundingHistory(symbol: String, limit: Int, onDone: (JSONArray?) -> Unit) {
-        get("/v5/market/funding/history?category=linear&symbol=$symbol&limit=$limit") { body ->
+        get("/v5/market/funding/history?category=$category&symbol=$symbol&limit=$limit") { body ->
             onDone(body?.optJSONObject("result")?.optJSONArray("list"))
         }
     }
 
     /** GET /v5/market/instruments-info — спецификации контракта. */
     fun instrumentsInfo(symbol: String, onDone: (JSONObject?) -> Unit) {
-        get("/v5/market/instruments-info?category=linear&symbol=$symbol") { body ->
+        get("/v5/market/instruments-info?category=$category&symbol=$symbol") { body ->
             onDone(body?.optJSONObject("result")?.optJSONArray("list")?.optJSONObject(0))
         }
     }
 
     /** GET /v5/market/risk-limit — лимиты риска. */
     fun riskLimit(symbol: String, onDone: (JSONObject?) -> Unit) {
-        get("/v5/market/risk-limit?category=linear&symbol=$symbol") { body ->
+        get("/v5/market/risk-limit?category=$category&symbol=$symbol") { body ->
             val list = body?.optJSONObject("result")?.optJSONArray("list")
             onDone(
                 if (list == null || list.length() == 0) null
