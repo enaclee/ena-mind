@@ -181,7 +181,7 @@ private fun MainScaffold(state: AppState, toast: String?, onThemeChange: (Settin
     }
     if (picker) ContractPickerDialog(state, instrument.symbol, {}, { picker = false })
     Box(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize().imePadding()) {
+        Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding()) {
             if (!ime) Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("ENΛVERSE", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)

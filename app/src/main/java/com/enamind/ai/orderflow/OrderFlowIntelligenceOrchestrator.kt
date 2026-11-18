@@ -35,7 +35,14 @@ class OrderFlowIntelligenceOrchestrator(
     private var stableGlowColor: GlowColorState = GlowColorState.NEUTRAL
     private var neutralSinceMs = 0L
 
-    fun resetForInstrument(symbol: String) {
+    @Volatile private var generation = 0L
+
+    @Synchronized
+    fun resetForInstrument(symbol: String, newGeneration: Long = generation + 1) {
+        generation = newGeneration
+        neutralSinceMs = 0L
+        pendingGlowSinceMs = 0L
+        pendingGlowColor = GlowColorState.NEUTRAL
         streamHub.clearSymbol(symbol)
         confirmedMarkersHistory.clear()
         lastGlowSymbol = ""
@@ -43,6 +50,7 @@ class OrderFlowIntelligenceOrchestrator(
         _report.value = OrderFlowReport(symbol = symbol)
     }
 
+    @Synchronized
     fun evaluate(
         symbol: String,
         interval: String,
@@ -53,8 +61,10 @@ class OrderFlowIntelligenceOrchestrator(
         quantAdx: Double? = null,
         quantEr: Double? = null,
         signalConfirmMs: Long = DEFAULT_GLOW_CONFIRM_MS,
-        venueSyncWarning: String? = null
+        venueSyncWarning: String? = null,
+        expectedGeneration: Long = generation
     ): OrderFlowReport {
+        if (expectedGeneration != generation) return _report.value
         if (lastGlowSymbol != symbol) {
             lastGlowSymbol = symbol
             pendingGlowColor = GlowColorState.NEUTRAL

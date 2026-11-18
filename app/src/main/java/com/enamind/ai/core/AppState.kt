@@ -519,6 +519,7 @@ class AppState(
         activeRest = BybitRest(settings.bybitBaseUrl, selected.category)
         ws?.close()
         tape.clear()
+        anchorsCollector.reset()
         enacore.reset(selected)
         _klines.value = emptyList()
         _lastBar.value = null

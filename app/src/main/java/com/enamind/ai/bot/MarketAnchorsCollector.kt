@@ -98,6 +98,12 @@ class MarketAnchorsCollector(
     private val liqBySymbol = HashMap<String, ArrayDeque<LiqPoint>>()
     private val restCacheBySymbol = ConcurrentHashMap<String, SymbolRestCache>()
 
+    fun reset() = synchronized(lock) {
+        perpTradesBySymbol.clear()
+        liqBySymbol.clear()
+        restCacheBySymbol.clear()
+    }
+
     fun recordPerpTrade(symbol: String, price: Double, qty: Double, isBuy: Boolean, tsMs: Long) {
         if (!price.isFinite() || !qty.isFinite() || price <= 0.0 || qty <= 0.0) return
         val sym = symbol.uppercase(Locale.ROOT)

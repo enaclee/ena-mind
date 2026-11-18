@@ -255,7 +255,7 @@ private fun BotHeaderControlCard(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Text(
-            "Стратегия: ${cfg.strategyModel.labelRu} · Статус: ${uiState.statusText}",
+            "Стратегия: ${if (cfg.enacoreBridge) "ENΛCORE" else "Ручной режим"} · Статус: ${uiState.statusText}",
             fontSize = 11.sp,
             fontFamily = FontFamily.Monospace,
             color = MaterialTheme.colorScheme.onSurface

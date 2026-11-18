@@ -260,6 +260,10 @@ class TradeBotEngine(
         val st = _uiState.value
         val cfg = st.config
         if (st.running) return
+        if (cfg.instrumentCategory == "inverse") {
+            _uiState.value = st.copy(lastError = "Инверсные контракты доступны для анализа. Бот использует линейную модель расчёта объёма и PnL.")
+            return
+        }
         if (cfg.mode.isLiveExchange && (cfg.instrumentCategory != "linear" || cfg.instrumentVenue != "Bybit")) {
             _uiState.value = st.copy(lastError = "Исполнение на бирже доступно для Bybit Linear. Для выбранного рынка используйте Paper.")
             return
@@ -328,9 +332,16 @@ class TradeBotEngine(
                 val p = probe.data
                 val effCap = computeEffectiveCapital(cfg.capitalUsdt, p.walletUsdt)
                 val sideFee = if (cfg.executionPreference == OrderExecutionPreference.MAKER_POST_ONLY) p.makerFeePct else p.takerFeePct
-                val existingPos = withContext(Dispatchers.IO) {
+                val existingResult = withContext(Dispatchers.IO) {
                     client.fetchOpenPosition(cfg.mode, slot, cfg.symbol)
-                }.data
+                }
+                if (!existingResult.ok) {
+                    _uiState.value = _uiState.value.copy(running = false, exchangeConnected = false,
+                        lastError = "Не удалось проверить открытую позицию: ${existingResult.message}")
+                    onServiceStateChanged(false)
+                    return@launch
+                }
+                val existingPos = existingResult.data
                 if (existingPos != null && existingPos.size > 0.0 && existingPos.side != null) {
                     val adopted = buildInitialPosition(
                         id = "adopted_${cfg.symbol}_${System.currentTimeMillis()}",
@@ -436,9 +447,9 @@ class TradeBotEngine(
             _uiState.value = _uiState.value.copy(
                 running = false,
                 closing = false,
-                statusText = reason,
-                waitReasonBadge = "Остановлен",
-                chartOverlay = buildChartOverlay(_uiState.value.config.symbol, null, _uiState.value.recentTrades)
+                statusText = if (_uiState.value.activePosition == null) reason else "Бот остановлен; закрытие позиции ещё не подтверждено биржей",
+                waitReasonBadge = if (_uiState.value.activePosition == null) "Остановлен" else "Проверьте позицию на бирже",
+                chartOverlay = buildChartOverlay(_uiState.value.config.symbol, _uiState.value.activePosition, _uiState.value.recentTrades)
             )
             onServiceStateChanged(false)
         }
@@ -702,9 +713,16 @@ class TradeBotEngine(
         if (cfg.mode.isLiveExchange && (nowMs - lastExchangeSyncMs) >= 10_000L) {
             lastExchangeSyncMs = nowMs
             val slot = vaultStore.loadCredentialSlot(cfg.mode)
-            val liveExPos = withContext(Dispatchers.IO) {
+            val positionResult = withContext(Dispatchers.IO) {
                 client.fetchOpenPosition(cfg.mode, slot, active.symbol)
-            }.data
+            }
+            if (!positionResult.ok) {
+                _uiState.value = _uiState.value.copy(activePosition = currentPos,
+                    lastError = "Не удалось синхронизировать позицию: ${positionResult.message}",
+                    waitReasonBadge = "Ожидание подтверждения биржи")
+                return
+            }
+            val liveExPos = positionResult.data
             if (liveExPos == null || liveExPos.size <= 0.0) {
                 finalizeTradeRecord(currentPos, livePrice, "Исполнено/закрыто на бирже Bybit")
                 return
@@ -1270,10 +1288,16 @@ class TradeBotEngine(
                     stopLossFormatted = null
                 )
             }
-            if (!res.ok && !forceMarket) {
+            if (!res.ok) {
                 _uiState.value = _uiState.value.copy(
                     lastError = "Ошибка закрытия на бирже: ${res.message}"
                 )
+                return
+            }
+            val confirmedClose = withContext(Dispatchers.IO) { client.fetchOpenPosition(pos.mode, slot, pos.symbol) }
+            if (!confirmedClose.ok || (confirmedClose.data?.size ?: 0.0) > 0.0) {
+                _uiState.value = _uiState.value.copy(lastError = "Запрос закрытия отправлен; ожидается подтверждение биржи",
+                    activePosition = pos)
                 return
             }
             val bal = withContext(Dispatchers.IO) {

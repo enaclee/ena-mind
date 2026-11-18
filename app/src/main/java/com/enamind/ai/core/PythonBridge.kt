@@ -131,9 +131,9 @@ object PythonBridge {
     // ================= NEURAL FORECAST ENGINE =================
 
     /** Полный прогон движка по живому срезу (каждые ~5с из NeuralEngine). */
-    fun engineFeed(symbol: String, fastJson: String): String = try {
+    fun engineFeed(symbol: String, fastJson: String, generation: Long = -1): String = try {
         Python.getInstance().getModule("chain_bridge")
-            .callAttr("engine_feed", symbol, fastJson).toString()
+            .callAttr("engine_feed", symbol, fastJson, generation).toString()
     } catch (e: PyException) {
         JSONObject().put("ok", false).put("error", "python: ${e.message}").toString()
     } catch (e: Exception) {
@@ -141,10 +141,10 @@ object PythonBridge {
     }
 
     /** Тяжёлый канал: свечи по таймфрейму в движок. */
-    fun engineSetKlines(symbol: String, tf: String, rowsJson: String): JSONObject = try {
+    fun engineSetKlines(symbol: String, tf: String, rowsJson: String, generation: Long = -1): JSONObject = try {
         JSONObject(
             Python.getInstance().getModule("chain_bridge")
-                .callAttr("engine_set_klines", symbol, tf, rowsJson).toString()
+                .callAttr("engine_set_klines", symbol, tf, rowsJson, generation).toString()
         )
     } catch (e: PyException) {
         err("python: ${e.message}")
