@@ -36,6 +36,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.flow.first
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -374,7 +376,9 @@ class TradeBotUnitTests {
             engine.startBot()
             assertTrue(engine.uiState.value.running)
             engine.stopAndCloseMarket("Тестовая остановка")
-            delay(250L)
+            withTimeout(5000L) {
+                engine.uiState.first { !it.running && !it.closing && it.statusText == "Тестовая остановка" }
+            }
             assertFalse(engine.uiState.value.running)
             assertFalse(engine.uiState.value.closing)
             assertNull(engine.uiState.value.activePosition)

@@ -16,6 +16,7 @@ import com.enamind.ai.orderflow.GlowColorState
 import com.enamind.ai.orderflow.LevelAttackPhase
 import com.enamind.ai.orderflow.MarketDominance
 import com.enamind.ai.orderflow.OrderFlowReport
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -107,6 +108,7 @@ class TradeBotEngine(
     )
     val uiState: StateFlow<BotUiState> = _uiState
 
+    private var startupJob: Job? = null
     private var loopJob: Job? = null
     private var privateWs: BybitV5TradingClient.PrivateWsHandle? = null
 
@@ -263,7 +265,7 @@ class TradeBotEngine(
     fun startBot(mainnetExplicitConfirmed: Boolean = false) {
         val st = _uiState.value
         val cfg = st.config
-        if (st.running) return
+        if (st.running || st.closing) return
         if (instrumentProvider().quoteCoin != "USDT") {
             _uiState.value = st.copy(lastError = "Бот ведёт баланс и PnL в USDT. Выбранная котируемая валюта доступна для анализа.")
             return
@@ -306,7 +308,8 @@ class TradeBotEngine(
         )
         onServiceStateChanged(true)
 
-        scope.launch {
+        startupJob = scope.launch {
+            tradeMutex.withLock {
             if (cfg.mode.isLiveExchange) {
                 val slot = vaultStore.loadCredentialSlot(cfg.mode)
                 val probe = withContext(Dispatchers.IO) {
@@ -411,14 +414,19 @@ class TradeBotEngine(
                 )
             }
 
+            kotlin.coroutines.coroutineContext.ensureActive()
+            if (!_uiState.value.running) return@withLock
             loopJob?.cancel()
             loopJob = scope.launch {
                 runBotLoop()
+            }
             }
         }
     }
 
     fun stopBotOnly(reason: String = "Остановлен пользователем") {
+        startupJob?.cancel()
+        startupJob = null
         loopJob?.cancel()
         loopJob = null
         privateWs?.close()
@@ -434,6 +442,9 @@ class TradeBotEngine(
     }
 
     fun stopAndCloseMarket(reason: String = "Аварийная остановка и закрытие по рынку") {
+        startupJob?.cancel()
+        startupJob = null
+        _uiState.value = _uiState.value.copy(running = false, closing = true)
         loopJob?.cancel()
         loopJob = null
         pendingSignalSide = null
