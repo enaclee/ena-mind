@@ -386,9 +386,11 @@ class NeuralEngine(
             val r1 = rest.klinesUnifiedSync(sym, "1", 1000)
             requireCurrent(instrument)
             if (r1.rows.isNotEmpty()) {
-                klinesCache["$sym:1"] = r1.rows
-                klinesCacheTs["$sym:1"] = System.currentTimeMillis()
-                _klineSource.value = r1.source
+                publish(instrument) {
+                    klinesCache["$sym:1"] = r1.rows
+                    klinesCacheTs["$sym:1"] = System.currentTimeMillis()
+                    _klineSource.value = r1.source
+                }
             }
             val otherTfs = coroutineScope {
                 listOf("3", "5", "15", "60").map { tf ->
@@ -403,9 +405,11 @@ class NeuralEngine(
             for ((tf, res) in otherTfs) {
                 if (res.rows.isEmpty()) continue
                 anyOk = true
-                klinesCache["$sym:$tf"] = res.rows
-                klinesCacheTs["$sym:$tf"] = nowTs
-                if (_klineSource.value.isBlank()) _klineSource.value = res.source
+                publish(instrument) {
+                    klinesCache["$sym:$tf"] = res.rows
+                    klinesCacheTs["$sym:$tf"] = nowTs
+                    if (_klineSource.value.isBlank()) _klineSource.value = res.source
+                }
             }
             if (PythonBridge.isReady()) {
                 syncCacheToPython(sym, instrument)

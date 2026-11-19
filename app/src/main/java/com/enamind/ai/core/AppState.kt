@@ -432,7 +432,13 @@ class AppState(
         reloadKlines()
         refreshMarketStats()
         appScope.launch { refreshNews() }
-        appScope.launch { contractCatalog.refreshSync(force = false) }
+        appScope.launch {
+            contractCatalog.refreshSync(force = false)
+            val selected = activeInstrument.value
+            contractCatalog.state.value.contracts.firstOrNull { it.key == selected.key }?.let {
+                synchronized(this@AppState) { if (activeInstrument.value.key == selected.key) selectInstrument(it) }
+            }
+        }
         appScope.launch { calendarAutoLoop() }
         appScope.launch { verifyOldForecasts() }
         appScope.launch { feedStatusLoop() }
@@ -506,7 +512,16 @@ class AppState(
 
     @Synchronized
     fun selectInstrument(info: ContractCatalogRepo.ContractInfo): Boolean {
-        if (activeInstrument.value.key == info.key) return true
+        if (activeInstrument.value.key == info.key) {
+            val refreshed = ActiveInstrument.from(info, activeInstrument.value.generation)
+            if (refreshed != activeInstrument.value) {
+                _activeInstrument.value = refreshed
+                if (!botEngine.uiState.value.running && botEngine.uiState.value.activePosition == null)
+                    botEngine.updateConfig { it.copy(instrumentCategory = refreshed.category, instrumentVenue = refreshed.venue,
+                        leverage = it.leverage.coerceAtMost(refreshed.maxLeverage.toInt().coerceAtLeast(1))) }
+            }
+            return true
+        }
         val bot = botEngine.uiState.value
         if (bot.running || bot.activePosition != null) {
             toast("Остановите бота и завершите позицию перед сменой инструмента")
@@ -580,6 +595,7 @@ class AppState(
         val generation = instrument.generation
         ws = BybitWs(sym, object : BybitWs.Listener {
             override fun onTicker(t: BybitWs.Ticker) {
+                synchronized(this@AppState) {
                 if (activeInstrument.value.generation != generation) return
                 if (t.last.isFinite() && t.last > 0) lastBybitTickerMs.set(System.currentTimeMillis())
                 anchorsCollector.recordTicker(sym, t.last, t.openInterest, t.fundingRate)
@@ -592,9 +608,11 @@ class AppState(
                     openInterest = t.openInterest.takeIf { it.isFinite() && it > 0 } ?: _market.value.openInterest,
                     feedSource = "Bybit"
                 )
+                }
             }
 
             override fun onTrade(tr: BybitWs.Trade) {
+                synchronized(this@AppState) {
                 if (activeInstrument.value.generation != generation) return
                 lastBybitTradeMs.set(System.currentTimeMillis())
                 coreTradeEventMs.set(tr.tsMs - engine.clockSync.status().offsetMs)
@@ -617,9 +635,11 @@ class AppState(
                     venue = "Bybit"
                 )
                 _market.value = _market.value.copy(tape = tape.stats())
+                }
             }
 
             override fun onBook(bids: List<BybitWs.BookLevel>, asks: List<BybitWs.BookLevel>) {
+                synchronized(this@AppState) {
                 if (activeInstrument.value.generation != generation) return
                 lastBybitBookMs.set(System.currentTimeMillis())
                 orderFlow.streamHub.recordBookSnapshot(
@@ -632,17 +652,21 @@ class AppState(
                 )
                 _market.value = _market.value.copy(bids = bids.take(12).map { it.copy(qty = instrument.baseQuantity(it.price, it.qty)) },
                     asks = asks.take(12).map { it.copy(qty = instrument.baseQuantity(it.price, it.qty)) })
+                }
             }
 
             override fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {
+                synchronized(this@AppState) {
                 if (activeInstrument.value.generation != generation) return
                 if (synced) coreBookEventMs.set(System.currentTimeMillis() - lagMs) else coreBookEventMs.set(0L)
                 orderFlow.streamHub.recordDomDeltas(sym, deltas.map { it.copy(
                     prevQty = instrument.baseQuantity(it.price, it.prevQty), newQty = instrument.baseQuantity(it.price, it.newQty),
                     deltaQty = instrument.baseQuantity(it.price, it.deltaQty)) }, synced, lagMs, "Bybit")
+                }
             }
 
             override fun onLiquidation(l: BybitWs.Liquidation) {
+                synchronized(this@AppState) {
                 if (activeInstrument.value.generation != generation) return
                 val baseSize = instrument.baseQuantity(l.price, l.size)
                 liq.add(l.copy(size = baseSize))
@@ -652,19 +676,25 @@ class AppState(
                     liq1hUsd = s.optDouble("sum_usd_1h").takeIf { it.isFinite() },
                     liq24hUsd = s.optDouble("sum_usd_24h").takeIf { it.isFinite() }
                 )
+                }
             }
 
             override fun onMinuteKline(bar: BybitWs.Kline) {
+                synchronized(this@AppState) {
                 enacore.onMinuteBar(generation, bar)
+                }
             }
 
             override fun onKline(bar: BybitWs.Kline) {
+                synchronized(this@AppState) {
                 if (activeInstrument.value.generation != generation) return
                 lastBybitKlineMs.set(System.currentTimeMillis())
                 applyLiveBar(bar)
+                }
             }
 
             override fun onStatus(connected: Boolean, note: String) {
+                synchronized(this@AppState) {
                 if (activeInstrument.value.generation != generation) return
                 val cur = _market.value
                 val resolvedNote = if (connected && !isBybitFresh(lastBybitTickerMs.get(), 10_000L) &&
@@ -675,9 +705,11 @@ class AppState(
                     note
                 }
                 _market.value = cur.copy(wsConnected = connected, wsNote = resolvedNote)
+                }
             }
 
             override fun onBookDesync(reason: String) {
+                synchronized(this@AppState) {
                 if (activeInstrument.value.generation != generation) return
                 if (!engine.binanceConnected) {
                     if (reason.startsWith("WS_STALE", ignoreCase = true)) {
@@ -690,9 +722,11 @@ class AppState(
                         wsNote = "стакан: $reason"
                     )
                 }
+                }
             }
 
             override fun onReconnected() {
+                synchronized(this@AppState) {
                 if (activeInstrument.value.generation != generation) return
                 appScope.launch(Dispatchers.IO) {
                     runCatching {
@@ -703,6 +737,7 @@ class AppState(
                             bybitBaseUrl = settings.bybitBaseUrl
                         )
                     }
+                }
                 }
             }
         }, category = instrument.category, klineInterval = iv, clockOffsetMsProvider = { engine.clockSync.status().offsetMs }).also { it.connect() }

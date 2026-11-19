@@ -177,7 +177,16 @@ fun EnaMindTheme(theme: Settings.Theme, accent: Int = 0xFF8AB4F8.toInt(), rgbDar
         Settings.Theme.RGB -> rgbDark
     }
     val base = if (dark) DarkScheme else LightScheme
-    val selected = Color(accent)
+    val requested = Color(accent)
+    var selected = requested
+    fun contrast(a: Color, b: Color): Float {
+        val x = a.luminance(); val y = b.luminance()
+        return (maxOf(x, y) + .05f) / (minOf(x, y) + .05f)
+    }
+    for (step in 0..20) {
+        selected = lerp(requested, if (dark) Color.White else Color.Black, step / 20f)
+        if (contrast(selected, base.surface) >= 4.5f) break
+    }
     val container = lerp(base.surface, selected, if (dark) .28f else .15f)
     val scheme = if (theme == Settings.Theme.RGB) base.copy(
         primary = selected, onPrimary = if (selected.luminance() > .179f) Color.Black else Color.White,

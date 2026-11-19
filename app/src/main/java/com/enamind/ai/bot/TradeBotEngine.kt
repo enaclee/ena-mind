@@ -137,7 +137,11 @@ class TradeBotEngine(
     fun updateConfig(transform: (BotConfig) -> BotConfig) {
         val prev = _uiState.value.config
         val raw = transform(prev)
-        if (_uiState.value.activePosition != null && (raw.symbol != prev.symbol || raw.instrumentCategory != prev.instrumentCategory || raw.mode != prev.mode || raw.enacoreBridge != prev.enacoreBridge)) return
+        if ((_uiState.value.running || _uiState.value.activePosition != null) &&
+            (raw.symbol != prev.symbol || raw.instrumentCategory != prev.instrumentCategory || raw.mode != prev.mode || raw.enacoreBridge != prev.enacoreBridge)) {
+            _uiState.value = _uiState.value.copy(lastError = "Остановите бота и завершите позицию перед сменой режима")
+            return
+        }
         val cleanSymbol = raw.symbol.trim().uppercase().ifBlank { "BTCUSDT" }
         val contract = contractCatalog.findContract(cleanSymbol, raw.instrumentCategory)
         val maxLev = if (raw.instrumentCategory == "spot") 1 else (contract?.maxLeverage?.toInt() ?: 1).coerceIn(1, 125)
@@ -260,6 +264,10 @@ class TradeBotEngine(
         val st = _uiState.value
         val cfg = st.config
         if (st.running) return
+        if (instrumentProvider().quoteCoin != "USDT") {
+            _uiState.value = st.copy(lastError = "Бот ведёт баланс и PnL в USDT. Выбранная котируемая валюта доступна для анализа.")
+            return
+        }
         if (cfg.instrumentCategory == "inverse") {
             _uiState.value = st.copy(lastError = "Инверсные контракты доступны для анализа. Бот использует линейную модель расчёта объёма и PnL.")
             return

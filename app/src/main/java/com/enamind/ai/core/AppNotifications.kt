@@ -26,7 +26,7 @@ class AppNotifications(private val ctx: Context, private val app: AppState) {
         if (!app.settings.notificationEnabled(kind)) return
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
         val now = System.currentTimeMillis()
-        if (now - (last[kind] ?: 0) < 10000) return
+        if (!kind.startsWith("bot_") && now - (last[kind] ?: 0) < 10000) return
         last[kind] = now
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26) nm.createNotificationChannel(NotificationChannel("enaverse_$kind", CHANNELS[kind] ?: kind, NotificationManager.IMPORTANCE_DEFAULT))
@@ -40,6 +40,8 @@ class AppNotifications(private val ctx: Context, private val app: AppState) {
         if (!started.compareAndSet(false, true)) return
         app.appScope.launch {
             var key = ""; var reference = 0.0; var absorption = false; var awo = ""; var stale = false
+            var previousBotError: String? = null
+            var lastClosedTrade: String? = null
             while (isActive) {
                 val instrument = app.activeInstrument.value
                 val market = app.market.value; val flow = app.orderFlow.report.value; val core = app.enacore.state.value
@@ -58,6 +60,16 @@ class AppNotifications(private val ctx: Context, private val app: AppState) {
                 val nowStale = flow.freshness == DataFreshness.STALE || flow.freshness == DataFreshness.DESYNC
                 if (nowStale && !stale) post("network", "${instrument.symbol} · потеря свежести", flow.freshnessWarning ?: "Проверьте сеть")
                 stale = nowStale
+                val bot = app.botEngine.uiState.value
+                if (!bot.lastError.isNullOrBlank() && bot.lastError != previousBotError)
+                    post("bot_stop", "Бот · ошибка", bot.lastError!!)
+                previousBotError = bot.lastError
+                bot.recentTrades.lastOrNull()?.let { trade ->
+                    if (lastClosedTrade != null && trade.id != lastClosedTrade &&
+                        (trade.exitReason.contains("стоп", true) || trade.exitReason.contains("SL", true) || trade.exitReason.contains("трал", true)))
+                        post("bot_stop", "${trade.symbol} · защитный выход", trade.exitReason)
+                    lastClosedTrade = trade.id
+                }
                 delay(1000)
             }
         }
