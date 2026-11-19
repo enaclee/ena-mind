@@ -5,37 +5,6 @@ package com.enamind.ai.bot.strategy
  * Полностью отвязаны от Android Context, Jetpack Compose и сетевого клиента Bybit.
  */
 
-enum class StrategyModelId(
-    val id: String,
-    val labelRu: String,
-    val shortLabel: String,
-    val descriptionRu: String
-) {
-    FLOW_PULSE_CONTINUATION(
-        id = "flow_pulse_continuation",
-        labelRu = "Flow Pulse Scalp",
-        shortLabel = "Pulse+Транши",
-        descriptionRu = "Частый скальпинг по потоку и дрейфу + полная опора на незакрытые сделки"
-    ),
-    SQUEEZE_LIQUIDATION_HUNTER(
-        id = "squeeze_liquidation_hunter",
-        labelRu = "Squeeze & Liquidations",
-        shortLabel = "Сквиз/Ликв",
-        descriptionRu = "Пробой сброшенных спуфинг-стен и каскадов ликвидаций"
-    ),
-    WALL_ABSORPTION_SNIPER(
-        id = "wall_absorption_sniper",
-        labelRu = "Wall Absorption Sniper",
-        shortLabel = "Снайпер S/R",
-        descriptionRu = "Контр-трендовый снайпер от истинных стен S/R с Proximity Gate"
-    );
-
-    companion object {
-        fun fromId(id: String?): StrategyModelId =
-            entries.firstOrNull { it.id == id || it.name == id } ?: FLOW_PULSE_CONTINUATION
-    }
-}
-
 enum class OrderExecutionPreference(val labelRu: String) {
     MAKER_POST_ONLY("Умный Maker (PostOnly)"),
     TAKER_MARKET("Быстрый Market (Taker)");
@@ -137,7 +106,3 @@ sealed class StrategyDecision {
     data class ExitAll(val reason: String) : StrategyDecision()
 }
 
-interface StrategyBridge {
-    val id: StrategyModelId
-    fun evaluate(snapshot: MarketContextSnapshot, openPosition: OpenPositionContext): StrategyDecision
-}

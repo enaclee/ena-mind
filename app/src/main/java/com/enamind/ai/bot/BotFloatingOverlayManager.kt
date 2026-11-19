@@ -245,7 +245,13 @@ class BotFloatingOverlayManager(
     private fun bindState(st: BotUiState) {
         val stats = st.activeModeStats
         val zone = stats.glowZone
-        val glowColor = resolveHudGlowColorInt(stats)
+        val appearance = com.enamind.ai.core.Settings(ctx)
+        val dark = appearance.theme == com.enamind.ai.core.Settings.Theme.BLACK ||
+            (appearance.theme == com.enamind.ai.core.Settings.Theme.RGB && appearance.rgbDarkBase)
+        val glowColor = if (zone == HudGlowZone.NEUTRAL && appearance.theme == com.enamind.ai.core.Settings.Theme.RGB) appearance.accentColor else resolveHudGlowColorInt(stats)
+        pairTextView?.setTextColor(if (dark) 0xFFECEEF2.toInt() else 0xFF1F1F1F.toInt())
+        statusTextView?.setTextColor(if (dark) 0xFF949BA8.toInt() else 0xFF5F6368.toInt())
+        rootContainer?.setBaseDark(dark)
         val pos = st.activePosition
 
         pairTextView?.text = "${st.config.symbol} · ${st.config.mode.shortLabel}"
@@ -300,6 +306,8 @@ class BotFloatingOverlayManager(
         init {
             setWillNotDraw(false)
         }
+
+        fun setBaseDark(dark: Boolean) { bgPaint.color = if (dark) 0xEE0C0E14.toInt() else 0xF2FFFFFF.toInt(); invalidate() }
 
         fun setGlowAppearance(color: Int, isStrong: Boolean) {
             glowColor = color

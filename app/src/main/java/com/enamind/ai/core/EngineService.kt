@@ -46,6 +46,8 @@ class EngineService : Service() {
         return START_STICKY
     }
 
+    override fun onTimeout(startId: Int, fgsType: Int) { stopSelf() }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createChannel() {
@@ -54,10 +56,10 @@ class EngineService : Service() {
         nm.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
-                "Движок ENA",
+                "Движок ENΛVERSE",
                 NotificationManager.IMPORTANCE_LOW // без звука: постоянный статус, не спам
             ).apply {
-                description = "Постоянный статус ENA (реальное время + память 24ч)"
+                description = "Постоянный статус ENΛVERSE (реальное время + память 24ч)"
                 setShowBadge(false)
             }
         )
@@ -71,7 +73,7 @@ class EngineService : Service() {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_compass)
-            .setContentTitle("ENA · анализ активен")
+            .setContentTitle("ENΛVERSE · анализ активен")
             .setContentText("Order Flow & Absorption · 6ч/24ч аналитика")
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)

@@ -80,7 +80,7 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Изолированный свободный ИИ-чат Google AI Studio + OpenAI-совместимые провайдеры.
+ * Изолированный свободный ИИ-чат Gemini + OpenAI-совместимые провайдеры.
  *
  * НЕ имеет доступа к NeuralEngine, TrendReasoningEngine, Order Flow или ботам ENA.
  * Поддерживает чистый текстовый ввод и прикрепление фото/файлов для мультимодальных моделей.
@@ -95,7 +95,7 @@ fun AiChatScreen(
     val isOpenAi = state.settings.aiProvider == com.enamind.ai.core.Settings.PROVIDER_OPENAI_COMPAT
     val hasKey = if (isOpenAi) state.settings.aiOpenAiApiKey.isNotBlank() else state.settings.aiStudioApiKey.isNotBlank()
     val activeModel = if (isOpenAi) state.settings.aiOpenAiModel else state.settings.aiStudioModel
-    val providerTitle = if (isOpenAi) "OpenAI API" else "Google AI Studio"
+    val providerTitle = if (isOpenAi) "OpenAI API" else "Gemini"
     var inputText by remember { mutableStateOf("") }
     var attachMenuOpen by remember { mutableStateOf(false) }
     val pendingAttachments = remember { mutableStateListOf<AiStudioClient.ChatAttachment>() }
@@ -158,109 +158,8 @@ fun AiChatScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .imePadding()
             .testTag("ai_chat_screen")
     ) {
-        // Верхняя панель статуса ИИ-чата
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            shape = RoundedCornerShape(16.dp),
-            color = MaterialTheme.colorScheme.surface,
-            border = BorderStroke(0.8.dp, MaterialTheme.colorScheme.outlineVariant)
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.AutoAwesome,
-                    contentDescription = "ИИ Чат",
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(20.dp)
-                )
-                Spacer(Modifier.width(8.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "ИИ ЧАТ · $providerTitle",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        text = "$activeModel · ${if (hasKey) "ключ задан" else "ключ не задан"} · изолирован от движка",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontSize = 10.5.sp,
-                        color = if (hasKey) greenText else amberText,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                IconButton(
-                    onClick = onOpenAiSettings,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .testTag("ai_chat_settings_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Settings,
-                        contentDescription = "Настроить API для ИИ-чата",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                }
-                IconButton(
-                    onClick = { state.clearAiChat() },
-                    modifier = Modifier
-                        .size(48.dp)
-                        .testTag("ai_chat_clear")
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.DeleteOutline,
-                        contentDescription = "Очистить историю ИИ-чата",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-        }
-
-        if (!hasKey) {
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 2.dp),
-                shape = RoundedCornerShape(14.dp),
-                color = amberText.copy(alpha = 0.11f),
-                border = BorderStroke(0.8.dp, amberText.copy(alpha = 0.42f))
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = "Укажите ключ Google AI Studio или OpenAI-совместимого провайдера в Настройках → API.",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Button(
-                        onClick = onOpenAiSettings,
-                        modifier = Modifier
-                            .heightIn(min = 48.dp)
-                            .testTag("ai_chat_open_settings"),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Text("Настроить →", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-        }
-
         // Лента сообщений: weight(1f) без внешнего SelectionContainer, чтобы панель ввода никогда не выдавливалась
         LazyColumn(
             state = listState,

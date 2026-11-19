@@ -8,6 +8,8 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
@@ -75,7 +77,7 @@ private val DarkScheme = darkColorScheme(
     onError = Color(0xFF601410)
 )
 
-// Палитра в духе Google AI Studio Light — воздушный светлый фон и белые карточки с тонкими границами
+// Палитра в духе Gemini Light — воздушный светлый фон и белые карточки с тонкими границами
 private val LightScheme = lightColorScheme(
     primary = AiStudioBlueLight,
     onPrimary = Color.White,
@@ -168,13 +170,30 @@ private val AppShapes = Shapes(
 )
 
 @Composable
-fun EnaMindTheme(theme: Settings.Theme, content: @Composable () -> Unit) {
+fun EnaMindTheme(theme: Settings.Theme, accent: Int = 0xFF8AB4F8.toInt(), rgbDark: Boolean = true, content: @Composable () -> Unit) {
     val dark = when (theme) {
         Settings.Theme.BLACK -> true
         Settings.Theme.WHITE -> false
+        Settings.Theme.RGB -> rgbDark
     }
+    val base = if (dark) DarkScheme else LightScheme
+    val requested = Color(accent)
+    var selected = requested
+    fun contrast(a: Color, b: Color): Float {
+        val x = a.luminance(); val y = b.luminance()
+        return (maxOf(x, y) + .05f) / (minOf(x, y) + .05f)
+    }
+    for (step in 0..20) {
+        selected = lerp(requested, if (dark) Color.White else Color.Black, step / 20f)
+        if (contrast(selected, base.surface) >= 4.5f) break
+    }
+    val container = lerp(base.surface, selected, if (dark) .28f else .15f)
+    val scheme = if (theme == Settings.Theme.RGB) base.copy(
+        primary = selected, onPrimary = if (selected.luminance() > .179f) Color.Black else Color.White,
+        primaryContainer = container, onPrimaryContainer = if (container.luminance() > .179f) Color.Black else Color.White,
+        secondary = selected, onSecondary = if (selected.luminance() > .179f) Color.Black else Color.White) else base
     MaterialTheme(
-        colorScheme = if (dark) DarkScheme else LightScheme,
+        colorScheme = scheme,
         typography = AppTypography,
         shapes = AppShapes,
         content = content

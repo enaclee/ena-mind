@@ -155,7 +155,12 @@ class BotVaultStore private constructor(
                 hudDisplayMode = HudDisplayMode.fromName(o.optString("hudDisplayMode")),
                 timeoutBehavior = TimeoutBehavior.fromName(o.optString("timeoutBehavior")),
                 paperStartBalanceUsdt = o.optDouble("paperStartBalanceUsdt", 1000.0).coerceIn(50.0, 1_000_000.0),
-                strategyModel = com.enamind.ai.bot.strategy.StrategyModelId.fromId(o.optString("strategyModel")),
+                enacoreBridge = o.optBoolean("enacoreBridge", false),
+                instrumentCategory = o.optString("instrumentCategory", "linear").takeIf { it in setOf("linear", "spot", "inverse") } ?: "linear",
+                instrumentVenue = o.optString("instrumentVenue", "Bybit"),
+                entryDeltaPct = o.optDouble("entryDeltaPct", 14.0).coerceIn(1.0, 90.0),
+                entryOfi = o.optDouble("entryOfi", 0.16).coerceIn(0.01, 1.0),
+                maxSpreadPct = o.optDouble("maxSpreadPct", 0.15).coerceIn(0.01, 1.0),
                 executionPreference = com.enamind.ai.bot.strategy.OrderExecutionPreference.fromName(o.optString("executionPreference")),
                 makerFallbackPolicy = MakerFallbackPolicy.fromName(o.optString("makerFallbackPolicy")),
                 maxTranches = maxTr,
@@ -196,7 +201,9 @@ class BotVaultStore private constructor(
             .put("hudDisplayMode", cfg.hudDisplayMode.name)
             .put("timeoutBehavior", cfg.timeoutBehavior.name)
             .put("paperStartBalanceUsdt", cfg.paperStartBalanceUsdt)
-            .put("strategyModel", cfg.strategyModel.id)
+            .put("enacoreBridge", cfg.enacoreBridge)
+            .put("instrumentCategory", cfg.instrumentCategory).put("instrumentVenue", cfg.instrumentVenue)
+            .put("entryDeltaPct", cfg.entryDeltaPct).put("entryOfi", cfg.entryOfi).put("maxSpreadPct", cfg.maxSpreadPct)
             .put("executionPreference", cfg.executionPreference.name)
             .put("makerFallbackPolicy", cfg.makerFallbackPolicy.name)
             .put("maxTranches", cfg.maxTranches)

@@ -117,7 +117,7 @@ fun OnboardingScreen(state: AppState, onDone: () -> Unit) {
 
             Spacer(Modifier.height(6.dp))
             Text(
-                text = "Пожалуйста, внимательно прочитайте перед началом работы с ENA",
+                text = "Пожалуйста, внимательно прочитайте перед началом работы с ENΛVERSE",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -140,7 +140,7 @@ fun OnboardingScreen(state: AppState, onDone: () -> Unit) {
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        text = "ENA может быть не для вас, если:",
+                        text = "ENΛVERSE может быть не для вас, если:",
                         fontSize = 16.sp,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface
@@ -167,7 +167,7 @@ fun OnboardingScreen(state: AppState, onDone: () -> Unit) {
                     )
 
                     Text(
-                        text = "ENA — инструмент для изучения рынка, анализа трендов и понимания движения цен, а не способ гарантированного заработка.",
+                        text = "ENΛVERSE — инструмент для изучения рынка, анализа трендов и понимания движения цен, а не способ гарантированного заработка.",
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold,
                         lineHeight = 21.sp,
@@ -219,7 +219,7 @@ fun OnboardingScreen(state: AppState, onDone: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text(
-                text = "ENA · Разрешения и ответственность",
+                text = "ENΛVERSE · Разрешения и ответственность",
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onBackground
@@ -231,7 +231,7 @@ fun OnboardingScreen(state: AppState, onDone: () -> Unit) {
             )
 
             OnboardingSection(
-                title = "1 · Разрешения для приложения",
+                title = "• Разрешения для приложения",
                 body = "Рекомендуется самостоятельно перейти в системные настройки Android и выдать приложению все необходимые разрешения. Приложение не собирает и не передаёт ваши личные данные."
             ) {
                 Row(
@@ -310,7 +310,7 @@ fun OnboardingScreen(state: AppState, onDone: () -> Unit) {
                         }
                         runCatching { ctx.startActivity(intent) }
                             .onFailure {
-                                state.toast("Откройте Настройки → Приложения → ENA вручную")
+                                state.toast("Откройте Настройки → Приложения → ENΛVERSE вручную")
                             }
                     },
                     modifier = Modifier
@@ -334,8 +334,8 @@ fun OnboardingScreen(state: AppState, onDone: () -> Unit) {
             }
 
             OnboardingSection(
-                title = "2 · Отказ от ответственности",
-                body = "ENA — это аналитический и образовательный инструмент для наблюдения за стаканом, лентой сделок, поглощением ликвидности и структурой рынка, а не источник гарантированного заработка денег.\n\n" +
+                title = "• Отказ от ответственности",
+                body = "ENΛVERSE — это аналитический и образовательный инструмент для наблюдения за стаканом, лентой сделок, поглощением ликвидности и структурой рынка, а не источник гарантированного заработка денег.\n\n" +
                     "Ни один алгоритм не даёт 100% гарантии результата. Финансовый итог всегда зависит от вашего опыта, системного обучения, глубокого понимания механики рынка, управления рисками и личной торговой дисциплины."
             )
 

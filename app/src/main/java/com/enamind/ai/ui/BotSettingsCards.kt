@@ -73,7 +73,6 @@ import com.enamind.ai.bot.StopLossBasis
 import com.enamind.ai.bot.TargetBasis
 import com.enamind.ai.bot.TimeoutBehavior
 import com.enamind.ai.bot.strategy.OrderExecutionPreference
-import com.enamind.ai.bot.strategy.StrategyModelId
 import com.enamind.ai.core.AppState
 import kotlin.math.roundToInt
 
@@ -137,7 +136,7 @@ internal fun BotModeAndKeysCard(
                             bot.updateConfig { it.copy(paperStartBalanceUsdt = v) }
                         }
                     },
-                    label = { Text("Стартовый депозит Paper (USDT)", fontSize = 11.sp) },
+                    label = { BotParameterLabel("Стартовый депозит Paper (USDT)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     singleLine = true,
                     modifier = Modifier.weight(1f)
@@ -176,7 +175,7 @@ internal fun BotModeAndKeysCard(
             OutlinedTextField(
                 value = apiKeyText,
                 onValueChange = { apiKeyText = it },
-                label = { Text("API Key (${cfg.mode.shortLabel})", fontSize = 11.sp) },
+                label = { BotParameterLabel("API Key (${cfg.mode.shortLabel})") },
                 singleLine = true,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -185,7 +184,7 @@ internal fun BotModeAndKeysCard(
             OutlinedTextField(
                 value = apiSecretText,
                 onValueChange = { apiSecretText = it },
-                label = { Text("API Secret (${cfg.mode.shortLabel})", fontSize = 11.sp) },
+                label = { BotParameterLabel("API Secret (${cfg.mode.shortLabel})") },
                 singleLine = true,
                 visualTransformation = if (showSecret) VisualTransformation.None else PasswordVisualTransformation(),
                 trailingIcon = {
@@ -281,39 +280,23 @@ internal fun BotStrategyRiskCard(
 
     BotSectionCard(
         title = "СТРАТЕГИЯ, ТРАНШИ И РИСК",
-        subtitle = "Горячее переключение StrategyBridge · PostOnly Maker · SL опционален",
+        subtitle = "Ручные параметры или ENΛCORE · PostOnly / Market",
         icon = Icons.Outlined.Tune
     ) {
-        Text(
-            "Модель стратегии (без сброса потоков):",
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.onSurface
+        BotSwitchRow(
+            title = "Мост ENΛCORE",
+            subtitle = if (cfg.enacoreBridge) "Мозг подключён · вход, цель и горизонт через AWO" else "Ручной режим · Order Flow и Радар",
+            checked = cfg.enacoreBridge,
+            testTag = "enacore_bridge_switch",
+            onCheckedChange = { on -> bot.updateConfig { it.copy(enacoreBridge = on) } }
         )
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            StrategyModelId.entries.forEach { model ->
-                FilterChip(
-                    selected = cfg.strategyModel == model,
-                    onClick = { bot.updateConfig { it.copy(strategyModel = model) } },
-                    modifier = Modifier
-                        .heightIn(min = 48.dp)
-                        .testTag("bot_strategy_${model.id}"),
-                    label = { Text(model.shortLabel, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) },
-                    colors = botChipColors()
-                )
-            }
+        if (!cfg.enacoreBridge) {
+            ManualThresholdField("Delta, %", cfg.entryDeltaPct, "Минимальный перевес агрессивных покупок или продаж. Больше значение — меньше входов.") { v -> bot.updateConfig { it.copy(entryDeltaPct = v.coerceIn(1.0, 90.0)) } }
+            ManualThresholdField("OFI", cfg.entryOfi, "Минимальный нормализованный дисбаланс стакана, от 0.01 до 1.0. Направление должно совпасть с Delta.") { v -> bot.updateConfig { it.copy(entryOfi = v.coerceIn(0.01, 1.0)) } }
         }
-        Text(
-            cfg.strategyModel.descriptionRu,
-            fontSize = 10.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+        ManualThresholdField("Максимальный спред, %", cfg.maxSpreadPct, "Разница лучшей продажи и покупки относительно цены. При превышении бот ждёт.") { v -> bot.updateConfig { it.copy(maxSpreadPct = v.coerceIn(0.01, 1.0)) } }
 
+        BotParameterLabel("Режим исполнения")
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             OrderExecutionPreference.entries.forEach { pref ->
                 FilterChip(
@@ -326,7 +309,8 @@ internal fun BotStrategyRiskCard(
             }
         }
         if (cfg.executionPreference == OrderExecutionPreference.MAKER_POST_ONLY) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            BotParameterLabel("Таймаут Maker и резервное исполнение")
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 MakerFallbackPolicy.entries.forEach { fb ->
                     FilterChip(
                         selected = cfg.makerFallbackPolicy == fb,
@@ -346,6 +330,7 @@ internal fun BotStrategyRiskCard(
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface
         )
+        BotParameterLabel("Транши")
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             (1..4).forEach { count ->
                 FilterChip(
@@ -372,7 +357,7 @@ internal fun BotStrategyRiskCard(
                         scaleStepText = t
                         t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(scaleStepPct = v) } }
                     },
-                    label = { Text("Шаг добора %", fontSize = 10.5.sp) },
+                    label = { BotParameterLabel("Шаг добора %") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     singleLine = true,
                     modifier = Modifier.weight(1f)
@@ -402,7 +387,7 @@ internal fun BotStrategyRiskCard(
                     capitalText = t
                     t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(capitalUsdt = v) } }
                 },
-                label = { Text("Капитал (USDT)", fontSize = 11.sp) },
+                label = { BotParameterLabel("Капитал (USDT)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
                 modifier = Modifier.weight(1f)
@@ -413,7 +398,7 @@ internal fun BotStrategyRiskCard(
                     dailyLossText = t
                     t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(dailyMaxLossPct = v) } }
                 },
-                label = { Text("Макс. убыток/день %", fontSize = 11.sp) },
+                label = { BotParameterLabel("Макс. убыток/день %") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
                 modifier = Modifier.weight(1f)
@@ -422,7 +407,7 @@ internal fun BotStrategyRiskCard(
 
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Кредитное плечо (${cfg.symbol})", fontSize = 11.5.sp, color = MaterialTheme.colorScheme.onSurface)
+                BotParameterLabel("Кредитное плечо (${cfg.symbol})")
                 Text(
                     "${levSlider.roundToInt()}x (макс ${maxLev}x)",
                     fontSize = 11.5.sp,
@@ -435,10 +420,12 @@ internal fun BotStrategyRiskCard(
                 value = levSlider,
                 onValueChange = { levSlider = it },
                 onValueChangeFinished = { bot.updateConfig { it.copy(leverage = levSlider.roundToInt()) } },
+                enabled = maxLev > 1,
                 valueRange = 1f..maxLev.toFloat().coerceAtLeast(2f)
             )
         }
 
+        BotParameterLabel("Режим маржи")
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             MarginMode.entries.forEach { mm ->
                 FilterChip(
@@ -451,6 +438,7 @@ internal fun BotStrategyRiskCard(
             }
         }
 
+        BotParameterLabel("База расчёта прибыли и цели")
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             TargetBasis.entries.forEach { tb ->
                 FilterChip(
@@ -463,6 +451,7 @@ internal fun BotStrategyRiskCard(
             }
         }
 
+        BotParameterLabel("Разрешённое направление")
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -487,7 +476,7 @@ internal fun BotStrategyRiskCard(
                     minProfitText = t
                     t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(minNetProfitPct = v) } }
                 },
-                label = { Text("Мин. плюс %", fontSize = 10.5.sp) },
+                label = { BotParameterLabel("Мин. плюс %") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
                 modifier = Modifier.weight(1f)
@@ -498,7 +487,7 @@ internal fun BotStrategyRiskCard(
                     maxProfitText = t
                     t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(maxProfitPct = v) } }
                 },
-                label = { Text("Макс. цель %", fontSize = 10.5.sp) },
+                label = { BotParameterLabel("Макс. цель %") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
                 modifier = Modifier.weight(1f)
@@ -512,7 +501,7 @@ internal fun BotStrategyRiskCard(
                     trailText = t
                     t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(trailingGivebackPct = v) } }
                 },
-                label = { Text("Откат трала %", fontSize = 10.5.sp) },
+                label = { BotParameterLabel("Откат трала %") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
                 modifier = Modifier.weight(1f)
@@ -524,7 +513,7 @@ internal fun BotStrategyRiskCard(
                     t.toIntOrNull()?.let { v -> bot.updateConfig { it.copy(maxHoldWaitMin = v) } }
                 },
                 enabled = !cfg.allowUnlimitedHold,
-                label = { Text(if (cfg.allowUnlimitedHold) "Без тайм-стопа" else "Ожидание (мин)", fontSize = 10.5.sp) },
+                label = { BotParameterLabel(if (cfg.allowUnlimitedHold) "Без тайм-стопа" else "Тайм-стоп (мин)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 singleLine = true,
                 modifier = Modifier.weight(1f)
@@ -591,7 +580,7 @@ internal fun BotStrategyRiskCard(
                         slAtrText = t
                         t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(stopLossAtrMult = v) } }
                     },
-                    label = { Text("Множитель Stop-Loss (× ATR 1m)", fontSize = 11.sp) },
+                    label = { BotParameterLabel("Множитель Stop-Loss (× ATR 1m)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -603,7 +592,7 @@ internal fun BotStrategyRiskCard(
                         slText = t
                         t.toDoubleOrNull()?.let { v -> bot.updateConfig { it.copy(stopLossPct = v) } }
                     },
-                    label = { Text("Уровень Stop-Loss (Net %)", fontSize = 11.sp) },
+                    label = { BotParameterLabel("Уровень Stop-Loss (Net %)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -732,6 +721,7 @@ internal fun BotHudAndBackgroundCard(
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface
         )
+        BotParameterLabel("Таймаут Android 15")
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             TimeoutBehavior.entries.forEach { tb ->
                 FilterChip(
@@ -776,7 +766,7 @@ internal fun BotSwitchRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f)) {
-            Text(title, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+            BotParameterLabel(title, subtitle)
             Text(subtitle, fontSize = 10.sp, lineHeight = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Spacer(Modifier.width(8.dp))

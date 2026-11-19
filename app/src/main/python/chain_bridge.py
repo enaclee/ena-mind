@@ -265,7 +265,35 @@ _ready=False
 
 # ================= NEURAL FORECAST ENGINE v7.0 =================
 
-def engine_set_klines(symbol,tf,rows_json):
+import threading
+from functools import wraps
+_instrument_lock = threading.RLock()
+_instrument_generation = -1
+
+def _generation_safe(index):
+    """Serialize legacy-engine access and reject late work after a market switch."""
+    def decorate(fn):
+        @wraps(fn)
+        def guarded(*args, **kwargs):
+            global _instrument_generation
+            generation = int(args[index] if len(args) > index else kwargs.get("generation", -1))
+            with _instrument_lock:
+                if generation >= 0:
+                    if generation < _instrument_generation:
+                        return json.dumps({"ok": False, "discarded": True, "error": "instrument changed"})
+                    if generation != _instrument_generation:
+                        _check()
+                        import mm_engine
+                        eng = mm_engine.get_engine()
+                        for name in ("sessions", "klines", "fast", "prev_book"):
+                            getattr(eng, name).clear()
+                        _instrument_generation = generation
+                return fn(*args, **kwargs)
+        return guarded
+    return decorate
+
+@_generation_safe(3)
+def engine_set_klines(symbol,tf,rows_json,generation=-1):
     """Тяжёлый канал данных: свечи по таймфрейму от Kotlin (REST+WS, раз в ~60с)."""
     _check()
     import mm_engine
@@ -275,7 +303,8 @@ def engine_set_klines(symbol,tf,rows_json):
     except Exception as e:
         return json.dumps({"ok":False,"error":str(e)},ensure_ascii=False)
 
-def engine_feed(symbol,fast_json="{}"):
+@_generation_safe(2)
+def engine_feed(symbol,fast_json="{}",generation=-1):
     """Лёгкий канал + полный прогон движка. fast_json — живой срез
     рынка от Kotlin (цена/потоки/книга/деривативы/кросс/мульти-биржи).
     Возвращает JSON результата конвейера (агенты/совет/прогноз 6ч и 24ч/сессия)."""
@@ -289,7 +318,8 @@ def engine_feed(symbol,fast_json="{}"):
     except Exception as e:
         return json.dumps({"ok":False,"error":str(e),"trace":traceback.format_exc()[-300:]},ensure_ascii=False)
 
-def engine_outlook(symbol="BTCUSDT",horizon_h=6,fast_json="{}"):
+@_generation_safe(3)
+def engine_outlook(symbol="BTCUSDT",horizon_h=6,fast_json="{}",generation=-1):
     """Свежий пересчёт прогноза на 6ч или 24ч без кэша на каждый запрос пользователя."""
     _check()
     import mm_engine

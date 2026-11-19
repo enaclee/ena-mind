@@ -25,7 +25,8 @@ class BybitWs(
     private val symbol: String,
     private val listener: Listener,
     private val klineInterval: String = "60",
-    private val clockOffsetMsProvider: () -> Long = { 0L }
+    private val clockOffsetMsProvider: () -> Long = { 0L },
+    private val category: String = "linear"
 ) {
     interface Listener {
         fun onTicker(t: Ticker)
@@ -33,6 +34,7 @@ class BybitWs(
         fun onBook(bids: List<BookLevel>, asks: List<BookLevel>)
         fun onLiquidation(l: Liquidation)
         fun onKline(bar: Kline)
+        fun onMinuteKline(bar: Kline) {}
         fun onStatus(connected: Boolean, note: String)
         fun onBookDesync(reason: String) {}
         fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {}
@@ -48,7 +50,7 @@ class BybitWs(
         val nextFundingTs: Long
     )
 
-    data class Trade(val price: Double, val size: Double, val side: String, val tsMs: Long, val lagMs: Long = 0L)
+    data class Trade(val price: Double, val size: Double, val side: String, val tsMs: Long, val lagMs: Long = 0L, val id: String? = null)
 
     data class BookLevel(val price: Double, val qty: Double)
 
@@ -94,7 +96,7 @@ class BybitWs(
         closedByUser = false
         val gen = generation.incrementAndGet()
         feedTracker.onConnecting()
-        val req = Request.Builder().url(URL).build()
+        val req = Request.Builder().url("wss://stream.bybit.com/v5/public/$category").build()
         ws = client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (gen != generation.get() || closedByUser) {
@@ -113,8 +115,9 @@ class BybitWs(
                     put("tickers.$symbol")
                     put("publicTrade.$symbol")
                     put("orderbook.50.$symbol")
-                    put("allLiquidation.$symbol")
+                    if (category != "spot") put("allLiquidation.$symbol")
                     put("kline.$klineInterval.$symbol")
+                    if (klineInterval != "1") put("kline.1.$symbol")
                 }
                 webSocket.send(JSONObject().put("op", "subscribe").put("args", args).toString())
                 listener.onStatus(true, if (reconnected) "переподключено (ресинхрон стакана…)" else "подключено (ждём данные)")
@@ -218,8 +221,7 @@ class BybitWs(
                     if (arr.length() > 0) feedTracker.onValidMessage(FeedStatus.Kind.KLINE)
                     for (i in 0 until arr.length()) {
                         val o = arr.getJSONObject(i)
-                        listener.onKline(
-                            Kline(
+                        val bar = Kline(
                                 tsMs = o.optLong("start"),
                                 open = o.optDouble("open"),
                                 high = o.optDouble("high"),
@@ -227,8 +229,9 @@ class BybitWs(
                                 close = o.optDouble("close"),
                                 volume = o.optDouble("volume"),
                                 confirm = o.optBoolean("confirm", false)
-                            )
                         )
+                        if (topic == "kline.1.$symbol") listener.onMinuteKline(bar)
+                        if (topic == "kline.$klineInterval.$symbol") listener.onKline(bar)
                     }
                 }
                 topic.startsWith("allLiquidation") -> {
@@ -294,7 +297,8 @@ class BybitWs(
             size = d.optDouble("v"),
             side = d.optString("S"),
             tsMs = ts,
-            lagMs = computeLagMs(ts)
+            lagMs = computeLagMs(ts),
+            id = d.optString("i").takeIf { it.isNotBlank() }
         )
     }
 
@@ -366,6 +370,9 @@ class TapeAggregator(private val window: Int = 500) {
     private val trades = ArrayDeque<BybitWs.Trade>(window)
 
     @Synchronized
+    fun clear() { synchronized(this) { trades.clear() } }
+
+    @Synchronized
     fun add(t: BybitWs.Trade) {
         if (trades.size >= window) trades.removeFirst()
         trades.addLast(t)
@@ -406,6 +413,8 @@ class TapeAggregator(private val window: Int = 500) {
 class LiquidationAggregator {
     private val items = ArrayList<BybitWs.Liquidation>()
     private val hourMs = 3600_000L
+
+    @Synchronized fun clear() { items.clear() }
 
     @Synchronized
     fun add(l: BybitWs.Liquidation) {

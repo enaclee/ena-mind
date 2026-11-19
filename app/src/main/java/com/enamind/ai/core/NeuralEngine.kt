@@ -104,6 +104,16 @@ class NeuralEngine(
     // ---------------- WS бирж (независимое подтверждение + fallback для UI) ----------------
     private var binanceWs: BinanceWs? = null
     private var okxWs: OkxWs? = null
+    @Volatile var crossPriceAtMs = 0L
+    private fun requireCurrent(instrument: ActiveInstrument) {
+        if (state.activeInstrument.value != instrument) throw kotlinx.coroutines.CancellationException("Instrument changed")
+    }
+    private fun publish(instrument: ActiveInstrument, action: () -> Unit) = synchronized(state) {
+        requireCurrent(instrument)
+        action()
+    }
+
+    fun enacoreBars(): List<List<Double>> = klinesCache["$symbol:1"].orEmpty()
     @Volatile var binancePrice = 0.0
     @Volatile var okxPrice = 0.0
     @Volatile var binanceDepth: Pair<List<Pair<Double, Double>>, List<Pair<Double, Double>>>? = null
@@ -165,15 +175,17 @@ class NeuralEngine(
 
     /** Синхронизация свечей, уже загруженных графиком в AppState. */
     fun seedChartKlines(sym: String, iv: String, rows: List<List<Double>>) {
-        if (rows.size < 5) return
-        klinesCache["$sym:$iv"] = rows
+        val instrument = state.activeInstrument.value
+        if (rows.size < 5 || sym != instrument.symbol) return
+        publish(instrument) { klinesCache["$sym:$iv"] = rows }
         if (PythonBridge.isReady()) {
             val sig = klineSig(rows)
             val key = "$sym:$iv"
             if (lastSyncedKlineSig[key] != sig) {
                 scope.launch(Dispatchers.IO) {
-                    val r = PythonBridge.engineSetKlines(sym, iv, toJsonRows(rows).toString())
-                    if (r.optBoolean("ok", true)) lastSyncedKlineSig[key] = sig
+                    requireCurrent(instrument)
+                    val r = PythonBridge.engineSetKlines(sym, iv, toJsonRows(rows).toString(), instrument.generation)
+                    if (r.optBoolean("ok", true)) publish(instrument) { lastSyncedKlineSig[key] = sig }
                 }
             }
         }
@@ -195,6 +207,18 @@ class NeuralEngine(
     }
 
     fun changeSymbol() {
+        crossPriceAtMs = 0L
+        klinesCache.clear()
+        klinesCacheTs.clear()
+        synchronized(altKlines) { altKlines.clear() }
+        latestVenueSnapshot = null
+        lastRadarRaw = null
+        binanceConnected = false
+        okxConnected = false
+        lastSyncedKlineSig.clear()
+        _intelligence.value = null
+        _realTimePulse.value = RealTimeLeadEngine.RealTimeTrendPulse(symbol = symbol)
+        state.orderFlow.resetForInstrument(symbol, state.activeInstrument.value.generation)
         binancePrice = 0.0
         okxPrice = 0.0
         binanceDepth = null
@@ -221,21 +245,27 @@ class NeuralEngine(
     }
 
     private fun connectBinanceOnly() {
+        val instrument = state.activeInstrument.value
         val sym = symbol
         val iv = chartInterval
         binanceWs?.close()
+        if (instrument.category == "inverse" || instrument.baseCoin in setOf("XAU", "XAG", "GOLD", "SILVER")) { binanceConnected = false; return }
         binanceWs = BinanceWs(sym, object : BinanceWs.Listener {
             override fun onFlow(flow: BinanceWs.FlowStats) {
+                if (instrument != state.activeInstrument.value) return
                 binanceFlow = flow
                 state.onFallbackFlow(sym, flow)
             }
 
             override fun onPrice(price: Double) {
+                if (instrument != state.activeInstrument.value) return
+                crossPriceAtMs = System.currentTimeMillis()
                 binancePrice = price
                 state.onFallbackPrice(sym, price, "Binance")
             }
 
             override fun onDepth(bids: List<Pair<Double, Double>>, asks: List<Pair<Double, Double>>) {
+                if (instrument != state.activeInstrument.value) return
                 binanceDepth = bids to asks
                 state.onFallbackDepth(sym, bids, asks)
                 if (!state.hasFreshBybitBook()) {
@@ -251,6 +281,7 @@ class NeuralEngine(
             }
 
             override fun onTrade(price: Double, qty: Double, isAggressiveBuy: Boolean, exchangeTsMs: Long, lagMs: Long) {
+                if (instrument != state.activeInstrument.value) return
                 if (!state.hasFreshBybitTrades()) {
                     state.orderFlow.streamHub.recordTrade(
                         symbol = sym,
@@ -265,27 +296,32 @@ class NeuralEngine(
             }
 
             override fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {
+                if (instrument != state.activeInstrument.value) return
                 if (!state.hasFreshBybitBook()) {
                     state.orderFlow.streamHub.recordDomDeltas(sym, deltas, synced, lagMs, "Binance")
                 }
             }
 
             override fun onBookDesync(reason: String) {
+                if (instrument != state.activeInstrument.value) return
                 if (!state.hasFreshBybitBook()) {
                     state.orderFlow.streamHub.recordDesync(sym, reason, "Binance")
                 }
             }
 
             override fun onKline(bar: BybitWs.Kline) {
+                if (instrument != state.activeInstrument.value) return
                 state.onFallbackKline(sym, iv, bar)
             }
 
             override fun onTicker24h(price: Double, change24hPct: Double, volume24h: Double, quoteVolume24h: Double) {
+                if (instrument != state.activeInstrument.value) return
                 binancePrice = price
                 state.onFallbackTicker24h(sym, price, change24hPct, volume24h, quoteVolume24h, "Binance")
             }
 
             override fun onStatus(connected: Boolean, note: String) {
+                if (instrument != state.activeInstrument.value) return
                 binanceConnected = connected
                 binanceNote = note
                 state.onFallbackStatus()
@@ -294,20 +330,26 @@ class NeuralEngine(
     }
 
     private fun connectOkxOnly() {
+        val instrument = state.activeInstrument.value
         val sym = symbol
         okxWs?.close()
+        if (instrument.category == "inverse") { okxConnected = false; return }
         okxWs = OkxWs(sym, object : OkxWs.Listener {
             override fun onFlow(flow: OkxWs.FlowStats) {
+                if (instrument != state.activeInstrument.value) return
                 okxFlow = flow
                 state.onFallbackOkxFlow(sym, flow)
             }
 
             override fun onPrice(price: Double, vol24hCcy: Double) {
+                if (instrument != state.activeInstrument.value) return
+                crossPriceAtMs = System.currentTimeMillis()
                 okxPrice = price
                 state.onFallbackPrice(sym, price, "OKX", vol24hCcy)
             }
 
             override fun onStatus(connected: Boolean, note: String) {
+                if (instrument != state.activeInstrument.value) return
                 okxConnected = connected
                 okxNote = note
                 state.onFallbackStatus()
@@ -335,33 +377,42 @@ class NeuralEngine(
     }
 
     /** Свечи активного символа по основным ТФ (Bybit -> Binance Vision/api1/api3 -> OKX). */
-    private suspend fun pushKlines(sym: String): Boolean = warmupMutex.withLock {
+    private suspend fun pushKlines(sym: String, instrument: ActiveInstrument = state.activeInstrument.value): Boolean = warmupMutex.withLock {
+        requireCurrent(instrument)
+        if (sym != instrument.symbol) return@withLock false
+        val rest = state.rest
         withContext(Dispatchers.IO) {
             // Сначала загружаем "1" (он быстрее переводит Bybit в cooldown при геоблоке)
-            val r1 = state.rest.klinesUnifiedSync(sym, "1", 250)
+            val r1 = rest.klinesUnifiedSync(sym, "1", 1000)
+            requireCurrent(instrument)
             if (r1.rows.isNotEmpty()) {
-                klinesCache["$sym:1"] = r1.rows
-                klinesCacheTs["$sym:1"] = System.currentTimeMillis()
-                _klineSource.value = r1.source
+                publish(instrument) {
+                    klinesCache["$sym:1"] = r1.rows
+                    klinesCacheTs["$sym:1"] = System.currentTimeMillis()
+                    _klineSource.value = r1.source
+                }
             }
             val otherTfs = coroutineScope {
                 listOf("3", "5", "15", "60").map { tf ->
                     async(Dispatchers.IO) {
-                        tf to state.rest.klinesUnifiedSync(sym, tf, 250)
+                        tf to rest.klinesUnifiedSync(sym, tf, 250)
                     }
                 }.awaitAll()
             }
+            requireCurrent(instrument)
             var anyOk = r1.rows.isNotEmpty()
             val nowTs = System.currentTimeMillis()
             for ((tf, res) in otherTfs) {
                 if (res.rows.isEmpty()) continue
                 anyOk = true
-                klinesCache["$sym:$tf"] = res.rows
-                klinesCacheTs["$sym:$tf"] = nowTs
-                if (_klineSource.value.isBlank()) _klineSource.value = res.source
+                publish(instrument) {
+                    klinesCache["$sym:$tf"] = res.rows
+                    klinesCacheTs["$sym:$tf"] = nowTs
+                    if (_klineSource.value.isBlank()) _klineSource.value = res.source
+                }
             }
             if (PythonBridge.isReady()) {
-                syncCacheToPython(sym)
+                syncCacheToPython(sym, instrument)
             }
             anyOk
         }
@@ -375,16 +426,17 @@ class NeuralEngine(
         return "${rows.size}:$firstTs:$lastTs:$lastClose"
     }
 
-    private fun syncCacheToPython(sym: String) {
+    private fun syncCacheToPython(sym: String, instrument: ActiveInstrument = state.activeInstrument.value) {
+        requireCurrent(instrument)
         for (tf in listOf("1", "3", "5", "15", "60")) {
             val key = "$sym:$tf"
             val rows = klinesCache[key] ?: continue
             if (rows.size < 5) continue
             val sig = klineSig(rows)
             if (lastSyncedKlineSig[key] == sig) continue
-            val res = PythonBridge.engineSetKlines(sym, tf, toJsonRows(rows).toString())
+            val res = PythonBridge.engineSetKlines(sym, tf, toJsonRows(rows).toString(), instrument.generation)
             if (res.optBoolean("ok", true)) {
-                lastSyncedKlineSig[key] = sig
+                publish(instrument) { lastSyncedKlineSig[key] = sig }
             }
         }
     }
@@ -423,11 +475,14 @@ class NeuralEngine(
 
     /** 1m-свечи всех активов watchlist (кросс-активные корреляции). */
     private suspend fun pushAltKlines() = withContext(Dispatchers.IO) {
+        val instrument = state.activeInstrument.value
+        val rest = com.enamind.ai.bybit.BybitRest(state.settings.bybitBaseUrl, "linear")
         for (s in WATCHLIST) {
             if (s == symbol) continue
             val lastTs = klinesCacheTs["$s:1"] ?: 0L
             if (System.currentTimeMillis() - lastTs < 90_000L) continue
-            val res = state.rest.klinesUnifiedSync(s, "1", 120)
+            val res = rest.klinesUnifiedSync(s, "1", 120)
+            requireCurrent(instrument)
             if (res.rows.isEmpty()) continue
             klinesCache["$s:1"] = res.rows
             klinesCacheTs["$s:1"] = System.currentTimeMillis()
@@ -450,7 +505,8 @@ class NeuralEngine(
     }
 
     suspend fun refreshIntelligence(forceRadar: Boolean = false): UnifiedIntelligenceReport = intelMutex.withLock {
-        val targetSym = symbol
+        val instrument = state.activeInstrument.value
+        val targetSym = instrument.symbol
         if (forceRadar) _radarRefreshing.value = true
         return@withLock try {
             if (forceRadar) {
@@ -472,6 +528,7 @@ class NeuralEngine(
                 withContext(Dispatchers.IO) {
                     intelClient.fetchRadarSnapshotSync(targetSym, btcPrice, force = forceRadar)
                 }.also {
+                    requireCurrent(instrument)
                     lastRadarRaw = it
                     lastRadarFetchMs.set(System.currentTimeMillis())
                 }
@@ -491,7 +548,7 @@ class NeuralEngine(
 
             val venueSnap = withContext(Dispatchers.IO) {
                 multiVenueBridge.fetchVenueSnapshotSync(targetSym)
-            }.also { latestVenueSnapshot = it }
+            }.also { requireCurrent(instrument); latestVenueSnapshot = it }
 
             val clockSt = withContext(Dispatchers.IO) {
                 clockSync.syncIfNeeded(state.rest.http, state.rest.isBybitInCooldown(), force = forceRadar)
@@ -531,9 +588,10 @@ class NeuralEngine(
                     memoryVault.recordObservation(report, entryPx)
                 }
             }
+            requireCurrent(instrument)
             val updatedReport = report.copy(learning = memoryVault.snapshot())
 
-            if (targetSym == symbol) {
+            if (state.activeInstrument.value == instrument) {
                 _intelligence.value = updatedReport
                 val curRes = _result.value
                 if ((curRes == null || !curRes.optBoolean("ok")) && kmap.isNotEmpty()) {
@@ -554,15 +612,17 @@ class NeuralEngine(
         }
     }
 
-    private suspend fun runComputeOnce(targetSym: String): JSONObject? = computeMutex.withLock {
+    private suspend fun runComputeOnce(targetSym: String, instrument: ActiveInstrument = state.activeInstrument.value): JSONObject? = computeMutex.withLock {
+        requireCurrent(instrument)
+        if (targetSym != instrument.symbol) return@withLock null
         _running.value = true
         return try {
             var pyRes: JSONObject? = null
             if (ensurePython()) {
-                syncCacheToPython(targetSym)
+                syncCacheToPython(targetSym, instrument)
                 val fast = buildFast()
                 val resStr = withContext(Dispatchers.IO) {
-                    PythonBridge.engineFeed(targetSym, fast.toString())
+                    PythonBridge.engineFeed(targetSym, fast.toString(), instrument.generation)
                 }
                 pyRes = try {
                     JSONObject(resStr)
@@ -572,9 +632,10 @@ class NeuralEngine(
                 }
             }
 
+            requireCurrent(instrument)
             if (pyRes != null && pyRes.optBoolean("ok")) {
                 lastPythonOkResult = pyRes
-                if (targetSym == symbol) {
+                if (state.activeInstrument.value == instrument) {
                     _result.value = pyRes
                 }
                 // Синхронизируем Kotlin-разум и Sentinel с новым Python-срезом
@@ -594,9 +655,9 @@ class NeuralEngine(
             if (kmap.isEmpty()) {
                 withContext(Dispatchers.IO) {
                     val r15 = state.rest.klinesUnifiedSync(targetSym, "15", 200)
-                    if (r15.rows.isNotEmpty()) klinesCache["$targetSym:15"] = r15.rows
+                    if (r15.rows.isNotEmpty()) publish(instrument) { klinesCache["$targetSym:15"] = r15.rows }
                     val r60 = state.rest.klinesUnifiedSync(targetSym, "60", 200)
-                    if (r60.rows.isNotEmpty()) klinesCache["$targetSym:60"] = r60.rows
+                    if (r60.rows.isNotEmpty()) publish(instrument) { klinesCache["$targetSym:60"] = r60.rows }
                 }
                 kmap = collectKlinesFor(targetSym)
             }
@@ -604,7 +665,7 @@ class NeuralEngine(
             if (kmap.isNotEmpty()) {
                 val intel = refreshIntelligence(forceRadar = lastRadarRaw == null)
                 val fallbackJson = intel.toEngineJson()
-                if (targetSym == symbol) {
+                if (state.activeInstrument.value == instrument) {
                     _result.value = fallbackJson
                 }
                 return fallbackJson
@@ -642,7 +703,8 @@ class NeuralEngine(
      * Объединяет актуальные свечи, мульти-биржевой срез, Chain Radar, деривативы и Python-оценку.
      */
     suspend fun computeFreshOutlook(horizonHours: Int): JSONObject {
-        val targetSym = symbol
+        val instrument = state.activeInstrument.value
+        val targetSym = instrument.symbol
         val m = state.market.value
         var kmap = collectKlinesFor(targetSym)
         if (kmap["15"].isNullOrEmpty() || kmap["60"].isNullOrEmpty()) {
@@ -651,11 +713,11 @@ class NeuralEngine(
         }
         val venueSnap = withContext(Dispatchers.IO) {
             multiVenueBridge.fetchVenueSnapshotSync(targetSym)
-        }.also { latestVenueSnapshot = it }
+        }.also { requireCurrent(instrument); latestVenueSnapshot = it }
         val btcPx = if (targetSym == "BTCUSDT") m.price else null
         val radarRaw = withContext(Dispatchers.IO) {
             intelClient.fetchRadarSnapshotSync(targetSym, btcPx, force = false)
-        }.also { lastRadarRaw = it }
+        }.also { requireCurrent(instrument); lastRadarRaw = it }
         val crossSpreadBps = if (binancePrice > 0 && okxPrice > 0) {
             (okxPrice - binancePrice) / binancePrice * 10000.0
         } else null
@@ -667,8 +729,8 @@ class NeuralEngine(
         var pyOutlook: JSONObject? = null
         if (ensurePython()) {
             withContext(Dispatchers.IO) {
-                syncCacheToPython(targetSym)
-                val r = PythonBridge.callEngine("engine_outlook", targetSym, horizonHours, fastJson.toString())
+                syncCacheToPython(targetSym, instrument)
+                val r = PythonBridge.callEngine("engine_outlook", targetSym, horizonHours, fastJson.toString(), instrument.generation)
                 if (r.optBoolean("ok")) pyOutlook = r
             }
         }
@@ -696,7 +758,7 @@ class NeuralEngine(
                 orderFlow = ofPayload
             )
         }
-        if (targetSym == symbol) {
+        if (state.activeInstrument.value == instrument) {
             _intelligence.value = report
         }
         val summary = if (horizonHours <= 6) report.outlook6h else report.outlook24h
@@ -847,14 +909,16 @@ class NeuralEngine(
         var tick = 0
         while (scope.isActive) {
             try {
-                val sym = symbol
+                val instrument = state.activeInstrument.value
+                val sym = instrument.symbol
                 val m = state.market.value
                 val bars1m = klinesCache["$sym:1"] ?: state.klines.value
                 // Каждые ~10с освежаем мульти-биржевой снимок Coinbase/Kraken/Binance velocity в фоне
                 if (tick % 5 == 0) {
-                    latestVenueSnapshot = withContext(Dispatchers.IO) {
+                    val freshVenue = withContext(Dispatchers.IO) {
                         multiVenueBridge.fetchVenueSnapshotSync(sym)
                     }
+                    publish(instrument) { latestVenueSnapshot = freshVenue }
                 }
                 val snap = latestVenueSnapshot
                 val intel = _intelligence.value?.takeIf { it.symbol == sym }
@@ -877,10 +941,11 @@ class NeuralEngine(
                         nowMs = nowMs
                     )
                 }
+                requireCurrent(instrument)
                 _realTimePulse.value = pulse
 
                 // Слой 3: Периодический сбор рыночных якорей (Spot CVD / Open Interest)
-                if (tick % 2 == 0) {
+                if (tick % 2 == 0 && instrument.category == "linear") {
                     withContext(Dispatchers.IO) {
                         state.anchorsCollector.pollRestAnchorsIfDue(sym, nowMs)
                     }
@@ -912,7 +977,8 @@ class NeuralEngine(
                         nowMs = nowMs,
                         quantAdx = intel?.quant?.adx,
                         quantEr = intel?.quant?.efficiencyRatio,
-                        venueSyncWarning = venueSyncWarn
+                        venueSyncWarning = venueSyncWarn,
+                        expectedGeneration = instrument.generation
                     )
                 }
 
@@ -961,9 +1027,11 @@ class NeuralEngine(
         while (scope.isActive) {
             for (s in WATCHLIST) {
                 if (s == symbol) continue
+                val instrument = state.activeInstrument.value
                 try {
                     withContext(Dispatchers.IO) {
                         if (!ensurePython()) return@withContext
+                        val rest = com.enamind.ai.bybit.BybitRest(state.settings.bybitBaseUrl, "linear")
                         var lastClose = 0.0
                         val nowTs = System.currentTimeMillis()
                         for (tf in listOf("1", "15", "60")) {
@@ -973,7 +1041,8 @@ class NeuralEngine(
                             val rows = if (cached != null && cached.isNotEmpty() && ageMs < 120_000L) {
                                 cached
                             } else {
-                                val res = state.rest.klinesUnifiedSync(s, tf, 200)
+                                val res = rest.klinesUnifiedSync(s, tf, 200)
+                                requireCurrent(instrument)
                                 if (res.rows.isNotEmpty()) {
                                     klinesCache[key] = res.rows
                                     klinesCacheTs[key] = System.currentTimeMillis()
@@ -982,7 +1051,7 @@ class NeuralEngine(
                             }
                             if (rows.isEmpty()) continue
                             if (lastClose <= 0.0) lastClose = rows.lastOrNull()?.getOrNull(4) ?: 0.0
-                            PythonBridge.engineSetKlines(s, tf, toJsonRows(rows).toString())
+                            PythonBridge.engineSetKlines(s, tf, toJsonRows(rows).toString(), instrument.generation)
                         }
                         val vSnap = multiVenueBridge.fetchVenueSnapshotSync(s)
                         val fastObj = JSONObject().apply {
@@ -995,7 +1064,9 @@ class NeuralEngine(
                                 put("binance_whale_spike_usd", vSnap.binanceWhaleSpikeUsd)
                             })
                         }
-                        val res = JSONObject(PythonBridge.engineFeed(s, fastObj.toString()))
+                        val res = JSONObject(PythonBridge.engineFeed(s, fastObj.toString(), instrument.generation))
+                        requireCurrent(instrument)
+                        if (s == symbol) return@withContext
                         if (res.optBoolean("ok")) {
                             val f = res.optJSONObject("forecast")
                             val cur = _watch.value.toMutableMap()

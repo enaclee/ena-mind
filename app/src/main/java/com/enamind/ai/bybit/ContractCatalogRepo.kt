@@ -30,8 +30,10 @@ class ContractCatalogRepo(
         val maxLeverage: Double?,
         val source: String,
         val qtyStep: Double? = null,
-        val minNotionalValue: Double? = null
-    )
+        val minNotionalValue: Double? = null,
+        val category: String = "linear",
+        val assetClass: String = "Крипто"
+    ) { val key: String get() = "$source:$category:$symbol" }
 
     data class CatalogState(
         val contracts: List<ContractInfo> = emptyList(),
@@ -72,7 +74,9 @@ class ContractCatalogRepo(
                         maxLeverage = o.optDouble("maxLeverage", Double.NaN).takeIf { it.isFinite() && it > 0 },
                         source = o.optString("source", "cache"),
                         qtyStep = o.optDouble("qtyStep", Double.NaN).takeIf { it.isFinite() && it > 0 },
-                        minNotionalValue = o.optDouble("minNotionalValue", Double.NaN).takeIf { it.isFinite() && it > 0 }
+                        minNotionalValue = o.optDouble("minNotionalValue", Double.NaN).takeIf { it.isFinite() && it > 0 },
+                        category = o.optString("category", "linear"),
+                        assetClass = o.optString("assetClass", "Крипто")
                     )
                 )
             }
@@ -97,13 +101,12 @@ class ContractCatalogRepo(
         }
         _state.value = cur.copy(loading = true, error = null)
 
-        val fetched = fetchBybitLinear(settings.bybitBaseUrl)
-            ?: fetchBinanceFutures()
-            ?: fetchBinanceSpotUsdt()
-            ?: fetchOkxSwaps()
+        val bybit = listOf("linear", "spot", "inverse").mapNotNull { fetchBybitCategory(settings.bybitBaseUrl, it) }.flatMap { it.first }
+        val fetched = if (bybit.isNotEmpty()) bybit to "Bybit · Linear / Spot / Inverse"
+            else fetchBinanceFutures() ?: fetchBinanceSpotUsdt() ?: fetchOkxSwaps()
 
         return if (fetched != null && fetched.first.isNotEmpty()) {
-            val sorted = fetched.first.distinctBy { it.symbol }.sortedWith(
+            val sorted = fetched.first.distinctBy { it.key }.sortedWith(
                 compareBy<ContractInfo> {
                     val idx = Settings.SYMBOLS.indexOf(it.symbol)
                     if (idx >= 0) idx else Int.MAX_VALUE
@@ -127,8 +130,8 @@ class ContractCatalogRepo(
         }
     }
 
-    fun findContract(symbol: String): ContractInfo? =
-        _state.value.contracts.firstOrNull { it.symbol.equals(symbol, ignoreCase = true) }
+    fun findContract(symbol: String, category: String = settings.instrumentCategory): ContractInfo? =
+        _state.value.contracts.firstOrNull { it.category == category && it.symbol.equals(symbol, ignoreCase = true) }
 
     fun findTickSize(symbol: String): Double? =
         findContract(symbol)?.tickSize
@@ -136,7 +139,7 @@ class ContractCatalogRepo(
     fun findQtyStep(symbol: String): Double? =
         findContract(symbol)?.qtyStep
 
-    private fun fetchBybitLinear(baseUrl: String): Pair<List<ContractInfo>, String>? {
+    private fun fetchBybitCategory(baseUrl: String, category: String): Pair<List<ContractInfo>, String>? {
         val all = ArrayList<ContractInfo>()
         var cursor = ""
         val bases = listOf(baseUrl.trimEnd('/'), "https://api.bytick.com").distinct()
@@ -145,16 +148,17 @@ class ContractCatalogRepo(
             cursor = ""
             var pages = 0
             var ok = false
-            while (pages < 5) {
+            while (pages < 20) {
                 pages++
                 val cursorParam = if (cursor.isNotBlank()) "&cursor=$cursor" else ""
-                val url = "$base/v5/market/instruments-info?category=linear&status=Trading&limit=1000$cursorParam"
+                val pagination = if (category == "spot") "" else "&limit=1000$cursorParam"
+                val url = "$base/v5/market/instruments-info?category=$category&status=Trading$pagination"
                 val txt = getText(url) ?: break
-                val parsed = parseBybitInstrumentsJson(txt) ?: break
+                val parsed = parseBybitInstrumentsJson(txt, category) ?: break
                 all.addAll(parsed.first)
                 ok = true
                 cursor = parsed.second
-                if (cursor.isBlank()) break
+                if (category == "spot" || cursor.isBlank()) break
             }
             if (ok && all.isNotEmpty()) return all to "Bybit"
         }
@@ -193,6 +197,8 @@ class ContractCatalogRepo(
             for (c in list) {
                 arr.put(
                     JSONObject()
+                        .put("category", c.category)
+                        .put("assetClass", c.assetClass)
                         .put("symbol", c.symbol)
                         .put("baseCoin", c.baseCoin)
                         .put("quoteCoin", c.quoteCoin)
@@ -226,7 +232,7 @@ class ContractCatalogRepo(
     }
 
     companion object {
-        fun parseBybitInstrumentsJson(rawJson: String): Pair<List<ContractInfo>, String>? {
+        fun parseBybitInstrumentsJson(rawJson: String, category: String = "linear"): Pair<List<ContractInfo>, String>? {
             return try {
                 val root = JSONObject(rawJson)
                 if (root.optInt("retCode", -1) != 0) return null
@@ -239,16 +245,17 @@ class ContractCatalogRepo(
                     val sym = o.optString("symbol").uppercase(Locale.ROOT)
                     val quote = o.optString("quoteCoin").uppercase(Locale.ROOT)
                     val status = o.optString("status")
-                    if (sym.isBlank() || quote != "USDT") continue
+                    if (sym.isBlank() || quote.isBlank()) continue
                     if (status.isNotBlank() && status != "Trading") continue
                     val base = o.optString("baseCoin").uppercase(Locale.ROOT).ifBlank { sym.removeSuffix("USDT") }
                     val tick = o.optJSONObject("priceFilter")?.optString("tickSize")?.toDoubleOrNull()?.takeIf { it > 0 }
                     val lotObj = o.optJSONObject("lotSizeFilter")
-                    val minQty = lotObj?.optString("minOrderQty")?.toDoubleOrNull()?.takeIf { it > 0 }
-                    val qStep = lotObj?.optString("qtyStep")?.toDoubleOrNull()?.takeIf { it > 0 } ?: minQty
-                    val minNotional = lotObj?.optString("minNotionalValue")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    val minQty = lotObj?.optString(if (category == "spot") "basePrecision" else "minOrderQty")?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 }
+                    val qStep = lotObj?.optString(if (category == "spot") "basePrecision" else "qtyStep")?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 } ?: minQty
+                    val minNotional = lotObj?.optString(if (category == "spot") "minOrderAmt" else "minNotionalValue")?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 }
                     val maxLev = o.optJSONObject("leverageFilter")?.optString("maxLeverage")?.toDoubleOrNull()?.takeIf { it > 0 }
-                    out.add(ContractInfo(sym, base, quote, tick, minQty, maxLev, "Bybit", qStep, minNotional))
+                    val asset = if (base in setOf("XAU", "XAG", "PAXG", "XAUT", "GOLD", "SILVER") || o.optString("symbolType").contains("xstock", true) || o.optString("marketRegion").isNotBlank() || o.optString("underlyingTicker").isNotBlank()) "Металлы / RWA" else "Крипто"
+                    out.add(ContractInfo(sym, base, quote, tick, minQty, if (category == "spot") 1.0 else maxLev, "Bybit", qStep, minNotional, category, asset))
                 }
                 out to cursor
             } catch (_: Exception) {
@@ -290,7 +297,7 @@ class ContractCatalogRepo(
                             }
                         }
                     }
-                    out.add(ContractInfo(sym, base, quote, tick, minQty, null, source, qStep, minNotional))
+                    out.add(ContractInfo(sym, base, quote, tick, minQty, null, source, qStep, minNotional, if (source.contains("Futures")) "linear" else "spot"))
                 }
                 out
             } catch (_: Exception) {

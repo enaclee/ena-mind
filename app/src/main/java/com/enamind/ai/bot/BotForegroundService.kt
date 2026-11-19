@@ -24,7 +24,7 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 
 /**
- * Foreground-сервис торгового бота ENA (android:foregroundServiceType="dataSync").
+ * Foreground-сервис торгового бота ENΛVERSE (android:foregroundServiceType="dataSync").
  *
  * Гарантии надёжности:
  *  - Удерживает PARTIAL_WAKE_LOCK только пока бот запущен и освобождает его при остановке;
@@ -92,7 +92,7 @@ class BotForegroundService : Service() {
             else ->
                 "Android 15 завершил фоновый сервис по таймауту (6ч). Позиция ${cfg.symbol} оставлена под защитой биржи."
         }
-        postHighPriorityAlert(this, "Сервис остановлен системой", body)
+        EnaApp.get().state.notifications.post("bot_timeout", "Сервис остановлен системой", body)
         botEngine?.handleAndroid15ServiceTimeout()
         releaseWakeLock()
         stopSelf()
@@ -160,7 +160,7 @@ class BotForegroundService : Service() {
         val stats = st.activeModeStats
         val wrPart = if (stats.totalTrades > 0) "WR ${"%.0f%%".format(Locale.US, stats.winratePct)}" else "WR —"
         val pos = st.activePosition
-        val title = "ENA Бот · ${st.config.mode.shortLabel} · ${st.config.symbol}"
+        val title = "ENΛVERSE · Бот · ${st.config.mode.shortLabel} · ${st.config.symbol}"
         val text = if (pos != null) {
             "${pos.side.labelRu} ${String.format(Locale.US, "%+.2f%%", pos.netPnlPct)} (${String.format(Locale.US, "%+.2f", pos.netPnlUsdt)} USDT) · $wrPart"
         } else {
@@ -194,7 +194,7 @@ class BotForegroundService : Service() {
             nm.createNotificationChannel(
                 NotificationChannel(
                     CHANNEL_ONGOING,
-                    "Торговый бот ENA",
+                    "Торговый бот ENΛVERSE",
                     NotificationManager.IMPORTANCE_LOW
                 ).apply {
                     description = "Постоянный статус работы бота, пары, PnL и Winrate"
@@ -204,7 +204,7 @@ class BotForegroundService : Service() {
             nm.createNotificationChannel(
                 NotificationChannel(
                     CHANNEL_ALERTS,
-                    "Критические уведомления бота ENA",
+                    "Критические уведомления бота ENΛVERSE",
                     NotificationManager.IMPORTANCE_HIGH
                 ).apply {
                     description = "Уведомления об остановке сервиса Android 15 и закрытии позиций"

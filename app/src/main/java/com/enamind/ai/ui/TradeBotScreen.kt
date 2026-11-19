@@ -199,7 +199,7 @@ private fun BotHeaderControlCard(
     }
 
     BotSectionCard(
-        title = "ТОРГОВЫЙ БОТ ENA",
+        title = "ТОРГОВЫЙ БОТ ENΛVERSE",
         subtitle = "Order Flow + Radar · ${cfg.mode.labelRu}",
         icon = Icons.Outlined.SmartToy,
         badgeText = if (uiState.running) "РАБОТАЕТ" else "ПАУЗА",
@@ -255,7 +255,7 @@ private fun BotHeaderControlCard(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Text(
-            "Стратегия: ${cfg.strategyModel.labelRu} · Статус: ${uiState.statusText}",
+            "Стратегия: ${if (cfg.enacoreBridge) "ENΛCORE" else "Ручной режим"} · Статус: ${uiState.statusText}",
             fontSize = 11.sp,
             fontFamily = FontFamily.Monospace,
             color = MaterialTheme.colorScheme.onSurface

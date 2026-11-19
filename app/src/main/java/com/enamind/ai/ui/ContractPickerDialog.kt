@@ -1,6 +1,9 @@
 package com.enamind.ai.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material3.FilterChip
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -67,10 +70,12 @@ fun ContractPickerDialog(
     val catalogState by state.contractCatalog.state.collectAsState()
     val favorites by state.favoriteSymbols.collectAsState()
     var query by remember { mutableStateOf("") }
+    var category by remember { mutableStateOf("Все") }
+    val active by state.activeInstrument.collectAsState()
 
     BackHandler(onBack = onDismiss)
 
-    val itemsToShow = remember(catalogState.contracts, favorites, query) {
+    val itemsToShow = remember(catalogState.contracts, favorites, query, category) {
         val baseList: List<ContractCatalogRepo.ContractInfo> = if (catalogState.contracts.isNotEmpty()) {
             catalogState.contracts
         } else {
@@ -82,7 +87,7 @@ fun ContractPickerDialog(
                     tickSize = null,
                     minOrderQty = null,
                     maxLeverage = null,
-                    source = "базовый"
+                    source = "Bybit"
                 )
             }
         }
@@ -94,7 +99,14 @@ fun ContractPickerDialog(
                 it.symbol.contains(cleanQuery) || it.baseCoin.contains(cleanQuery)
             }
         }
-        filtered.sortedWith(
+        filtered.filter { c -> when (category) {
+            "Крипто" -> c.assetClass == "Крипто" && c.category == "linear"
+            "Металлы / RWA" -> c.assetClass == "Металлы / RWA"
+            "Спот" -> c.category == "spot"
+            "Инверсные" -> c.category == "inverse"
+            "Избранное" -> c.key in favorites || c.symbol in favorites
+            else -> true
+        } }.sortedWith(
             compareByDescending<ContractCatalogRepo.ContractInfo> { favorites.contains(it.symbol) }
                 .thenByDescending { it.symbol == currentSymbol }
                 .thenBy { it.symbol }
@@ -193,6 +205,11 @@ fun ContractPickerDialog(
                     )
                 )
 
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("Все", "Крипто", "Металлы / RWA", "Спот", "Инверсные", "Избранное").forEach { label ->
+                        FilterChip(selected = category == label, onClick = { category = label }, label = { Text(label) }, modifier = Modifier.heightIn(min = 48.dp))
+                    }
+                }
                 catalogState.error?.let { err ->
                     Text(
                         err,
@@ -224,14 +241,14 @@ fun ContractPickerDialog(
                         contentPadding = PaddingValues(vertical = 2.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        items(itemsToShow, key = { it.symbol }) { c ->
-                            val isSelected = c.symbol == currentSymbol
-                            val isFav = favorites.contains(c.symbol)
+                        items(itemsToShow, key = { it.key }) { c ->
+                            val isSelected = c.key == active.key
+                            val isFav = favorites.contains(c.key) || favorites.contains(c.symbol)
                             Surface(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
-                                        onSelect(c.symbol)
+                                        if (state.selectInstrument(c)) onSelect(c.symbol)
                                         onDismiss()
                                     }
                                     .testTag("contract_row_${c.symbol}"),
@@ -268,7 +285,7 @@ fun ContractPickerDialog(
                                                 color = MaterialTheme.colorScheme.surfaceVariant
                                             ) {
                                                 Text(
-                                                    c.source,
+                                                    "${c.source} · ${c.category}",
                                                     fontSize = 9.sp,
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                     maxLines = 1,
@@ -291,7 +308,7 @@ fun ContractPickerDialog(
                                         }
                                     }
                                     IconButton(
-                                        onClick = { state.toggleFavoriteSymbol(c.symbol) },
+                                        onClick = { state.toggleFavoriteSymbol(c.key) },
                                         modifier = Modifier
                                             .minimumInteractiveComponentSize()
                                             .testTag("contract_fav_${c.symbol}")

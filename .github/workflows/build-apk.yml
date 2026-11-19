@@ -1,4 +1,4 @@
-name: Build ENA APK
+name: Build ENAVERSE APK
 
 on:
   push:
@@ -73,6 +73,9 @@ jobs:
           gradle-version: '9.3.1'
           cache-provider: 'basic'
 
+      - name: Run ENACORE deterministic regressions
+        run: python3 -m unittest discover -s app/src/test/python -v
+
       - name: Run Python skill tests
         run: python3 ena-mind/tests/run_tests.py
 
@@ -81,18 +84,18 @@ jobs:
           JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
         run: gradle :app:testDebugUnitTest :app:assembleDebug --no-daemon
 
-      - name: Upload ENA test reports on failure
-        if: failure()
+      - name: Upload ENAVERSE test reports
+        if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: ENA-test-reports
+          name: ENAVERSE-test-reports
           path: app/build/reports/tests/**
           if-no-files-found: ignore
 
-      - name: Upload ENA APK artifact
+      - name: Upload ENAVERSE APK artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ENA-debug-apk
+          name: ENAVERSE-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 

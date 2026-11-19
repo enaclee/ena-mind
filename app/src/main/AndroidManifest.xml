@@ -35,6 +35,8 @@
             </intent-filter>
         </activity>
 
+        <service android:name="com.enamind.ai.overlay.WidgetOverlayService" android:exported="false" android:foregroundServiceType="dataSync" />
+
         <service
             android:name="com.enamind.ai.core.EngineService"
             android:exported="false"

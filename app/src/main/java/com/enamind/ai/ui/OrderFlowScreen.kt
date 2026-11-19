@@ -37,6 +37,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
+import com.enamind.ai.orderflow.GlowSignal
+import com.enamind.ai.orderflow.GlowColorState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -96,9 +102,10 @@ fun OrderFlowScreen(state: AppState) {
 
     val ivLabel = Settings.INTERVALS.firstOrNull { it.first == market.interval }?.second ?: market.interval
     val quickPairs = remember(favorites, market.symbol) {
-        (listOf(market.symbol) + favorites.toList() + Settings.SYMBOLS).distinct()
+        (listOf(market.symbol) + favorites.map { it.substringAfterLast(":") } + Settings.SYMBOLS).distinct()
     }
 
+    CompositionLocalProvider(LocalOrderFlowGlow provides report.glow) {
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -213,7 +220,10 @@ fun OrderFlowScreen(state: AppState) {
             ExplanationAndScenariosAreaCard(report)
         }
     }
+    }
 }
+
+private val LocalOrderFlowGlow = staticCompositionLocalOf { GlowSignal() }
 
 @Composable
 private fun OrderFlowSectionCard(
@@ -225,11 +235,17 @@ private fun OrderFlowSectionCard(
     badgeColor: Color,
     content: @Composable ColumnScope.() -> Unit
 ) {
+    val glow = LocalOrderFlowGlow.current
+    val edge by animateColorAsState(targetValue = when (glow.colorState) {
+        GlowColorState.GREEN -> enaGreenText()
+        GlowColorState.RED -> MaterialTheme.colorScheme.error
+        GlowColorState.NEUTRAL -> MaterialTheme.colorScheme.outlineVariant
+    }, animationSpec = tween(650), label = "flow_card_pressure")
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(0.9.dp, MaterialTheme.colorScheme.outlineVariant)
+        border = BorderStroke((0.9f + glow.strength * 1.2f).dp, edge)
     ) {
         Column(
             modifier = Modifier.padding(14.dp),
@@ -768,7 +784,7 @@ private fun ExplanationAndScenariosAreaCard(report: OrderFlowReport) {
 
     OrderFlowSectionCard(
         indexLabel = "5",
-        title = "ОБЪЯСНЕНИЕ ENA, СЦЕНАРИИ И ДОСТОВЕРНОСТЬ",
+        title = "ОБЪЯСНЕНИЕ ENΛVERSE, СЦЕНАРИИ И ДОСТОВЕРНОСТЬ",
         subtitle = "Без автоматических BUY/SELL — интерпретация борьбы сторон",
         icon = Icons.Outlined.Psychology,
         badgeText = conf.grade.labelRu,

@@ -1,7 +1,6 @@
 package com.enamind.ai.bot
 
 import com.enamind.ai.bot.strategy.OrderExecutionPreference
-import com.enamind.ai.bot.strategy.StrategyModelId
 import com.enamind.ai.core.NetworkHub
 import java.util.Locale
 
@@ -209,7 +208,12 @@ data class BotConfig(
     val timeoutBehavior: TimeoutBehavior = TimeoutBehavior.KEEP_EXCHANGE_PROTECTION,
     val paperStartBalanceUsdt: Double = 1000.0,
     // Слой 4 & 5: изолированная стратегия, PostOnly Maker и траншевый движок продолжения
-    val strategyModel: StrategyModelId = StrategyModelId.FLOW_PULSE_CONTINUATION,
+    val enacoreBridge: Boolean = false,
+    val instrumentCategory: String = "linear",
+    val instrumentVenue: String = "Bybit",
+    val entryDeltaPct: Double = 14.0,
+    val entryOfi: Double = 0.16,
+    val maxSpreadPct: Double = 0.15,
     val executionPreference: OrderExecutionPreference = OrderExecutionPreference.MAKER_POST_ONLY,
     val makerFallbackPolicy: MakerFallbackPolicy = MakerFallbackPolicy.FALLBACK_MARKET,
     val maxTranches: Int = 3,
@@ -276,7 +280,9 @@ data class ActivePosition(
     val makerFeePct: Double = 0.036,
     val takerFeePct: Double = 0.10,
     val exitFeeRatePct: Double = 0.036,
-    val peelDone: Boolean = false
+    val peelDone: Boolean = false,
+    val coreTargetNetPct: Double? = null,
+    val coreHorizonMin: Int? = null
 ) {
     val trancheCount: Int get() = tranches.size.coerceAtLeast(1)
     val lastTranchePrice: Double get() = tranches.lastOrNull()?.entryPrice ?: entryPrice

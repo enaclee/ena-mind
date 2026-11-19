@@ -1,6 +1,14 @@
 package com.enamind.ai
 
 import android.os.Bundle
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.*
+import androidx.compose.foundation.pager.*
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import com.enamind.ai.ui.EnacoreScreen
+import com.enamind.ai.ui.ContractPickerDialog
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -126,7 +134,9 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            EnaMindTheme(themeSetting) {
+            val appearanceRevision by state.settings.appearanceRevision.collectAsState()
+            val appliedTheme = remember(appearanceRevision) { state.settings.theme }
+            EnaMindTheme(appliedTheme, state.settings.accentColor, state.settings.rgbDarkBase) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     Box(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
                         if (!onboardingDone) {
@@ -147,162 +157,73 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private data class TabSpec(
-    val label: String,
-    val compactLabel: String,
-    val weight: Float,
-    val selectedIcon: ImageVector,
-    val unselectedIcon: ImageVector
-)
 
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-private fun MainScaffold(
-    state: AppState,
-    toast: String?,
-    onThemeChange: (Settings.Theme) -> Unit,
-    settingsTab: Int,
-    onOpenSettingsTab: (Int) -> Unit
-) {
-    // 0 ORDER FLOW | 1 ИИ ЧАТ | 2 БОТ | 3 РЫНОК | 4 РАДАР | 5 НАСТРОЙКИ
-    var tab by rememberSaveable { mutableIntStateOf(0) }
-    var settingsOpen by remember { mutableStateOf(false) }
-
-    BackHandler(enabled = tab != 0) {
-        settingsOpen = false
-        tab = 0
+private fun MainScaffold(state: AppState, toast: String?, onThemeChange: (Settings.Theme) -> Unit,
+                         settingsTab: Int, onOpenSettingsTab: (Int) -> Unit) {
+    val labels = listOf("ORDER FLOW", "ENΛCORE", "ИИ ЧАТ", "БОТ", "РЫНОК", "РАДАР", "НАСТРОЙКИ")
+    val icons = listOf(Icons.Outlined.Timeline, Icons.Outlined.AutoAwesome, Icons.Outlined.AutoAwesome,
+        Icons.Outlined.SmartToy, Icons.Outlined.BarChart, Icons.Outlined.Radar, Icons.Outlined.Settings)
+    val pager = rememberPagerState(pageCount = { labels.size })
+    val nav = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val instrument by state.activeInstrument.collectAsState()
+    val ime = WindowInsets.isImeVisible
+    var picker by remember { mutableStateOf(false) }
+    BackHandler(pager.currentPage != 0) { scope.launch { pager.animateScrollToPage(0) } }
+    LaunchedEffect(pager.currentPage) {
+        nav.animateScrollToItem(pager.currentPage)
+        val info = nav.layoutInfo
+        val item = info.visibleItemsInfo.firstOrNull { it.index == pager.currentPage }
+        if (item != null) nav.animateScrollToItem(pager.currentPage,
+            -((info.viewportEndOffset - info.viewportStartOffset - item.size) / 2).coerceAtLeast(0))
     }
-
-    LaunchedEffect(settingsTab, settingsOpen) {
-        if (settingsOpen) tab = 5
-    }
-
-    val tabs = listOf(
-        TabSpec("ORDER FLOW", "ORDER FLOW", 1.38f, Icons.Filled.Timeline, Icons.Outlined.Timeline),
-        TabSpec("ИИ ЧАТ", "ИИ ЧАТ", 0.94f, Icons.Filled.AutoAwesome, Icons.Outlined.AutoAwesome),
-        TabSpec("БОТ", "БОТ", 0.86f, Icons.Filled.SmartToy, Icons.Outlined.SmartToy),
-        TabSpec("РЫНОК", "РЫНОК", 0.92f, Icons.Filled.BarChart, Icons.Outlined.BarChart),
-        TabSpec("РАДАР", "РАДАР", 0.92f, Icons.Filled.Radar, Icons.Outlined.Radar),
-        TabSpec("НАСТРОЙКИ", "НАСТР.", 0.98f, Icons.Filled.Settings, Icons.Outlined.Settings)
-    )
-
-    Box(modifier = Modifier.fillMaxSize()) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
-                when (tab) {
-                    0 -> OrderFlowScreen(state = state)
-                    1 -> AiChatScreen(
-                        state = state,
-                        onOpenAiSettings = {
-                            onOpenSettingsTab(1)
-                            settingsOpen = true
-                            tab = 5
-                        }
-                    )
-                    2 -> TradeBotScreen(state = state)
-                    3 -> MarketMonitor(state = state)
-                    4 -> RadarSentinelScreen(state = state)
-                    else -> SettingsScreen(
-                        state = state,
-                        onThemeChange = onThemeChange,
-                        onClose = { settingsOpen = false; tab = 0 },
-                        initialTab = if (settingsOpen) settingsTab else 0
-                    )
+    if (picker) ContractPickerDialog(state, instrument.symbol, {}, { picker = false })
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding()) {
+            if (!ime) Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("ENΛVERSE", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                TextButton(onClick = { picker = true }) {
+                    Text("${instrument.symbol} · ${instrument.category}", fontSize = 11.sp)
                 }
             }
-
-            // Нижняя панель навигации внутри Dynamic Market Glow (адаптивно под 360dp, без обрезания ORDER FLOW)
-            DynamicMarketGlowPanel(state = state) {
-                BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-                    val isCompactWidth = maxWidth < 380.dp
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(64.dp)
-                            .padding(horizontal = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        tabs.forEachIndexed { i, t ->
-                            val isSelected = tab == i
-                            val itemColor = if (isSelected) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            }
-                            val interaction = remember { MutableInteractionSource() }
-                            Column(
-                                modifier = Modifier
-                                    .weight(t.weight)
-                                    .widthIn(min = 48.dp)
-                                    .height(58.dp)
-                                    .minimumInteractiveComponentSize()
-                                    .clip(RoundedCornerShape(14.dp))
-                                    .clickable(
-                                        interactionSource = interaction,
-                                        indication = ripple(bounded = true),
-                                        onClick = { settingsOpen = false; tab = i }
-                                    )
-                                    .semantics {
-                                        selected = isSelected
-                                        role = Role.Tab
-                                    }
-                                    .testTag("nav_tab_$i"),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.Center
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(
-                                            if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f)
-                                            else Color.Transparent
-                                        )
-                                        .padding(horizontal = 10.dp, vertical = 3.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = if (isSelected) t.selectedIcon else t.unselectedIcon,
-                                        contentDescription = t.label,
-                                        tint = itemColor,
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                }
-                                Spacer(Modifier.height(2.dp))
-                                Text(
-                                    text = if (isCompactWidth) t.compactLabel else t.label,
-                                    fontSize = 9.sp,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                    color = itemColor,
-                                    maxLines = 1,
-                                    softWrap = false,
-                                    overflow = TextOverflow.Clip
-                                )
+            HorizontalPager(state = pager, beyondViewportPageCount = 1,
+                modifier = Modifier.fillMaxWidth().weight(1f).testTag("main_pager")) { page ->
+                when (page) {
+                    0 -> OrderFlowScreen(state)
+                    1 -> EnacoreScreen(state)
+                    2 -> AiChatScreen(state, onOpenAiSettings = { scope.launch { pager.animateScrollToPage(6) } })
+                    3 -> TradeBotScreen(state)
+                    4 -> MarketMonitor(state)
+                    5 -> RadarSentinelScreen(state)
+                    6 -> SettingsScreen(state, onThemeChange = onThemeChange, onClose = { scope.launch { pager.animateScrollToPage(0) } }, initialTab = settingsTab)
+                }
+            }
+            if (!ime) DynamicMarketGlowPanel(state) {
+                LazyRow(state = nav, modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    itemsIndexed(labels) { index, label ->
+                        val chosen = pager.currentPage == index
+                        Surface(shape = RoundedCornerShape(16.dp), color = if (chosen) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface) {
+                            Column(Modifier.widthIn(min = 84.dp).heightIn(min = 60.dp)
+                                .clickable { scope.launch { pager.animateScrollToPage(index) } }
+                                .semantics { selected = chosen; role = Role.Tab }
+                                .testTag("nav_tab_$index").padding(horizontal = 12.dp, vertical = 8.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                                Icon(icons[index], contentDescription = null, modifier = Modifier.size(21.dp),
+                                    tint = if (chosen) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+                                Spacer(Modifier.height(4.dp))
+                                Text(label, fontSize = 11.sp, maxLines = 1, softWrap = false, fontWeight = FontWeight.SemiBold)
                             }
                         }
                     }
                 }
             }
         }
-
-        toast?.let { msg ->
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(horizontal = 20.dp, vertical = 124.dp),
-                shape = RoundedCornerShape(14.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
-                border = BorderStroke(0.8.dp, MaterialTheme.colorScheme.outline),
-                shadowElevation = 4.dp
-            ) {
-                Text(
-                    msg,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
-                )
-            }
-        }
+        toast?.let { Surface(Modifier.align(Alignment.BottomCenter).padding(20.dp, 100.dp),
+            shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.inverseSurface) {
+            Text(it, Modifier.padding(12.dp), color = MaterialTheme.colorScheme.inverseOnSurface)
+        } }
     }
 }
-

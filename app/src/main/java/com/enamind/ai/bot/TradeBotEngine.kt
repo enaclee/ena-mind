@@ -5,7 +5,8 @@ import com.enamind.ai.bot.strategy.MarketContextSnapshot
 import com.enamind.ai.bot.strategy.OpenPositionContext
 import com.enamind.ai.bot.strategy.OrderExecutionPreference
 import com.enamind.ai.bot.strategy.StrategyDecision
-import com.enamind.ai.bot.strategy.StrategyRegistry
+import com.enamind.ai.core.ActiveInstrument
+import com.enamind.ai.core.EnacoreSnapshot
 import com.enamind.ai.bybit.ContractCatalogRepo
 import com.enamind.ai.core.AppState
 import com.enamind.ai.intelligence.ExchangeClockSync
@@ -15,6 +16,7 @@ import com.enamind.ai.orderflow.GlowColorState
 import com.enamind.ai.orderflow.LevelAttackPhase
 import com.enamind.ai.orderflow.MarketDominance
 import com.enamind.ai.orderflow.OrderFlowReport
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -57,7 +59,10 @@ class TradeBotEngine(
     private val anchorsProvider: (String) -> MarketAnchorsSnapshot? = { null },
     private val clockSync: ExchangeClockSync = ExchangeClockSync(),
     private val onServiceStateChanged: (shouldRunService: Boolean) -> Unit = {},
-    private val onNotify: (BotStatusNotification) -> Unit = {}
+    private val onNotify: (BotStatusNotification) -> Unit = {},
+    private val coreProvider: () -> EnacoreSnapshot = { EnacoreSnapshot() },
+    private val instrumentProvider: () -> ActiveInstrument = { ActiveInstrument() },
+    private val onCorePosition: (String, String, Boolean, Double) -> Unit = { _, _, _, _ -> }
 ) {
     data class NetPnlResult(
         val grossPnlUsdt: Double,
@@ -103,6 +108,7 @@ class TradeBotEngine(
     )
     val uiState: StateFlow<BotUiState> = _uiState
 
+    private var startupJob: Job? = null
     private var loopJob: Job? = null
     private var privateWs: BybitV5TradingClient.PrivateWsHandle? = null
 
@@ -133,9 +139,14 @@ class TradeBotEngine(
     fun updateConfig(transform: (BotConfig) -> BotConfig) {
         val prev = _uiState.value.config
         val raw = transform(prev)
+        if ((_uiState.value.running || _uiState.value.activePosition != null) &&
+            (raw.symbol != prev.symbol || raw.instrumentCategory != prev.instrumentCategory || raw.mode != prev.mode || raw.enacoreBridge != prev.enacoreBridge)) {
+            _uiState.value = _uiState.value.copy(lastError = "Остановите бота и завершите позицию перед сменой режима")
+            return
+        }
         val cleanSymbol = raw.symbol.trim().uppercase().ifBlank { "BTCUSDT" }
-        val contract = contractCatalog.findContract(cleanSymbol)
-        val maxLev = (contract?.maxLeverage?.toInt() ?: 125).coerceIn(1, 125)
+        val contract = contractCatalog.findContract(cleanSymbol, raw.instrumentCategory)
+        val maxLev = if (raw.instrumentCategory == "spot") 1 else (contract?.maxLeverage?.toInt() ?: 1).coerceIn(1, 125)
         val maxTr = raw.maxTranches.coerceIn(1, 4)
         val cleanWeights = if (raw.trancheWeightsPct.size == maxTr && raw.trancheWeightsPct.all { it > 0 }) {
             raw.trancheWeightsPct
@@ -167,7 +178,7 @@ class TradeBotEngine(
             else -> _uiState.value.walletBalanceUsdt
         }
         val feeProfile = if (!clean.mode.isLiveExchange || modeChanged || symChanged) {
-            BybitV5TradingClient.defaultFeeProfile(clean.symbol)
+            if (clean.instrumentCategory == "spot") BybitV5TradingClient.FeeProfile(.1, .1, false) else BybitV5TradingClient.defaultFeeProfile(clean.symbol)
         } else {
             BybitV5TradingClient.FeeProfile(
                 makerFeePct = _uiState.value.makerFeePct,
@@ -200,7 +211,7 @@ class TradeBotEngine(
         val cfg = _uiState.value.config
         if (!cfg.mode.isLiveExchange) {
             val paperBal = computePaperBalance(cfg.paperStartBalanceUsdt, _uiState.value.statsByMode[BotMode.PAPER])
-            val feeProfile = BybitV5TradingClient.defaultFeeProfile(cfg.symbol)
+            val feeProfile = if (cfg.instrumentCategory == "spot") BybitV5TradingClient.FeeProfile(.1, .1, false) else BybitV5TradingClient.defaultFeeProfile(cfg.symbol)
             val effCap = computeEffectiveCapital(cfg.capitalUsdt, paperBal)
             val sideFee = feeProfile.effectiveSidePct(cfg.executionPreference == OrderExecutionPreference.MAKER_POST_ONLY)
             val contract = contractCatalog.findContract(cfg.symbol)
@@ -254,7 +265,19 @@ class TradeBotEngine(
     fun startBot(mainnetExplicitConfirmed: Boolean = false) {
         val st = _uiState.value
         val cfg = st.config
-        if (st.running) return
+        if (st.running || st.closing) return
+        if (instrumentProvider().quoteCoin != "USDT") {
+            _uiState.value = st.copy(lastError = "Бот ведёт баланс и PnL в USDT. Выбранная котируемая валюта доступна для анализа.")
+            return
+        }
+        if (cfg.instrumentCategory == "inverse") {
+            _uiState.value = st.copy(lastError = "Инверсные контракты доступны для анализа. Бот использует линейную модель расчёта объёма и PnL.")
+            return
+        }
+        if (cfg.mode.isLiveExchange && (cfg.instrumentCategory != "linear" || cfg.instrumentVenue != "Bybit")) {
+            _uiState.value = st.copy(lastError = "Исполнение на бирже доступно для Bybit Linear. Для выбранного рынка используйте Paper.")
+            return
+        }
 
         if (cfg.mode == BotMode.BYBIT_MAINNET && !mainnetExplicitConfirmed && !st.mainnetConfirmedSession) {
             _uiState.value = st.copy(lastError = "Требуется подтверждение запуска на реальном счёте Bybit Mainnet")
@@ -280,12 +303,13 @@ class TradeBotEngine(
             running = true,
             lastError = null,
             mainnetConfirmedSession = if (cfg.mode == BotMode.BYBIT_MAINNET) true else st.mainnetConfirmedSession,
-            statusText = "Запуск (${cfg.mode.shortLabel}) · ${cfg.strategyModel.shortLabel} · ${cfg.symbol}…",
+            statusText = "Запуск (${cfg.mode.shortLabel}) · ${if (cfg.enacoreBridge) "ENΛCORE" else "Ручной режим"} · ${cfg.symbol}…",
             waitReasonBadge = "Подготовка ${cfg.symbol}…"
         )
         onServiceStateChanged(true)
 
-        scope.launch {
+        startupJob = scope.launch {
+            tradeMutex.withLock {
             if (cfg.mode.isLiveExchange) {
                 val slot = vaultStore.loadCredentialSlot(cfg.mode)
                 val probe = withContext(Dispatchers.IO) {
@@ -319,9 +343,16 @@ class TradeBotEngine(
                 val p = probe.data
                 val effCap = computeEffectiveCapital(cfg.capitalUsdt, p.walletUsdt)
                 val sideFee = if (cfg.executionPreference == OrderExecutionPreference.MAKER_POST_ONLY) p.makerFeePct else p.takerFeePct
-                val existingPos = withContext(Dispatchers.IO) {
+                val existingResult = withContext(Dispatchers.IO) {
                     client.fetchOpenPosition(cfg.mode, slot, cfg.symbol)
-                }.data
+                }
+                if (!existingResult.ok) {
+                    _uiState.value = _uiState.value.copy(running = false, exchangeConnected = false,
+                        lastError = "Не удалось проверить открытую позицию: ${existingResult.message}")
+                    onServiceStateChanged(false)
+                    return@launch
+                }
+                val existingPos = existingResult.data
                 if (existingPos != null && existingPos.size > 0.0 && existingPos.side != null) {
                     val adopted = buildInitialPosition(
                         id = "adopted_${cfg.symbol}_${System.currentTimeMillis()}",
@@ -358,8 +389,8 @@ class TradeBotEngine(
                     trailingNoiseWarning = computeTrailingNoiseWarning(cfg),
                     exchangeConnected = true,
                     isUtaAccount = p.isUta,
-                    statusText = "${cfg.mode.shortLabel} активен · ${cfg.strategyModel.shortLabel} · ${cfg.symbol}",
-                    waitReasonBadge = "Поиск сигнала (${cfg.strategyModel.shortLabel})"
+                    statusText = "${cfg.mode.shortLabel} активен · ${if (cfg.enacoreBridge) "ENΛCORE" else "Ручной режим"} · ${cfg.symbol}",
+                    waitReasonBadge = "Поиск сигнала (${if (cfg.enacoreBridge) "ENΛCORE" else "Ручной режим"})"
                 )
                 startPrivateWs(cfg.mode, slot)
             } else {
@@ -378,19 +409,24 @@ class TradeBotEngine(
                     minNotionalWarning = validateTrancheMinimum(cfg, effCap, marketProvider().price, contract),
                     trailingNoiseWarning = computeTrailingNoiseWarning(cfg),
                     exchangeConnected = true,
-                    statusText = "PAPER активен · ${cfg.strategyModel.shortLabel} · ${cfg.symbol}",
-                    waitReasonBadge = "Поиск сигнала (${cfg.strategyModel.shortLabel})"
+                    statusText = "PAPER активен · ${if (cfg.enacoreBridge) "ENΛCORE" else "Ручной режим"} · ${cfg.symbol}",
+                    waitReasonBadge = "Поиск сигнала (${if (cfg.enacoreBridge) "ENΛCORE" else "Ручной режим"})"
                 )
             }
 
+            kotlin.coroutines.coroutineContext.ensureActive()
+            if (!_uiState.value.running) return@withLock
             loopJob?.cancel()
             loopJob = scope.launch {
                 runBotLoop()
+            }
             }
         }
     }
 
     fun stopBotOnly(reason: String = "Остановлен пользователем") {
+        startupJob?.cancel()
+        startupJob = null
         loopJob?.cancel()
         loopJob = null
         privateWs?.close()
@@ -406,6 +442,9 @@ class TradeBotEngine(
     }
 
     fun stopAndCloseMarket(reason: String = "Аварийная остановка и закрытие по рынку") {
+        startupJob?.cancel()
+        startupJob = null
+        _uiState.value = _uiState.value.copy(running = false, closing = true)
         loopJob?.cancel()
         loopJob = null
         pendingSignalSide = null
@@ -427,9 +466,9 @@ class TradeBotEngine(
             _uiState.value = _uiState.value.copy(
                 running = false,
                 closing = false,
-                statusText = reason,
-                waitReasonBadge = "Остановлен",
-                chartOverlay = buildChartOverlay(_uiState.value.config.symbol, null, _uiState.value.recentTrades)
+                statusText = if (_uiState.value.activePosition == null) reason else "Бот остановлен; закрытие позиции ещё не подтверждено биржей",
+                waitReasonBadge = if (_uiState.value.activePosition == null) "Остановлен" else "Проверьте позицию на бирже",
+                chartOverlay = buildChartOverlay(_uiState.value.config.symbol, _uiState.value.activePosition, _uiState.value.recentTrades)
             )
             onServiceStateChanged(false)
         }
@@ -520,7 +559,11 @@ class TradeBotEngine(
     private suspend fun stepTickLocked() {
         val st = _uiState.value
         if (!st.running) return
-        val cfg = st.config
+        val pos = st.activePosition
+        val cfg = if (pos?.coreTargetNetPct != null) st.config.copy(targetBasis = TargetBasis.PRICE_MOVE_PCT,
+            minNetProfitPct = pos.coreTargetNetPct, maxProfitPct = pos.coreTargetNetPct,
+            maxHoldWaitMin = pos.coreHorizonMin ?: st.config.maxHoldWaitMin, allowUnlimitedHold = false) else st.config
+        if (marketProvider().symbol != cfg.symbol || reportProvider().symbol != cfg.symbol) return
         val report = reportProvider()
         val market = marketProvider()
         val (quantAdx, quantEr) = quantAdxErProvider()
@@ -555,7 +598,8 @@ class TradeBotEngine(
             livePrice = livePrice,
             nowMs = nowMs
         )
-        val strategy = StrategyRegistry.resolve(cfg.strategyModel)
+        val core = coreProvider()
+        val instrument = instrumentProvider()
         val active = st.activePosition
 
         if (active == null) {
@@ -597,7 +641,7 @@ class TradeBotEngine(
                 allowCounterAbsorption = cfg.allowCounterAbsorption,
                 requireRadarNotFlat = cfg.requireRadarNotFlat
             )
-            val decision = strategy.evaluate(snapshot, openCtx)
+            val decision = BotDecisionEngine.evaluate(snapshot, openCtx, cfg, core, instrument)
 
             val candidateSide = when (decision) {
                 is StrategyDecision.Enter -> {
@@ -668,7 +712,9 @@ class TradeBotEngine(
 
             pendingSignalSide = null
             openPositionInternal(
-                cfg = cfg,
+                cfg = if (cfg.enacoreBridge && core.targetPct != null && core.horizonMin != null) cfg.copy(
+                    targetBasis = TargetBasis.PRICE_MOVE_PCT, minNetProfitPct = core.targetPct,
+                    maxProfitPct = core.targetPct, maxHoldWaitMin = core.horizonMin, allowUnlimitedHold = false) else cfg,
                 side = side,
                 livePrice = livePrice,
                 nowMs = nowMs,
@@ -686,9 +732,16 @@ class TradeBotEngine(
         if (cfg.mode.isLiveExchange && (nowMs - lastExchangeSyncMs) >= 10_000L) {
             lastExchangeSyncMs = nowMs
             val slot = vaultStore.loadCredentialSlot(cfg.mode)
-            val liveExPos = withContext(Dispatchers.IO) {
+            val positionResult = withContext(Dispatchers.IO) {
                 client.fetchOpenPosition(cfg.mode, slot, active.symbol)
-            }.data
+            }
+            if (!positionResult.ok) {
+                _uiState.value = _uiState.value.copy(activePosition = currentPos,
+                    lastError = "Не удалось синхронизировать позицию: ${positionResult.message}",
+                    waitReasonBadge = "Ожидание подтверждения биржи")
+                return
+            }
+            val liveExPos = positionResult.data
             if (liveExPos == null || liveExPos.size <= 0.0) {
                 finalizeTradeRecord(currentPos, livePrice, "Исполнено/закрыто на бирже Bybit")
                 return
@@ -759,7 +812,7 @@ class TradeBotEngine(
             heldMs = (nowMs - currentPos.openedAtMs).coerceAtLeast(0L)
         )
 
-        val decision = strategy.evaluate(snapshot, openCtx)
+        val decision = BotDecisionEngine.evaluate(snapshot, openCtx, cfg, core, instrument)
         val signalStillAligned = when (decision) {
             is StrategyDecision.ScaleIn -> (decision.sideIsBuy == (currentPos.side == TradeSide.BUY))
             else -> (!snapshot.conflictDetected &&
@@ -875,7 +928,7 @@ class TradeBotEngine(
         val st = _uiState.value
         val makerPct = st.makerFeePct
         val takerPct = st.takerFeePct
-        val expectedRoundTripPct = if (orderPref == OrderExecutionPreference.MAKER_POST_ONLY) makerPct * 2.0 else takerPct * 2.0
+        val expectedRoundTripPct = (if (orderPref == OrderExecutionPreference.MAKER_POST_ONLY) makerPct else takerPct) + takerPct
 
         val slPrice = if (cfg.stopLossEnabled) {
             val slPct = effectiveStopLossPct(cfg, atr1mPct)
@@ -979,8 +1032,10 @@ class TradeBotEngine(
                 estLiquidationPrice = exPos?.liqPrice ?: estimateLiquidationPrice(side, actualEntry, cfg.leverage, cfg.marginMode),
                 serverTrailingStopPrice = exPos?.stopLoss ?: slPrice
             )
+            onCorePosition(created.id, created.symbol, true, 0.0)
             _uiState.value = _uiState.value.copy(
-                activePosition = created,
+                activePosition = created.copy(coreTargetNetPct = cfg.minNetProfitPct.takeIf { cfg.enacoreBridge },
+                    coreHorizonMin = cfg.maxHoldWaitMin.takeIf { cfg.enacoreBridge }),
                 lastError = null,
                 waitReasonBadge = "Открыт транш 1/${cfg.maxTranches}",
                 statusText = "Открыта ${side.labelRu} ${cfg.symbol} @ $actualEntry",
@@ -1006,8 +1061,10 @@ class TradeBotEngine(
                 reason = "$reason (${if (enteredAsMaker) "Maker" else "Taker"})",
                 atr1mPct = atr1mPct
             )
+            onCorePosition(created.id, created.symbol, true, 0.0)
             _uiState.value = _uiState.value.copy(
-                activePosition = created,
+                activePosition = created.copy(coreTargetNetPct = cfg.minNetProfitPct.takeIf { cfg.enacoreBridge },
+                    coreHorizonMin = cfg.maxHoldWaitMin.takeIf { cfg.enacoreBridge }),
                 lastError = null,
                 waitReasonBadge = "PAPER: транш 1/${cfg.maxTranches}",
                 statusText = "PAPER: открыта ${side.labelRu} ${cfg.symbol} @ $livePrice",
@@ -1250,10 +1307,16 @@ class TradeBotEngine(
                     stopLossFormatted = null
                 )
             }
-            if (!res.ok && !forceMarket) {
+            if (!res.ok) {
                 _uiState.value = _uiState.value.copy(
                     lastError = "Ошибка закрытия на бирже: ${res.message}"
                 )
+                return
+            }
+            val confirmedClose = withContext(Dispatchers.IO) { client.fetchOpenPosition(pos.mode, slot, pos.symbol) }
+            if (!confirmedClose.ok || (confirmedClose.data?.size ?: 0.0) > 0.0) {
+                _uiState.value = _uiState.value.copy(lastError = "Запрос закрытия отправлен; ожидается подтверждение биржи",
+                    activePosition = pos)
                 return
             }
             val bal = withContext(Dispatchers.IO) {
@@ -1302,7 +1365,7 @@ class TradeBotEngine(
     }
 
     private fun finalizeTradeRecord(pos: ActivePosition, exitPrice: Double, reason: String) {
-        val cfg = _uiState.value.config
+        val cfg = if (pos.coreTargetNetPct != null) _uiState.value.config.copy(targetBasis = TargetBasis.PRICE_MOVE_PCT) else _uiState.value.config
         val pnl = if (pos.paidEntryFeesUsdt > 0.0) {
             computeBlendedNetPnl(
                 side = pos.side,
@@ -1347,6 +1410,7 @@ class TradeBotEngine(
             won = won
         )
         recordClosedSlice(record)
+        onCorePosition(pos.id, pos.symbol, false, pnl.netPnlUsdt)
         _uiState.value = _uiState.value.copy(
             activePosition = null,
             statusText = "${pos.mode.shortLabel} · закрыта ${if (won) "+" else ""}${"%.2f".format(Locale.US, pnl.netPnlUsdt)} USDT ($reason)",
@@ -1438,7 +1502,7 @@ class TradeBotEngine(
         atr1mPct: Double? = null
     ): ActivePosition {
         val entryFeePct = if (enteredAsMaker) makerFeePct else takerFeePct
-        val exitFeePct = if (cfg.executionPreference == OrderExecutionPreference.MAKER_POST_ONLY) makerFeePct else takerFeePct
+        val exitFeePct = takerFeePct // Close and peel orders are Market, including after a Maker entry.
         val roundTripFeePct = entryFeePct + exitFeePct
         val paidEntryFeeUsdt = entryPrice * qty * (entryFeePct / 100.0)
         val usedMargin = (entryPrice * qty) / leverage.coerceAtLeast(1)

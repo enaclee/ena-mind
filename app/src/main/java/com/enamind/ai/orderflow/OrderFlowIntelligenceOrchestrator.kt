@@ -33,7 +33,24 @@ class OrderFlowIntelligenceOrchestrator(
     private var pendingGlowColor: GlowColorState = GlowColorState.NEUTRAL
     private var pendingGlowSinceMs: Long = 0L
     private var stableGlowColor: GlowColorState = GlowColorState.NEUTRAL
+    private var neutralSinceMs = 0L
 
+    @Volatile private var generation = 0L
+
+    @Synchronized
+    fun resetForInstrument(symbol: String, newGeneration: Long = generation + 1) {
+        generation = newGeneration
+        neutralSinceMs = 0L
+        pendingGlowSinceMs = 0L
+        pendingGlowColor = GlowColorState.NEUTRAL
+        streamHub.clearSymbol(symbol)
+        confirmedMarkersHistory.clear()
+        lastGlowSymbol = ""
+        stableGlowColor = GlowColorState.NEUTRAL
+        _report.value = OrderFlowReport(symbol = symbol)
+    }
+
+    @Synchronized
     fun evaluate(
         symbol: String,
         interval: String,
@@ -44,8 +61,10 @@ class OrderFlowIntelligenceOrchestrator(
         quantAdx: Double? = null,
         quantEr: Double? = null,
         signalConfirmMs: Long = DEFAULT_GLOW_CONFIRM_MS,
-        venueSyncWarning: String? = null
+        venueSyncWarning: String? = null,
+        expectedGeneration: Long = generation
     ): OrderFlowReport {
+        if (expectedGeneration != generation) return _report.value
         if (lastGlowSymbol != symbol) {
             lastGlowSymbol = symbol
             pendingGlowColor = GlowColorState.NEUTRAL
@@ -227,13 +246,22 @@ class OrderFlowIntelligenceOrchestrator(
         confirmMs: Long
     ): GlowSignal {
         // Сбой, рассинхрон, устаревание или конфликт сразу переводят свечение в NEUTRAL без задержки
-        if (freshness != DataFreshness.LIVE || rawGlow.conflictDetected || rawGlow.colorState == GlowColorState.NEUTRAL) {
+        if (freshness != DataFreshness.LIVE || rawGlow.conflictDetected) {
             pendingGlowColor = GlowColorState.NEUTRAL
             pendingGlowSinceMs = nowMs
             stableGlowColor = GlowColorState.NEUTRAL
             return rawGlow.copy(colorState = GlowColorState.NEUTRAL)
         }
 
+        if (rawGlow.colorState == GlowColorState.NEUTRAL) {
+            if (neutralSinceMs == 0L) neutralSinceMs = nowMs
+            if (nowMs - neutralSinceMs < 1200L && stableGlowColor != GlowColorState.NEUTRAL)
+                return rawGlow.copy(colorState = stableGlowColor, strength = 0.20f)
+            stableGlowColor = GlowColorState.NEUTRAL
+            pendingGlowColor = GlowColorState.NEUTRAL
+            return rawGlow
+        }
+        neutralSinceMs = 0L
         if (rawGlow.colorState == stableGlowColor) {
             pendingGlowColor = rawGlow.colorState
             return rawGlow
@@ -245,7 +273,7 @@ class OrderFlowIntelligenceOrchestrator(
         }
 
         val elapsed = (nowMs - pendingGlowSinceMs).coerceAtLeast(0L)
-        return if (elapsed >= confirmMs) {
+        return if (elapsed >= confirmMs.coerceAtMost(1500L)) {
             stableGlowColor = rawGlow.colorState
             rawGlow
         } else {
