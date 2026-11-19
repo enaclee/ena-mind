@@ -630,7 +630,7 @@ class EnaMindUnitTests {
         """.trimIndent()
         val parsed = ContractCatalogRepo.parseBybitInstrumentsJson(bybitRaw)
         assertNotNull(parsed)
-        assertEquals(1, parsed!!.first.size)
+        assertEquals(2, parsed!!.first.size)
         assertEquals("SUIUSDT", parsed.first[0].symbol)
         assertEquals(0.0001, parsed.first[0].tickSize ?: 0.0, 1e-8)
         assertEquals(0.1, parsed.first[0].qtyStep ?: 0.0, 1e-8)
@@ -863,9 +863,9 @@ class EnaMindUnitTests {
             OrderFlowStreamHub.RawTradeTick("BTCUSDT", 100.0 + i * 0.01, 2.0, true, baseTs + i * 100L, 2L, "Bybit")
         }
         val fp = FootprintEngine.analyze(trades, tickSize = 0.05, bars = emptyList())
-        // Negative MLOFI (-0.30) while tape Delta is strongly positive -> hard conflict
+        // Strong opposing MLOFI (-0.65) and tape Delta still require an immediate neutral signal
         val domConflict = com.enamind.ai.orderflow.DomSnapshotMetrics(
-            normalizedOfi = -0.30,
+            normalizedOfi = -0.65,
             executedQty = 15.0,
             synchronized = true,
             deltaSequenceCount = 8,

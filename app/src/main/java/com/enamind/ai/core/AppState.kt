@@ -67,7 +67,9 @@ class AppState(
     val activeInstrument: StateFlow<ActiveInstrument> = _activeInstrument
     val enacore by lazy { EnacoreEngine(ctx, this) }
     val notifications by lazy { AppNotifications(ctx, this) }
-    fun coreStreamTimes(): Pair<Long, Long> = lastBybitBookMs.get() to lastBybitTradeMs.get()
+    private val coreBookEventMs = AtomicLong(0L)
+    private val coreTradeEventMs = AtomicLong(0L)
+    fun coreStreamTimes(): Pair<Long, Long> = coreBookEventMs.get() to coreTradeEventMs.get()
     val majorCalendar = MajorCalendarRepo(ctx, settings)
     val orderFlow = OrderFlowIntelligenceOrchestrator(ctx)
     val botVault = BotVaultStore(ctx)
@@ -519,10 +521,13 @@ class AppState(
         activeRest = BybitRest(settings.bybitBaseUrl, selected.category)
         ws?.close()
         tape.clear()
+        liq.clear()
         anchorsCollector.reset()
         enacore.reset(selected)
         _klines.value = emptyList()
         _lastBar.value = null
+        coreBookEventMs.set(0L)
+        coreTradeEventMs.set(0L)
         lastBybitTickerMs.set(0L)
         lastBybitTradeMs.set(0L)
         lastBybitBookMs.set(0L)
@@ -592,19 +597,20 @@ class AppState(
             override fun onTrade(tr: BybitWs.Trade) {
                 if (activeInstrument.value.generation != generation) return
                 lastBybitTradeMs.set(System.currentTimeMillis())
-                tape.add(tr)
+                coreTradeEventMs.set(tr.tsMs - engine.clockSync.status().offsetMs)
+                tape.add(tr.copy(size = instrument.baseQuantity(tr.price, tr.size)))
                 enacore.onTrade(generation, tr)
                 anchorsCollector.recordPerpTrade(
                     symbol = sym,
                     price = tr.price,
-                    qty = tr.size,
+                    qty = instrument.baseQuantity(tr.price, tr.size),
                     isBuy = tr.side.equals("Buy", ignoreCase = true),
                     tsMs = tr.tsMs
                 )
                 orderFlow.streamHub.recordTrade(
                     symbol = sym,
                     price = tr.price,
-                    qty = tr.size,
+                    qty = instrument.baseQuantity(tr.price, tr.size),
                     isAggressiveBuy = tr.side.equals("Buy", ignoreCase = true),
                     exchangeTsMs = tr.tsMs,
                     lagMs = tr.lagMs,
@@ -618,24 +624,29 @@ class AppState(
                 lastBybitBookMs.set(System.currentTimeMillis())
                 orderFlow.streamHub.recordBookSnapshot(
                     symbol = sym,
-                    bids = bids.map { it.price to it.qty },
-                    asks = asks.map { it.price to it.qty },
+                    bids = bids.map { it.price to instrument.baseQuantity(it.price, it.qty) },
+                    asks = asks.map { it.price to instrument.baseQuantity(it.price, it.qty) },
                     synced = true,
                     tsMs = System.currentTimeMillis(),
                     venue = "Bybit"
                 )
-                _market.value = _market.value.copy(bids = bids.take(12), asks = asks.take(12))
+                _market.value = _market.value.copy(bids = bids.take(12).map { it.copy(qty = instrument.baseQuantity(it.price, it.qty)) },
+                    asks = asks.take(12).map { it.copy(qty = instrument.baseQuantity(it.price, it.qty)) })
             }
 
             override fun onBookDeltas(deltas: List<BookState.LevelDelta>, synced: Boolean, lagMs: Long) {
                 if (activeInstrument.value.generation != generation) return
-                orderFlow.streamHub.recordDomDeltas(sym, deltas, synced, lagMs, "Bybit")
+                if (synced) coreBookEventMs.set(System.currentTimeMillis() - lagMs) else coreBookEventMs.set(0L)
+                orderFlow.streamHub.recordDomDeltas(sym, deltas.map { it.copy(
+                    prevQty = instrument.baseQuantity(it.price, it.prevQty), newQty = instrument.baseQuantity(it.price, it.newQty),
+                    deltaQty = instrument.baseQuantity(it.price, it.deltaQty)) }, synced, lagMs, "Bybit")
             }
 
             override fun onLiquidation(l: BybitWs.Liquidation) {
                 if (activeInstrument.value.generation != generation) return
-                liq.add(l)
-                anchorsCollector.recordLiquidation(l.symbol, l.side, l.price, l.size, l.tsMs)
+                val baseSize = instrument.baseQuantity(l.price, l.size)
+                liq.add(l.copy(size = baseSize))
+                anchorsCollector.recordLiquidation(l.symbol, l.side, l.price, baseSize, l.tsMs)
                 val s = liq.stats(_market.value.symbol, System.currentTimeMillis())
                 _market.value = _market.value.copy(
                     liq1hUsd = s.optDouble("sum_usd_1h").takeIf { it.isFinite() },

@@ -87,7 +87,7 @@ fun ContractPickerDialog(
                     tickSize = null,
                     minOrderQty = null,
                     maxLeverage = null,
-                    source = "базовый"
+                    source = "Bybit"
                 )
             }
         }
@@ -285,7 +285,7 @@ fun ContractPickerDialog(
                                                 color = MaterialTheme.colorScheme.surfaceVariant
                                             ) {
                                                 Text(
-                                                    c.source,
+                                                    "${c.source} · ${c.category}",
                                                     fontSize = 9.sp,
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                     maxLines = 1,

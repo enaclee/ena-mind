@@ -784,7 +784,7 @@ private fun ExplanationAndScenariosAreaCard(report: OrderFlowReport) {
 
     OrderFlowSectionCard(
         indexLabel = "5",
-        title = "ОБЪЯСНЕНИЕ ENA, СЦЕНАРИИ И ДОСТОВЕРНОСТЬ",
+        title = "ОБЪЯСНЕНИЕ ENΛVERSE, СЦЕНАРИИ И ДОСТОВЕРНОСТЬ",
         subtitle = "Без автоматических BUY/SELL — интерпретация борьбы сторон",
         icon = Icons.Outlined.Psychology,
         badgeText = conf.grade.labelRu,

@@ -250,11 +250,11 @@ class ContractCatalogRepo(
                     val base = o.optString("baseCoin").uppercase(Locale.ROOT).ifBlank { sym.removeSuffix("USDT") }
                     val tick = o.optJSONObject("priceFilter")?.optString("tickSize")?.toDoubleOrNull()?.takeIf { it > 0 }
                     val lotObj = o.optJSONObject("lotSizeFilter")
-                    val minQty = lotObj?.optString("minOrderQty")?.toDoubleOrNull()?.takeIf { it > 0 }
-                    val qStep = lotObj?.optString("qtyStep")?.toDoubleOrNull()?.takeIf { it > 0 } ?: minQty
-                    val minNotional = lotObj?.optString("minNotionalValue")?.toDoubleOrNull()?.takeIf { it > 0 }
+                    val minQty = lotObj?.optString(if (category == "spot") "basePrecision" else "minOrderQty")?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 }
+                    val qStep = lotObj?.optString(if (category == "spot") "basePrecision" else "qtyStep")?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 } ?: minQty
+                    val minNotional = lotObj?.optString(if (category == "spot") "minOrderAmt" else "minNotionalValue")?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 }
                     val maxLev = o.optJSONObject("leverageFilter")?.optString("maxLeverage")?.toDoubleOrNull()?.takeIf { it > 0 }
-                    val asset = if (base in setOf("XAU", "XAG", "PAXG", "XAUT", "GOLD", "SILVER") || o.optString("symbolType").contains("xstock", true)) "Металлы / RWA" else "Крипто"
+                    val asset = if (base in setOf("XAU", "XAG", "PAXG", "XAUT", "GOLD", "SILVER") || o.optString("symbolType").contains("xstock", true) || o.optString("marketRegion").isNotBlank() || o.optString("underlyingTicker").isNotBlank()) "Металлы / RWA" else "Крипто"
                     out.add(ContractInfo(sym, base, quote, tick, minQty, if (category == "spot") 1.0 else maxLev, "Bybit", qStep, minNotional, category, asset))
                 }
                 out to cursor

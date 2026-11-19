@@ -29,7 +29,7 @@ data class EnacoreSnapshot(
 ) {
     fun isUsable(instrument: ActiveInstrument, now: Long): Boolean =
         key == instrument.key && generation == instrument.generation &&
-            now - computedAt in 0..6000 && bookAgeMs <= 6000 && tradeAgeMs <= 6000
+            now - computedAt in 0..6000 && bookAgeMs in 0..6000 && tradeAgeMs in 0..6000
 
     companion object {
         fun parse(o: JSONObject): EnacoreSnapshot {
@@ -66,18 +66,21 @@ class EnacoreEngine(private val ctx: Context, private val app: AppState) {
     private val _state = MutableStateFlow(EnacoreSnapshot())
     val state: StateFlow<EnacoreSnapshot> = _state
 
+    @Synchronized
     fun reset(instrument: ActiveInstrument) {
         pendingTrades.clear()
         liveBars.clear()
         _state.value = EnacoreSnapshot(key = instrument.key, generation = instrument.generation)
     }
 
+    @Synchronized
     fun onTrade(generation: Long, trade: BybitWs.Trade) {
         if (generation != app.activeInstrument.value.generation) return
         pendingTrades.add(generation to trade)
         while (pendingTrades.size > 1500) pendingTrades.poll()
     }
 
+    @Synchronized
     fun onMinuteBar(generation: Long, bar: BybitWs.Kline) {
         if (generation != app.activeInstrument.value.generation) return
         liveBars[bar.tsMs] = listOf(bar.tsMs.toDouble(), bar.open, bar.high, bar.low, bar.close, bar.volume)
@@ -98,7 +101,7 @@ class EnacoreEngine(private val ctx: Context, private val app: AppState) {
                         while (true) {
                             val (gen, t) = pendingTrades.poll() ?: break
                             if (gen == instrument.generation) trades.put(JSONObject()
-                                .put("ts", t.tsMs).put("price", t.price).put("qty", t.size).put("buy", t.side == "Buy"))
+                                .put("ts", t.tsMs).put("price", t.price).put("qty", t.size).put("buy", t.side == "Buy").put("id", t.id))
                         }
                         val rows = (app.engine.enacoreBars() + liveBars.values).associateBy { it.first() }.toSortedMap().values
                         val bars = JSONArray().also { a -> rows.forEach { a.put(JSONArray(it)) } }
@@ -111,7 +114,7 @@ class EnacoreEngine(private val ctx: Context, private val app: AppState) {
                             .put("book_imbalance", report.dom.bookImbalancePct)
                             .put("persistence", report.dom.levelPersistenceRatio)
                             .put("liquidity_pull", report.dom.liquidityPullDetected)
-                            .put("oi", market.openInterest ?: 0.0)
+                            .put("oi", market.openInterest ?: 0.0).put("funding_pct", market.fundingPct ?: JSONObject.NULL)
                             .put("absorption", if (!report.absorption.confirmed) 0 else when (report.absorption.side) {
                                 AbsorptionSide.BUYER_ABSORPTION -> 1
                                 AbsorptionSide.SELLER_ABSORPTION -> -1
@@ -123,7 +126,10 @@ class EnacoreEngine(private val ctx: Context, private val app: AppState) {
                         } else if (app.engine.okxConnected && app.engine.okxPrice > 0) {
                             metrics.put("cross_price", app.engine.okxPrice).put("cross_ts", app.engine.crossPriceAtMs)
                         }
-                        val fees = app.botEngine.uiState.value.let { it.makerFeePct + it.takerFeePct }
+                        val fees = app.botEngine.uiState.value.let { bot ->
+                            val entryFee = if (bot.config.executionPreference == com.enamind.ai.bot.strategy.OrderExecutionPreference.MAKER_POST_ONLY) bot.makerFeePct else bot.takerFeePct
+                            entryFee + bot.takerFeePct
+                        }
                         val payload = JSONObject().put("instrument", JSONObject()
                             .put("key", instrument.key).put("generation", instrument.generation)
                             .put("category", instrument.category).put("base", instrument.baseCoin)

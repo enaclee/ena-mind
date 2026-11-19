@@ -101,7 +101,7 @@ class PollingAdapter:
             return json.loads(response.read(128000))
 
     def enrich(self, instrument, metrics, now):
-        if finite(metrics.get('cross_price')) > 0:
+        if finite(metrics.get('cross_price')) > 0 and 0 <= now - finite(metrics.get('cross_ts'), -1e12) <= 90000:
             return dict(metrics)
         key = instrument['key']
         last = self.cache.get(key)
@@ -267,6 +267,8 @@ class Kernel:
         reason, verdict, best = 'Нет направленного преимущества', 'NEUTRAL', None
         if min(book_age, trade_age) < -5000 or max(book_age, trade_age) > 6000 or not m.get('synced'):
             verdict, reason = 'VETO', 'Поток устарел или стакан рассинхронизирован'
+        elif not pair.bars or now - max(pair.bars) > 180000:
+            verdict, reason = 'VETO', 'Минутные свечи устарели или ещё не загружены'
         elif spread is None or spread > .15:
             verdict, reason = 'VETO', 'Нет корректного спреда или спред выше 0.15%'
         elif abs(pressure) >= .18:

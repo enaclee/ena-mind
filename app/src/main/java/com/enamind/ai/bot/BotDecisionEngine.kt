@@ -17,12 +17,13 @@ object BotDecisionEngine {
         val buy: Boolean
         val note: String
         if (cfg.enacoreBridge) {
-            if (!core.isUsable(instrument, now) || !core.verdict.startsWith("CONFIRM "))
+            if (!core.isUsable(instrument, now) || core.verdict !in setOf("CONFIRM LONG", "CONFIRM SHORT") ||
+                core.targetPct !in setOf(0.5, 0.75, 1.0, 1.25, 1.5) || core.horizonMin !in setOf(15, 30, 60, 120))
                 return StrategyDecision.Hold("ENΛCORE: ${core.reason}")
             buy = core.verdict == "CONFIRM LONG"
             note = "ENΛCORE · Net ${core.targetPct}% · ${core.horizonMin}м · AWO"
         } else {
-            if (s.conflictDetected || abs(s.deltaPct) < cfg.entryDeltaPct || abs(s.normalizedOfi) < cfg.entryOfi)
+            if (!s.deltaPct.isFinite() || !s.normalizedOfi.isFinite() || s.conflictDetected || abs(s.deltaPct) < cfg.entryDeltaPct || abs(s.normalizedOfi) < cfg.entryOfi)
                 return StrategyDecision.Hold("Ожидание ручных порогов Delta / OFI")
             buy = s.deltaPct > 0
             if ((s.normalizedOfi > 0) != buy) return StrategyDecision.Hold("Delta и OFI расходятся")

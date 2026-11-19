@@ -203,7 +203,8 @@ class TradeBotUnitTests {
                 symbol = "ETHUSDT",
                 leverage = 15,
                 stopLossEnabled = false,
-                hudEnabled = true
+                hudEnabled = true, enacoreBridge = true, instrumentCategory = "spot",
+                entryDeltaPct = 23.0, entryOfi = .31, maxSpreadPct = .08
             )
             store.saveConfig(cfg)
             val loadedCfg = store.loadConfig()
@@ -211,6 +212,11 @@ class TradeBotUnitTests {
             assertEquals(15, loadedCfg.leverage)
             assertFalse(loadedCfg.stopLossEnabled)
             assertTrue(loadedCfg.hudEnabled)
+            assertTrue(loadedCfg.enacoreBridge)
+            assertEquals("spot", loadedCfg.instrumentCategory)
+            assertEquals(23.0, loadedCfg.entryDeltaPct, 0.0)
+            assertEquals(.31, loadedCfg.entryOfi, 0.0)
+            assertEquals(.08, loadedCfg.maxSpreadPct, 0.0)
 
             store.saveStatsByMode(
                 mapOf(

@@ -50,7 +50,7 @@ class BybitWs(
         val nextFundingTs: Long
     )
 
-    data class Trade(val price: Double, val size: Double, val side: String, val tsMs: Long, val lagMs: Long = 0L)
+    data class Trade(val price: Double, val size: Double, val side: String, val tsMs: Long, val lagMs: Long = 0L, val id: String? = null)
 
     data class BookLevel(val price: Double, val qty: Double)
 
@@ -297,7 +297,8 @@ class BybitWs(
             size = d.optDouble("v"),
             side = d.optString("S"),
             tsMs = ts,
-            lagMs = computeLagMs(ts)
+            lagMs = computeLagMs(ts),
+            id = d.optString("i").takeIf { it.isNotBlank() }
         )
     }
 
@@ -412,6 +413,8 @@ class TapeAggregator(private val window: Int = 500) {
 class LiquidationAggregator {
     private val items = ArrayList<BybitWs.Liquidation>()
     private val hourMs = 3600_000L
+
+    @Synchronized fun clear() { items.clear() }
 
     @Synchronized
     fun add(l: BybitWs.Liquidation) {

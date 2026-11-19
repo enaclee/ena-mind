@@ -296,6 +296,7 @@ internal fun BotStrategyRiskCard(
         }
         ManualThresholdField("Максимальный спред, %", cfg.maxSpreadPct, "Разница лучшей продажи и покупки относительно цены. При превышении бот ждёт.") { v -> bot.updateConfig { it.copy(maxSpreadPct = v.coerceIn(0.01, 1.0)) } }
 
+        BotParameterLabel("Режим исполнения")
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             OrderExecutionPreference.entries.forEach { pref ->
                 FilterChip(
@@ -308,7 +309,8 @@ internal fun BotStrategyRiskCard(
             }
         }
         if (cfg.executionPreference == OrderExecutionPreference.MAKER_POST_ONLY) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            BotParameterLabel("Таймаут Maker и резервное исполнение")
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 MakerFallbackPolicy.entries.forEach { fb ->
                     FilterChip(
                         selected = cfg.makerFallbackPolicy == fb,
@@ -328,6 +330,7 @@ internal fun BotStrategyRiskCard(
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface
         )
+        BotParameterLabel("Транши")
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             (1..4).forEach { count ->
                 FilterChip(
@@ -341,7 +344,7 @@ internal fun BotStrategyRiskCard(
                         }
                     },
                     modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    label = { BotParameterLabel("$count транш.") },
+                    label = { Text("$count транш.", fontSize = 10.5.sp) },
                     colors = botChipColors()
                 )
             }
@@ -404,7 +407,7 @@ internal fun BotStrategyRiskCard(
 
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Кредитное плечо (${cfg.symbol})", fontSize = 11.5.sp, color = MaterialTheme.colorScheme.onSurface)
+                BotParameterLabel("Кредитное плечо (${cfg.symbol})")
                 Text(
                     "${levSlider.roundToInt()}x (макс ${maxLev}x)",
                     fontSize = 11.5.sp,
@@ -417,10 +420,12 @@ internal fun BotStrategyRiskCard(
                 value = levSlider,
                 onValueChange = { levSlider = it },
                 onValueChangeFinished = { bot.updateConfig { it.copy(leverage = levSlider.roundToInt()) } },
+                enabled = maxLev > 1,
                 valueRange = 1f..maxLev.toFloat().coerceAtLeast(2f)
             )
         }
 
+        BotParameterLabel("Режим маржи")
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             MarginMode.entries.forEach { mm ->
                 FilterChip(
@@ -433,6 +438,7 @@ internal fun BotStrategyRiskCard(
             }
         }
 
+        BotParameterLabel("База расчёта прибыли и цели")
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             TargetBasis.entries.forEach { tb ->
                 FilterChip(
@@ -445,6 +451,7 @@ internal fun BotStrategyRiskCard(
             }
         }
 
+        BotParameterLabel("Разрешённое направление")
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -506,7 +513,7 @@ internal fun BotStrategyRiskCard(
                     t.toIntOrNull()?.let { v -> bot.updateConfig { it.copy(maxHoldWaitMin = v) } }
                 },
                 enabled = !cfg.allowUnlimitedHold,
-                label = { Text(if (cfg.allowUnlimitedHold) "Без тайм-стопа" else "Ожидание (мин)", fontSize = 10.5.sp) },
+                label = { BotParameterLabel(if (cfg.allowUnlimitedHold) "Без тайм-стопа" else "Тайм-стоп (мин)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 singleLine = true,
                 modifier = Modifier.weight(1f)
@@ -714,6 +721,7 @@ internal fun BotHudAndBackgroundCard(
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface
         )
+        BotParameterLabel("Таймаут Android 15")
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             TimeoutBehavior.entries.forEach { tb ->
                 FilterChip(

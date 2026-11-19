@@ -124,6 +124,16 @@ class CoreRegressionTests(unittest.TestCase):
         p = payload(count=0); p['bars'] = [[NOW,100,90,110,100,1], [NOW,100,math.inf,99,100,1]]
         self.assertEqual(Kernel().process(p, NOW)['bars'], 0)
 
+    def test_stale_history_vetoes_entry_despite_live_book(self):
+        p = payload()
+        p['bars'] = [[r[0]-3600000] + r[1:] for r in p['bars']]
+        self.assertEqual(Kernel().process(p, NOW)['verdict'], 'VETO')
+
+    def test_distinct_trade_ids_preserve_same_millisecond_prints(self):
+        p = payload(count=1)
+        p['trades'] = [dict(id=str(i), ts=NOW, price=100, qty=1, buy=True) for i in range(3)]
+        self.assertEqual(Kernel().process(p, NOW)['trades'], 3)
+
     def test_position_feedback_preserves_trade_identity(self):
         k = Kernel(); k.on_position_opened({'id': 'p1', 'symbol': 'BTCUSDT'})
         k.on_position_closed({'id': 'p1', 'net_pnl': 3})

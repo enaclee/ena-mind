@@ -999,7 +999,7 @@ private fun FaultsTab(state: AppState) {
                 }
                 Icon(
                     imageVector = Icons.Outlined.Shield,
-                    contentDescription = "Самодиагностика ENA",
+                    contentDescription = "Самодиагностика ENΛVERSE",
                     tint = healthColor,
                     modifier = Modifier.size(20.dp)
                 )

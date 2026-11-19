@@ -66,6 +66,10 @@ class WidgetOverlayService : Service() {
         app.toast("Фоновая сессия виджетов завершена Android. Расположение сохранено.")
         stopSelf()
     }
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        windows.values.forEach { it.bounds() }; save()
+    }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onDestroy() { save(); windows.values.toList().forEach { it.detach() }; windows.clear(); scope.cancel(); super.onDestroy() }
 
@@ -93,7 +97,7 @@ class WidgetOverlayService : Service() {
         var opacity = o.optDouble("opacity", .95).toFloat().coerceIn(.35f, 1f)
         val root = FrameLayout(this@WidgetOverlayService)
         val column = LinearLayout(this@WidgetOverlayService).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(4), dp(8), dp(4)) }
-        val body = WidgetCanvas(kind)
+        val body = WidgetCanvas(kind).apply { matrixShort = o.optBoolean("short", false) }
         val title = TextView(this@WidgetOverlayService).apply { textSize = 11f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER_VERTICAL }
         val panel = LinearLayout(this@WidgetOverlayService).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
         val lp = WindowManager.LayoutParams(contentWidth, contentHeight,
@@ -121,6 +125,7 @@ class WidgetOverlayService : Service() {
                 max = 65; progress = ((opacity - .35f) * 100).toInt()
                 setOnSeekBarChangeListener(seek { opacity = .35f + it / 100f; column.alpha = opacity; save() })
             })
+            if (kind == "matrix") panel.addView(button("Long / Short") { body.matrixShort = !body.matrixShort; body.invalidate(); save() }.apply { layoutParams = LinearLayout.LayoutParams(-1, dp(48)) })
             column.addView(panel)
             column.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
             val resize = TextView(this@WidgetOverlayService).apply { text = "↘"; textSize = 22f; gravity = Gravity.END; contentDescription = "Изменить размер виджета"; setTextColor(Color.GRAY) }
@@ -182,11 +187,11 @@ class WidgetOverlayService : Service() {
             body.dark = dark; body.accent = accent; body.invalidate()
         }
         fun json() = JSONObject().put("id", id).put("kind", kind).put("x", lp.x).put("y", lp.y)
-            .put("w", contentWidth).put("h", contentHeight).put("angle", angle).put("opacity", opacity)
+            .put("w", contentWidth).put("h", contentHeight).put("angle", angle).put("opacity", opacity).put("short", body.matrixShort)
     }
 
     private inner class WidgetCanvas(private val kind: String) : View(this@WidgetOverlayService) {
-        var dark = true; var accent = Color.CYAN
+        var dark = true; var accent = Color.CYAN; var matrixShort = false
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         override fun onDraw(c: Canvas) {
             super.onDraw(c)
@@ -211,8 +216,8 @@ class WidgetOverlayService : Service() {
                     }
                 }
                 "matrix" -> {
-                    line("LONG · Net | 15  30  60  120м", 0, accent)
-                    core.longCells.chunked(4).forEachIndexed { i, row -> line("${row.first().target}%  " + row.joinToString(" ") { it.probability?.let { p -> "${(p*100).toInt()}%" } ?: "—" }, i+1) }
+                    line("${if (matrixShort) "SHORT" else "LONG"} · Net | 15  30  60  120м", 0, accent)
+                    (if (matrixShort) core.shortCells else core.longCells).chunked(4).forEachIndexed { i, row -> line("${row.first().target}%  " + row.joinToString(" ") { it.probability?.let { p -> "${(p*100).toInt()}%" } ?: "—" }, i+1) }
                     line(core.verdict, 7, accent)
                 }
                 "agents" -> core.agents.forEachIndexed { i, a ->

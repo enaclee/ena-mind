@@ -199,7 +199,7 @@ private fun BotHeaderControlCard(
     }
 
     BotSectionCard(
-        title = "ТОРГОВЫЙ БОТ ENA",
+        title = "ТОРГОВЫЙ БОТ ENΛVERSE",
         subtitle = "Order Flow + Radar · ${cfg.mode.labelRu}",
         icon = Icons.Outlined.SmartToy,
         badgeText = if (uiState.running) "РАБОТАЕТ" else "ПАУЗА",

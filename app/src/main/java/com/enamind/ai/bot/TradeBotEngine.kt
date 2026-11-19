@@ -139,8 +139,8 @@ class TradeBotEngine(
         val raw = transform(prev)
         if (_uiState.value.activePosition != null && (raw.symbol != prev.symbol || raw.instrumentCategory != prev.instrumentCategory || raw.mode != prev.mode || raw.enacoreBridge != prev.enacoreBridge)) return
         val cleanSymbol = raw.symbol.trim().uppercase().ifBlank { "BTCUSDT" }
-        val contract = contractCatalog.findContract(cleanSymbol)
-        val maxLev = (contract?.maxLeverage?.toInt() ?: 125).coerceIn(1, 125)
+        val contract = contractCatalog.findContract(cleanSymbol, raw.instrumentCategory)
+        val maxLev = if (raw.instrumentCategory == "spot") 1 else (contract?.maxLeverage?.toInt() ?: 1).coerceIn(1, 125)
         val maxTr = raw.maxTranches.coerceIn(1, 4)
         val cleanWeights = if (raw.trancheWeightsPct.size == maxTr && raw.trancheWeightsPct.all { it > 0 }) {
             raw.trancheWeightsPct
@@ -172,7 +172,7 @@ class TradeBotEngine(
             else -> _uiState.value.walletBalanceUsdt
         }
         val feeProfile = if (!clean.mode.isLiveExchange || modeChanged || symChanged) {
-            BybitV5TradingClient.defaultFeeProfile(clean.symbol)
+            if (clean.instrumentCategory == "spot") BybitV5TradingClient.FeeProfile(.1, .1, false) else BybitV5TradingClient.defaultFeeProfile(clean.symbol)
         } else {
             BybitV5TradingClient.FeeProfile(
                 makerFeePct = _uiState.value.makerFeePct,
@@ -205,7 +205,7 @@ class TradeBotEngine(
         val cfg = _uiState.value.config
         if (!cfg.mode.isLiveExchange) {
             val paperBal = computePaperBalance(cfg.paperStartBalanceUsdt, _uiState.value.statsByMode[BotMode.PAPER])
-            val feeProfile = BybitV5TradingClient.defaultFeeProfile(cfg.symbol)
+            val feeProfile = if (cfg.instrumentCategory == "spot") BybitV5TradingClient.FeeProfile(.1, .1, false) else BybitV5TradingClient.defaultFeeProfile(cfg.symbol)
             val effCap = computeEffectiveCapital(cfg.capitalUsdt, paperBal)
             val sideFee = feeProfile.effectiveSidePct(cfg.executionPreference == OrderExecutionPreference.MAKER_POST_ONLY)
             val contract = contractCatalog.findContract(cfg.symbol)

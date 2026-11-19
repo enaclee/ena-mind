@@ -10,7 +10,7 @@ import androidx.compose.ui.unit.dp
 internal fun BotParameterLabel(label: String, explanation: String = botParameterExplanation(label)) {
     var open by remember { mutableStateOf(false) }
     Row {
-        Text(label)
+        Text(label, Modifier.weight(1f, fill = false))
         TextButton(onClick = { open = true }, modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp), contentPadding = PaddingValues(0.dp)) { Text("?") }
     }
     if (open) AlertDialog(onDismissRequest = { open = false }, title = { Text(label) }, text = { Text(explanation) },
@@ -24,7 +24,7 @@ internal fun botParameterExplanation(label: String): String = when {
     label.contains("транш", true) || label.contains("шаг", true) -> "Количество и веса последовательных входов. Добор разрешён только при сохранении направления, достаточном отступе и отсутствии встречного каскада ликвидаций."
     label.contains("Stop", true) || label.contains("SL") -> "Стоп ограничивает убыток. Процент зависит от выбранной базы: изменение цены, ROE или множитель ATR. Для реальной позиции защита отправляется на биржу."
     label.contains("трал", true) || label.contains("отступ", true) -> "После достижения минимальной чистой прибыли подтягивает защиту за максимумом. Отступ должен покрывать спред и рыночный шум."
-    label.contains("прибыл", true) || label.contains("цель", true) || label.contains("Take", true) -> "Цель после расчётных комиссий. При мосте ENΛCORE цель и предельный горизонт фиксируются при входе; матрица использует движение цены, а не ROE."
+    label.contains("прибыл", true) || label.contains("плюс", true) || label.contains("цель", true) || label.contains("Take", true) -> "Цель после расчётных комиссий. При мосте ENΛCORE цель и предельный горизонт фиксируются при входе; матрица использует движение цены, а не ROE."
     label.contains("Maker", true) || label.contains("исполн", true) -> "PostOnly размещает лимитный ордер без немедленного снятия ликвидности. Market исполняется по доступным ценам и может дать проскальзывание. Fallback определяет действие после таймаута Maker."
     label.contains("Android", true) || label.contains("тайм", true) -> "Android ограничивает суммарную фоновую работу dataSync. При системном таймауте приложение останавливает сервис и применяет выбранное поведение для позиции. Биржевой стоп работает независимо от приложения."
     label.contains("API", true) || label.contains("Key", true) || label.contains("Secret", true) -> "Ключи сохраняются локально в зашифрованном виде. Demo, Testnet и Mainnet имеют отдельные слоты. Не включайте право вывода средств."
