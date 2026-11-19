@@ -51,6 +51,9 @@ class EnaverseUnitTests {
         assertTrue(decision(core.copy(targetPct = null)) is StrategyDecision.Hold)
         assertTrue(decision(core.copy(horizonMin = 1)) is StrategyDecision.Hold)
         assertTrue(decision(core.copy(computedAt = now - 7000)) is StrategyDecision.Hold)
+        val spot = instrument.copy(category = "spot")
+        assertTrue(BotDecisionEngine.evaluate(live(), OpenPositionContext(hasOpenPosition = true, sideIsBuy = true),
+            cfg.copy(instrumentCategory = "spot"), core.copy(key = spot.key, verdict = "CONFIRM SHORT"), spot, now) is StrategyDecision.ExitAll)
     }
 
     @Test fun `manual rules reject nonfinite input and unborrowed spot shorts`() {

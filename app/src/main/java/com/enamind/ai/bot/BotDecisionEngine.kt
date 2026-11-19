@@ -36,8 +36,10 @@ object BotDecisionEngine {
         if (!cfg.allowCounterAbsorption && s.absorptionConfirmed &&
             ((buy && s.absorptionSideName == "SELLER_ABSORPTION") || (!buy && s.absorptionSideName == "BUYER_ABSORPTION")))
             return StrategyDecision.Hold("Встречное поглощение")
-        if (cfg.instrumentCategory == "spot" && !buy) return StrategyDecision.Hold("Спот: только Long без займа")
-        if (!p.hasOpenPosition) return StrategyDecision.Enter(buy, cfg.executionPreference, note)
+        if (!p.hasOpenPosition) {
+            if (cfg.instrumentCategory == "spot" && !buy) return StrategyDecision.Hold("Спот: только Long без займа")
+            return StrategyDecision.Enter(buy, cfg.executionPreference, note)
+        }
         if (cfg.enacoreBridge && p.sideIsBuy != buy) return StrategyDecision.ExitAll("ENΛCORE подтвердил смену направления")
         if (p.peelPartialEnabled && !p.peelDone && p.tranchesCount >= 2 && p.netPnlPct >= p.minNetProfitPct)
             return StrategyDecision.PeelPartial(.5, "Ручная фиксация половины прибыльной позиции")

@@ -917,7 +917,7 @@ class TradeBotEngine(
         val st = _uiState.value
         val makerPct = st.makerFeePct
         val takerPct = st.takerFeePct
-        val expectedRoundTripPct = if (orderPref == OrderExecutionPreference.MAKER_POST_ONLY) makerPct * 2.0 else takerPct * 2.0
+        val expectedRoundTripPct = (if (orderPref == OrderExecutionPreference.MAKER_POST_ONLY) makerPct else takerPct) + takerPct
 
         val slPrice = if (cfg.stopLossEnabled) {
             val slPct = effectiveStopLossPct(cfg, atr1mPct)
@@ -1354,7 +1354,7 @@ class TradeBotEngine(
     }
 
     private fun finalizeTradeRecord(pos: ActivePosition, exitPrice: Double, reason: String) {
-        val cfg = _uiState.value.config
+        val cfg = if (pos.coreTargetNetPct != null) _uiState.value.config.copy(targetBasis = TargetBasis.PRICE_MOVE_PCT) else _uiState.value.config
         val pnl = if (pos.paidEntryFeesUsdt > 0.0) {
             computeBlendedNetPnl(
                 side = pos.side,
@@ -1491,7 +1491,7 @@ class TradeBotEngine(
         atr1mPct: Double? = null
     ): ActivePosition {
         val entryFeePct = if (enteredAsMaker) makerFeePct else takerFeePct
-        val exitFeePct = if (cfg.executionPreference == OrderExecutionPreference.MAKER_POST_ONLY) makerFeePct else takerFeePct
+        val exitFeePct = takerFeePct // Close and peel orders are Market, including after a Maker entry.
         val roundTripFeePct = entryFeePct + exitFeePct
         val paidEntryFeeUsdt = entryPrice * qty * (entryFeePct / 100.0)
         val usedMargin = (entryPrice * qty) / leverage.coerceAtLeast(1)

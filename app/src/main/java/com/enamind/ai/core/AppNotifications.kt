@@ -41,7 +41,7 @@ class AppNotifications(private val ctx: Context, private val app: AppState) {
         app.appScope.launch {
             var key = ""; var reference = 0.0; var absorption = false; var awo = ""; var stale = false
             var previousBotError: String? = null
-            var lastClosedTrade: String? = null
+            var lastClosedTrade = app.botEngine.uiState.value.recentTrades.lastOrNull()?.id
             while (isActive) {
                 val instrument = app.activeInstrument.value
                 val market = app.market.value; val flow = app.orderFlow.report.value; val core = app.enacore.state.value
@@ -65,7 +65,7 @@ class AppNotifications(private val ctx: Context, private val app: AppState) {
                     post("bot_stop", "Бот · ошибка", bot.lastError!!)
                 previousBotError = bot.lastError
                 bot.recentTrades.lastOrNull()?.let { trade ->
-                    if (lastClosedTrade != null && trade.id != lastClosedTrade &&
+                    if (trade.id != lastClosedTrade &&
                         (trade.exitReason.contains("стоп", true) || trade.exitReason.contains("SL", true) || trade.exitReason.contains("трал", true)))
                         post("bot_stop", "${trade.symbol} · защитный выход", trade.exitReason)
                     lastClosedTrade = trade.id
